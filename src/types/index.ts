@@ -109,9 +109,9 @@ export interface WardrobeItem {
   category: WardrobeCategory;
   gender: 'male' | 'female' | 'unisex'; // Target gender (shoes default to 'unisex')
   description: string;         // Brief description for AI prompt
-  imageUrls: string[];         // 360° mannequin images in GCS
-  fitModelUrls?: string[];     // Fit model images (real human wearing garment) — used for drape/silhouette reference
-  flatImageUrl?: string;       // Optional flat image
+  fitModelUrls: string[];      // Fit model images (up to 8, ordered: front first, rotating right). Primary garment reference.
+  flatFrontUrl?: string;       // Flat product photo — front view
+  flatBackUrl?: string;        // Flat product photo — back view
   thumbnailUrl: string;        // First image for UI picker
   isPrimary: boolean;          // true = focus garment (step 1), false = styling item (step 3)
   createdAt: Date;

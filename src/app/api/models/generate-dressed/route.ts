@@ -255,19 +255,19 @@ export async function POST(req: NextRequest) {
       }
 
       // ── Send ALL available reference images per wardrobe item ──
-      // Structure per item: mannequin images (imageUrls) + flat image (flatImageUrl) + fit model images (fitModelUrls)
+      // Structure per item: fit model images (fitModelUrls) + flat front/back (flatFrontUrl/flatBackUrl)
       // More angles = better garment accuracy for Gemini.
       let itemImageCount = 0;
 
-      // A) Mannequin / 360° images (typically 6 angles)
-      if (itemData.imageUrls?.length > 0) {
-        for (let imgIdx = 0; imgIdx < itemData.imageUrls.length; imgIdx++) {
+      // A) Fit model images — primary garment reference (replaces mannequin 360°)
+      if (itemData.fitModelUrls?.length > 0) {
+        for (let imgIdx = 0; imgIdx < itemData.fitModelUrls.length; imgIdx++) {
           try {
-            const buf = await downloadGarmentImage(itemData.imageUrls[imgIdx]);
+            const buf = await downloadGarmentImage(itemData.fitModelUrls[imgIdx]);
             const resized = await resizeForFeed(buf, 900);
             const angleLabel = imgIdx === 0
-              ? `WARDROBE ITEM — ${category.toUpperCase()}: "${itemData.name}". MANNEQUIN REFERENCE. The model wears THIS EXACT item — copy color, material, silhouette, sole shape, and all details precisely.${itemData.description ? ' ' + itemData.description : ''}`
-              : `${category.toUpperCase()} "${itemData.name}" — MANNEQUIN angle ${imgIdx + 1}/${itemData.imageUrls.length}. Additional perspective for garment detail verification.`;
+              ? `WARDROBE ITEM — ${category.toUpperCase()}: "${itemData.name}". FIT MODEL REFERENCE. The model wears THIS EXACT item — copy color, material, silhouette, sole shape, and all details precisely.${itemData.description ? ' ' + itemData.description : ''}`
+              : `${category.toUpperCase()} "${itemData.name}" — FIT MODEL angle ${imgIdx + 1}/${itemData.fitModelUrls.length}. Additional perspective for garment detail verification.`;
             referenceImages.push({ buffer: resized, mimeType: 'image/jpeg', label: angleLabel });
             if (imgIdx === 0) {
               wardrobeQcRefs.push({ buffer: resized, mimeType: 'image/jpeg', name: `${category}: ${itemData.name}` });
@@ -275,48 +275,65 @@ export async function POST(req: NextRequest) {
             refIdx++;
             itemImageCount++;
           } catch (dlErr) {
-            console.warn(`[GenerateDressed] ${category}: failed to download mannequin image ${imgIdx}: ${String(dlErr).substring(0, 100)}`);
+            console.warn(`[GenerateDressed] ${category}: failed to download fit model image ${imgIdx}: ${String(dlErr).substring(0, 100)}`);
+          }
+        }
+      } else if (itemData.imageUrls?.length > 0) {
+        // Legacy fallback: mannequin images for old wardrobe items not yet migrated
+        for (let imgIdx = 0; imgIdx < itemData.imageUrls.length; imgIdx++) {
+          try {
+            const buf = await downloadGarmentImage(itemData.imageUrls[imgIdx]);
+            const resized = await resizeForFeed(buf, 900);
+            const angleLabel = imgIdx === 0
+              ? `WARDROBE ITEM — ${category.toUpperCase()}: "${itemData.name}". REFERENCE. The model wears THIS EXACT item — copy color, material, silhouette, and all details precisely.${itemData.description ? ' ' + itemData.description : ''}`
+              : `${category.toUpperCase()} "${itemData.name}" — angle ${imgIdx + 1}/${itemData.imageUrls.length}.`;
+            referenceImages.push({ buffer: resized, mimeType: 'image/jpeg', label: angleLabel });
+            if (imgIdx === 0) {
+              wardrobeQcRefs.push({ buffer: resized, mimeType: 'image/jpeg', name: `${category}: ${itemData.name}` });
+            }
+            refIdx++;
+            itemImageCount++;
+          } catch (dlErr) {
+            console.warn(`[GenerateDressed] ${category}: failed to download legacy image ${imgIdx}: ${String(dlErr).substring(0, 100)}`);
           }
         }
       }
 
-      // B) Flat image (single flat-lay shot)
-      if (itemData.flatImageUrl) {
+      // B) Flat front image
+      if (itemData.flatFrontUrl || itemData.flatImageUrl) {
         try {
-          const buf = await downloadGarmentImage(itemData.flatImageUrl);
+          const buf = await downloadGarmentImage((itemData.flatFrontUrl || itemData.flatImageUrl));
           const resized = await resizeForFeed(buf, 900);
           referenceImages.push({
             buffer: resized,
             mimeType: 'image/jpeg',
-            label: `${category.toUpperCase()} "${itemData.name}" — FLAT LAY image. Shows garment laid flat — use for color accuracy, fabric texture, and construction details.`,
+            label: `${category.toUpperCase()} "${itemData.name}" — FLAT FRONT image. Shows garment laid flat — use for color accuracy, fabric texture, and construction details.`,
           });
           refIdx++;
           itemImageCount++;
         } catch (dlErr) {
-          console.warn(`[GenerateDressed] ${category}: failed to download flat image: ${String(dlErr).substring(0, 100)}`);
+          console.warn(`[GenerateDressed] ${category}: failed to download flat front image: ${String(dlErr).substring(0, 100)}`);
         }
       }
 
-      // C) Fit model images (real human wearing the garment — drape/silhouette reference)
-      if (itemData.fitModelUrls?.length > 0) {
-        for (let imgIdx = 0; imgIdx < itemData.fitModelUrls.length; imgIdx++) {
-          try {
-            const buf = await downloadGarmentImage(itemData.fitModelUrls[imgIdx]);
-            const resized = await resizeForFeed(buf, 900);
-            referenceImages.push({
-              buffer: resized,
-              mimeType: 'image/jpeg',
-              label: `${category.toUpperCase()} "${itemData.name}" — FIT MODEL reference ${imgIdx + 1}/${itemData.fitModelUrls.length}. Shows how the garment DRAPES and FITS on a real person. Use for silhouette, length, and how fabric falls — but the FACE/IDENTITY must come from the model card, NOT this fit model.`,
-            });
-            refIdx++;
-            itemImageCount++;
-          } catch (dlErr) {
-            console.warn(`[GenerateDressed] ${category}: failed to download fit model image ${imgIdx}: ${String(dlErr).substring(0, 100)}`);
-          }
+      // C) Flat back image
+      if (itemData.flatBackUrl) {
+        try {
+          const buf = await downloadGarmentImage(itemData.flatBackUrl);
+          const resized = await resizeForFeed(buf, 900);
+          referenceImages.push({
+            buffer: resized,
+            mimeType: 'image/jpeg',
+            label: `${category.toUpperCase()} "${itemData.name}" — FLAT BACK image. Back construction reference: pocket shape, stitching, label placement.`,
+          });
+          refIdx++;
+          itemImageCount++;
+        } catch (dlErr) {
+          console.warn(`[GenerateDressed] ${category}: failed to download flat back image: ${String(dlErr).substring(0, 100)}`);
         }
       }
 
-      console.log(`[GenerateDressed] ${category}: loaded ${itemImageCount} total images for "${itemData.name}" (mannequin: ${itemData.imageUrls?.length || 0}, flat: ${itemData.flatImageUrl ? 1 : 0}, fitModel: ${itemData.fitModelUrls?.length || 0})`);
+      console.log(`[GenerateDressed] ${category}: loaded ${itemImageCount} total images for "${itemData.name}" (fitModel: ${itemData.fitModelUrls?.length || 0}, flatFront: ${itemData.flatFrontUrl ? 1 : 0}, flatBack: ${itemData.flatBackUrl ? 1 : 0})`);
     }
 
     if (outfitLines.length === 0) {
@@ -393,9 +410,9 @@ ${viewPoseRule}
 - Only garments explicitly listed above appear on the model. The outfit is complete as specified.
 - Accessories appear ONLY if explicitly listed above. Otherwise the model wears zero accessories (no belts, watches, jewelry, scarves, hats, bags, sunglasses).
 - Neutral base clothing (plain white t-shirt, compression shorts) stays plain — no branding, no logos, no text, clean fabric only
-- WARDROBE ITEM BRANDING: Labels, patches, and logos on wardrobe items must match the reference images 1:1 — correct position, size, color, and material. If a label is visible in the mannequin/flat/fit model references, it appears in the output. If absent from all references, that area is clean fabric.
+- WARDROBE ITEM BRANDING: Labels, patches, and logos on wardrobe items must match the reference images 1:1 — correct position, size, color, and material. If a label is visible in the fit model/flat references, it appears in the output. If absent from all references, that area is clean fabric.
 - Boots/shoes when listed: worn on the feet, visible below the model's base clothing
-- MANNEQUIN STAND: The mannequin reference photos show garments on a RAISED STAND — ignore the stand and its hem height. Render the actual garment length as described in the styling instructions.
+- FIT MODEL REFERENCE: The fit model reference photos show garments on a real person. Match the garment length and drape as shown in the fit model images.
 - HEMS: Preserve original hem style — no rolling, cuffing, or folding unless the product description explicitly says cuffs or turn-ups
 ${ECOM_NO_GOS}${garmentDnaLines.length > 0 ? '\n\n' + garmentDnaLines.join('\n') : ''}`;
 

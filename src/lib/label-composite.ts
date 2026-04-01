@@ -204,7 +204,7 @@ If no leather label is visible, respond:
 // ─── PUBLIC API ────────────────────────────────────────────────────────────
 
 /**
- * Extract the leather label from a mannequin/fit model back-view image.
+ * Extract the leather label from a flat back image or fit model back-view image.
  *
  * Uses Python + OpenCV GrabCut for pixel-perfect segmentation with alpha transparency.
  * Falls back to Gemini bbox + Sharp crop if Python unavailable.

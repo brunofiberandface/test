@@ -37,8 +37,8 @@ export async function POST(req: NextRequest) {
       shotType,
       variant,
       prompt,
-      flatImageUrl,
-      image360Urls,
+      flatFrontUrl,
+      flatBackUrl,
       modification,
       originalPrompt,
       version,
@@ -71,8 +71,8 @@ export async function POST(req: NextRequest) {
         if (jobDocData) {
           designNumber = designNumber || jobDocData.designNumber;
           garmentCategory = garmentCategory || jobDocData.garmentCategory;
-          flatImageUrl = flatImageUrl || jobDocData.flatImageUrl || '';
-          image360Urls = image360Urls || jobDocData.image360Urls || [];
+          flatFrontUrl = flatFrontUrl || jobDocData.flatFrontUrl || jobDocData.flatImageUrl || '';
+          flatBackUrl = flatBackUrl || jobDocData.flatBackUrl || '';
         }
       } catch (e) {
         console.error(`[Generate] Failed to resolve job fields:`, e);
@@ -96,8 +96,8 @@ export async function POST(req: NextRequest) {
     await reportProgress('Loading references', 5);
 
     // ── Collect ALL reference images in CORRECT v5 feed order (Learning #28) ──
-    // Order: 1. Model card → 2. Flat image (1400px) → 3. Mannequin front (1200px) →
-    //        4. Side mannequin → 5. Zone grids → 6. Text prompt
+    // Order: 1. Model card → 2. Flat front image (1400px) → 3. Fit model photos (1200px) →
+    //        4. Zone grids → 5. Text prompt
     const referenceImages: Array<{ buffer: Buffer; mimeType: string; label: string }> = [];
     // Store zone grid buffers separately so we can inject key ones into Phase 2
     const zoneGridRefs: Array<{ buffer: Buffer; mimeType: string; label: string; zoneName: string }> = [];
@@ -242,9 +242,9 @@ export async function POST(req: NextRequest) {
 
       let ignoreZoneInstruction = '';
       if (isLowerBodyFocus) {
-        ignoreZoneInstruction = `\n\nCRITICAL — COMPLETELY IGNORE ALL LEGWEAR on this dressed reference. The model wears short black compression shorts for modesty only — these are NOT a garment reference. They have ZERO relevance to the product. Do NOT use their color, length, fit, or silhouette as any reference. The ENTIRE lower body from waist to shoes will be dressed by the FOCUS GARMENT from the mannequin 360° reference images. Only match from this reference: face, hair, skin tone, body type, shoes, and any UPPER BODY clothing (jacket, shirt, top).\n\nCRITICAL — MATCH UPPER BODY CLOTHING EXACTLY: If this reference shows a white t-shirt, the output MUST show the SAME white t-shirt — same color, same neckline, same fit. DO NOT replace it with a tank top, crop top, or any other garment. DO NOT change the color. Changing the upper body clothing is a CRITICAL FAILURE.`;
+        ignoreZoneInstruction = `\n\nCRITICAL — COMPLETELY IGNORE ALL LEGWEAR on this dressed reference. The model wears short black compression shorts for modesty only — these are NOT a garment reference. They have ZERO relevance to the product. Do NOT use their color, length, fit, or silhouette as any reference. The ENTIRE lower body from waist to shoes will be dressed by the FOCUS GARMENT from the fit model reference images. Only match from this reference: face, hair, skin tone, body type, shoes, and any UPPER BODY clothing (jacket, shirt, top).\n\nCRITICAL — MATCH UPPER BODY CLOTHING EXACTLY: If this reference shows a white t-shirt, the output MUST show the SAME white t-shirt — same color, same neckline, same fit. DO NOT replace it with a tank top, crop top, or any other garment. DO NOT change the color. Changing the upper body clothing is a CRITICAL FAILURE.`;
       } else if (isUpperBodyFocus) {
-        ignoreZoneInstruction = `\n\nCRITICAL — IGNORE THE JACKET/SHIRT/TOP on this dressed reference. The model may appear to wear an upper body garment — this is PLACEHOLDER clothing and MUST BE COMPLETELY REPLACED by the focus garment (the actual product being photographed). Only match: face, hair, skin tone, body type, shoes, and any LOWER BODY clothing (pants, jeans). The UPPER BODY will be dressed by the focus garment from the mannequin references.`;
+        ignoreZoneInstruction = `\n\nCRITICAL — IGNORE THE JACKET/SHIRT/TOP on this dressed reference. The model may appear to wear an upper body garment — this is PLACEHOLDER clothing and MUST BE COMPLETELY REPLACED by the focus garment (the actual product being photographed). Only match: face, hair, skin tone, body type, shoes, and any LOWER BODY clothing (pants, jeans). The UPPER BODY will be dressed by the focus garment from the fit model references.`;
       }
 
       const dressedLabel = `MODEL DRESSED REFERENCE — this is the model for this shot. Match EXACTLY: face, hair, skin tone, body type, shoes, and all visible outfit items not covered by the focus garment.${ignoreZoneInstruction}`;
@@ -261,7 +261,7 @@ export async function POST(req: NextRequest) {
     // 1c. DRESSED BASE for M01/M02 cropped shots — body proportions + shoes/jacket reference
     // CRITICAL: When garment is lower-body (pants/jeans), the dressed base legwear is NOT
     // the product — it's base clothing (compression shorts). We must tell Gemini to IGNORE it.
-    // The actual pants come from mannequin 360° photos only.
+    // The actual pants come from fit model reference photos only.
     // When garment is upper-body (jacket), the dressed base pants ARE correct — use them.
     if (isCroppedShot && !fullBodyThenCrop && dressedBaseBuffer) {
       // Pre-crop dressed base to waist-down for M01/M02 — consistent with pre-cropped garment template
@@ -307,9 +307,9 @@ export async function POST(req: NextRequest) {
     // The flat image is the ABSOLUTE GROUND TRUTH for color/wash and shape/silhouette.
     let flatColor: FlatColor | null = null;
     let flatSilhouette: FlatSilhouette | null = null;
-    if (flatImageUrl) {
+    if (flatFrontUrl) {
       try {
-        const flatBuffer = await downloadGarmentImage(flatImageUrl.split('?')[0]);
+        const flatBuffer = await downloadGarmentImage(flatFrontUrl.split('?')[0]);
 
         // 2a. Extract mathematical color + silhouette from flat (ground truth)
         try {
@@ -334,49 +334,10 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // 3. MANNEQUIN 360° IMAGES — feed ALL available angles for full rotation reference
-    // The model needs the complete 360° rotation to accurately reproduce wash, color,
-    // construction details, and silhouette from every angle.
-    const mannequinBuffers: Array<{ buffer: Buffer; index: number }> = [];
-    if (image360Urls?.length) {
-      const maxAngles = Math.min(image360Urls.length, 9);
-
-      // Build labels for ALL angles (full rotation)
-      const labelMap = buildMannequinLabels(maxAngles);
-
-      for (let i = 0; i < maxAngles; i++) {
-        try {
-          const buf = await downloadGarmentImage(image360Urls[i].split('?')[0]);
-          const resizedBuf = await resizeForFeed(buf, 1200);
-
-          mannequinBuffers.push({ buffer: buf, index: i });
-
-          // Feed ALL mannequin images — full 360° rotation is critical for:
-          // - Consistent wash/color across all angles
-          // - Accurate construction details from every view
-          // - Correct silhouette and drape in dynamic poses
-          const angleLabel = labelMap[i] || `GARMENT ON MANNEQUIN (angle ${i + 1}/${maxAngles}, ~${Math.round(i * 360 / maxAngles)}°). Full 360° rotation reference — match wash, color, and construction from this angle.`;
-
-          // First image (front) gets the COLOR ANCHOR label
-          const colorAnchor = i === 0
-            ? `\nCOLOR ANCHOR — THIS IS THE DEFINITIVE WASH/COLOR REFERENCE. The exact shade, wash intensity, fading pattern, and color tone in this front view is the GROUND TRUTH. All other angles confirm it. Do NOT deviate from this color in the generated image.`
-            : '';
-
-          referenceImages.push({
-            buffer: resizedBuf,
-            mimeType: 'image/jpeg',
-            label: angleLabel + colorAnchor,
-          });
-          console.log(`[Generate] 3. Mannequin image ${i + 1}/${maxAngles}: ${angleLabel.substring(0, 60)}`);
-        } catch (err) {
-          console.error(`[Generate] Failed to load 360° image ${i}:`, err);
-        }
-      }
-    }
-
-    // 3a. FIT MODEL IMAGES — real human wearing garment, shows drape/silhouette/fit
-    // If the focus garment's wardrobe item has fitModelUrls, combine them with mannequin refs.
-    // Fit model photos give Gemini better fabric drape and silhouette reference than mannequin alone.
+    // 3. FIT MODEL IMAGES — primary garment reference (replaces mannequin 360°)
+    // Fit model photos show real human wearing garment: drape, silhouette, construction, wash.
+    // Ordered: front first, rotating right (up to 8 images).
+    const fitModelBuffers: Array<{ buffer: Buffer; index: number }> = [];
     let hasFitModelRefs = false;
     try {
       const jobDocFit = await jobsCol.doc(jobId).get();
@@ -390,25 +351,34 @@ export async function POST(req: NextRequest) {
             try {
               const buf = await downloadGarmentImage(fitUrls[i].split('?')[0]);
               const resizedBuf = await resizeForFeed(buf, 1200);
+
+              fitModelBuffers.push({ buffer: buf, index: i });
+
+              // First image (front) gets the COLOR ANCHOR label
+              const colorAnchor = i === 0
+                ? `\nCOLOR ANCHOR — THIS IS THE DEFINITIVE WASH/COLOR REFERENCE. The exact shade, wash intensity, fading pattern, and color tone in this front view is the GROUND TRUTH. All other angles confirm it. Do NOT deviate from this color in the generated image.`
+                : '';
+
+              const angleDesc = i === 0 ? 'front' : `angle ${i + 1}/${maxFitImages}, rotating right`;
               referenceImages.push({
                 buffer: resizedBuf,
                 mimeType: 'image/jpeg',
-                label: `FIT MODEL REFERENCE (${i + 1}/${maxFitImages}) — Real human wearing this EXACT garment. Use this for fabric DRAPE, SILHOUETTE, and how the garment FALLS on a real body. The fit model shows how the denim moves, folds, and sits at the waist/hip/knee. Combine with mannequin angles for construction details.`,
+                label: `FIT MODEL REFERENCE (${i + 1}/${maxFitImages}, ${angleDesc}) — Real human wearing this EXACT garment. Match wash, color, construction details, fabric drape, silhouette, and how the garment falls on a real body.${colorAnchor}`,
               });
-              console.log(`[Generate] 3a. Fit model image ${i + 1}/${maxFitImages} loaded`);
+              console.log(`[Generate] 3. Fit model image ${i + 1}/${maxFitImages} loaded (${angleDesc})`);
             } catch (err) {
               console.error(`[Generate] Failed to load fit model image ${i}:`, err);
             }
           }
           hasFitModelRefs = true;
-          console.log(`[Generate] 3a. ${maxFitImages} fit model references loaded — combined approach active`);
+          console.log(`[Generate] 3. ${maxFitImages} fit model references loaded`);
         }
       }
     } catch (fitErr) {
       console.warn(`[Generate] Fit model lookup failed (non-blocking):`, fitErr);
     }
 
-    // 3b. COLOR HEX EXTRACTION — FLAT IMAGE IS GROUND TRUTH (falls back to mannequin)
+    // 3b. COLOR HEX EXTRACTION — FLAT IMAGE IS GROUND TRUTH (falls back to fit model)
     // The flat product photo is studio-lit and color-calibrated — it's the definitive reference.
     // Gemini consistently lightens/shifts denim. We inject measured hex + LAB values as hard anchors.
     let garmentHexColor = '';
@@ -424,10 +394,10 @@ export async function POST(req: NextRequest) {
       if (anchorIdx >= 0) {
         referenceImages[anchorIdx].label += `\nEXTRACTED GARMENT COLOR: ${garmentHexColor}. The generated denim MUST match this exact color value.`;
       }
-    } else if (mannequinBuffers.length > 0) {
-      // Fallback: extract from mannequin front view (less accurate but better than nothing)
+    } else if (fitModelBuffers.length > 0) {
+      // Fallback: extract from fit model front view (less accurate than flat but better than nothing)
       try {
-        const frontBuf = mannequinBuffers[0].buffer;
+        const frontBuf = fitModelBuffers[0].buffer;
         const meta = await sharp(frontBuf).metadata();
         const imgW = meta.width || 1000;
         const imgH = meta.height || 1500;
@@ -454,7 +424,7 @@ export async function POST(req: NextRequest) {
         const avgB = Math.round(totalB / pixelCount);
         garmentHexColor = `#${avgR.toString(16).padStart(2, '0')}${avgG.toString(16).padStart(2, '0')}${avgB.toString(16).padStart(2, '0')}`;
         garmentColorBrightness = (avgR * 0.299 + avgG * 0.587 + avgB * 0.114);
-        console.log(`[Generate] 3b. Fallback: mannequin color ${garmentHexColor} (brightness=${garmentColorBrightness.toFixed(0)})`);
+        console.log(`[Generate] 3b. Fallback: fit model color ${garmentHexColor} (brightness=${garmentColorBrightness.toFixed(0)})`);
 
         const anchorIdx = referenceImages.findIndex(r => r.label.includes('COLOR ANCHOR'));
         if (anchorIdx >= 0) {
@@ -466,11 +436,11 @@ export async function POST(req: NextRequest) {
     }
 
     // 4. ZONE GRIDS — the v5 secret weapon (Learning #2, #20)
-    // Generate cropped detail grids from mannequin images
+    // Generate cropped detail grids from fit model images
     const category = garmentCategory || detectCategory(shotType);
-    if (mannequinBuffers.length >= 2) {
+    if (fitModelBuffers.length >= 2) {
       try {
-        const zoneGrids = await generateZoneGrids(mannequinBuffers, category);
+        const zoneGrids = await generateZoneGrids(fitModelBuffers, category);
         let gridNum = 1;
         const totalGrids = zoneGrids.length;
 
@@ -498,17 +468,17 @@ export async function POST(req: NextRequest) {
 
     // 5. SPECIAL ZONE CROPS — per-garment signature details (e.g., carpenter pocket, flare)
     const garmentDNA = getGarmentDNA(designNumber);
-    if (garmentDNA?.specialZones && mannequinBuffers.length > 0) {
+    if (garmentDNA?.specialZones && fitModelBuffers.length > 0) {
       for (const sz of garmentDNA.specialZones) {
         try {
           const specialGrids = await generateZoneGrids(
-            mannequinBuffers.filter(mb => sz.angles.includes(mb.index)),
+            fitModelBuffers.filter(mb => sz.angles.includes(mb.index)),
             '__special__'  // Special category — use the zone's own definition
           );
           // If no special grids generated via the standard path, crop manually
           // Actually, let's add them as individual high-res crops
           for (const angleIdx of sz.angles) {
-            const img = mannequinBuffers.find(mb => mb.index === angleIdx);
+            const img = fitModelBuffers.find(mb => mb.index === angleIdx);
             if (!img) continue;
             try {
               const meta = await sharp(img.buffer).metadata();
@@ -595,9 +565,9 @@ export async function POST(req: NextRequest) {
             // Model-on photos cause extractFlatColor to measure SKIN TONE instead of shirt color
             // because white shirt pixels get filtered as "background" and only skin pixels remain.
             // The shirt name + visual references + dressed base provide enough signal without hex.
-            if (itemData.flatImageUrl) {
+            if (itemData.flatFrontUrl || itemData.flatImageUrl) {
               try {
-                const shirtBuf = await downloadGarmentImage(itemData.flatImageUrl.split('?')[0]);
+                const shirtBuf = await downloadGarmentImage((itemData.flatFrontUrl || itemData.flatImageUrl).split('?')[0]);
                 const shirtColor = await extractFlatColor(shirtBuf);
                 wardrobeShirtHex = shirtColor.hex;
                 wardrobeShirtDesc = shirtColor.hueDescription;
@@ -655,8 +625,9 @@ export async function POST(req: NextRequest) {
           wardrobeDescriptions.push(`${wCat.toUpperCase()}: ${itemData.description || itemData.name}`);
 
           // Load front view for Pass 2
-          if (itemData.imageUrls?.length > 0) {
-            const buf = await downloadGarmentImage(itemData.imageUrls[0].split('?')[0]);
+          if (itemData.fitModelUrls?.length > 0 || itemData.imageUrls?.length > 0) {
+            const frontUrl = (itemData.fitModelUrls?.[0] || itemData.imageUrls?.[0]);
+            const buf = await downloadGarmentImage(frontUrl.split('?')[0]);
             const resized = await resizeForFeed(buf, 900);
             wardrobePass2Images.push({
               buffer: resized,
@@ -667,9 +638,9 @@ export async function POST(req: NextRequest) {
             });
           }
           // Flat image for Pass 2 if available
-          if (itemData.flatImageUrl) {
+          if (itemData.flatFrontUrl || itemData.flatImageUrl) {
             try {
-              const flatBuf = await downloadGarmentImage(itemData.flatImageUrl.split('?')[0]);
+              const flatBuf = await downloadGarmentImage((itemData.flatFrontUrl || itemData.flatImageUrl).split('?')[0]);
               const resizedFlat = await resizeForFeed(flatBuf, 800);
               wardrobePass2Images.push({
                 buffer: resizedFlat,
@@ -749,7 +720,7 @@ export async function POST(req: NextRequest) {
     const aspectRatio = SHOT_ASPECT_RATIOS[shotType] || '3:4';
 
     // ── 2-PHASE ARCHITECTURE (v10) ──
-    // Phase 1 (Pro): Generate garment template — mannequin refs only, no model card, no dressed base.
+    // Phase 1 (Pro): Generate garment template — fit model refs only, no model card, no dressed base.
     //   Pro excels at garment fidelity (wash, pockets, labels, silhouette).
     // Phase 2 (Flash): Combine garment template + model card → final shot.
     //   Flash produces more photographic/natural output.
@@ -759,7 +730,7 @@ export async function POST(req: NextRequest) {
     const croppedShotView = shotType === 'M02' ? 'BACK' : 'FRONT';
 
     // ── PHASE 1: Garment Template (Pro) ──
-    // Feed mannequin refs + flat image + zone grids + skin tone swatch.
+    // Feed fit model refs + flat image + zone grids + skin tone swatch.
     // v35: Skin-tone-locked Phase 1 — generate on the CORRECT skin tone from the start,
     // so Phase 2 doesn't need to "fix" skin color (which it often fails to do for crops/details).
     const phase1Refs = referenceImages.filter(r =>
@@ -803,23 +774,16 @@ TASK: Reproduce this EXACT garment on a generic ${modelGender} model.
 ${garmentCategory ? `\nGARMENT TYPE: This product is "${garmentCategory.toUpperCase()}". Generate ONLY this garment type — nothing else.` : ''}
 
 CRITICAL — GARMENT FIDELITY:
-- The mannequin reference images are the GROUND TRUTH. Match the exact wash, color, fading pattern.
+- The fit model reference images are the GROUND TRUTH. Match the exact wash, color, fading pattern.
 - Match every construction detail: pockets (shape, placement, stitching), seams, belt loops, waistband, hardware.
 - Match the silhouette exactly — if it's a flare, the flare width must match. If straight, keep straight.
 - Do NOT invent details. No labels, patches, or stitching that don't exist in the reference.
 ${garmentHexColor ? `- GARMENT COLOR LOCK: ${garmentHexColor}. The fabric MUST match this exact color.` : ''}
 
-CRITICAL — BACK POCKET STITCHING COLOR: The stitching on the back pockets MUST match the EXACT color shown in the mannequin back-view reference. If the mannequin shows tone-on-tone stitching (same color as denim), the output MUST show tone-on-tone stitching. Do NOT default to white/contrast stitching unless the mannequin reference CLEARLY shows white stitching. White stitching when the reference shows tone-on-tone = CRITICAL FAILURE.
-
-CRITICAL — MANNEQUIN STRAPS ARE NOT GARMENT STRAPS:
-- The mannequin torso has SHOULDER STRAPS, BANDS, and SUPPORT HARDWARE that hold the form together.
-- These straps are EQUIPMENT — they are NOT denim straps, NOT overall straps, NOT part of the garment.
-- If you see straps on the mannequin shoulders + denim pants below, the garment is PANTS/JEANS — NOT overalls or dungarees.
-- The GARMENT TYPE above tells you what this product is. Trust the category, not the mannequin hardware.
-- Generating overalls/dungarees when the product is pants or jeans is a CRITICAL FAILURE.
+CRITICAL — BACK POCKET STITCHING COLOR: The stitching on the back pockets MUST match the EXACT color shown in the fit model back-view reference. If the reference shows tone-on-tone stitching (same color as denim), the output MUST show tone-on-tone stitching. Do NOT default to white/contrast stitching unless the reference CLEARLY shows white stitching. White stitching when the reference shows tone-on-tone = CRITICAL FAILURE.
 
 CRITICAL — DO NOT ADD DISTRESSING:
-- Do NOT add tears, rips, fraying, distressing, or worn patches UNLESS they are CLEARLY visible in the mannequin photos.
+- Do NOT add tears, rips, fraying, distressing, or worn patches UNLESS they are CLEARLY visible in the fit model photos.
 - Clean denim is CLEAN — smooth, non-distressed fabric must stay smooth and non-distressed.
 - Do NOT add fraying at pocket edges, knee rips, or distressed patches that do not exist in the reference.
 
@@ -835,11 +799,10 @@ ASPECT: 9:16 portrait, full body head to toe visible.
 ${ECOM_NO_GOS}
 
 ${hasFitModelRefs
-  ? `The reference images include BOTH mannequin angles AND fit model photos (real human wearing the garment).
-Use MANNEQUIN images for: construction details, pocket placement, stitching, hardware, wash pattern, color.
-Use FIT MODEL images for: how the fabric DRAPES and FALLS on a real body, natural silhouette, waist/hip/knee fit, fabric movement.
-The fit model shows the TRUTH of how this garment looks when worn — prioritize its silhouette and drape over the mannequin's rigid shape.`
-  : `The reference images show the garment from multiple angles on a mannequin. Use them ALL to understand the 3D construction, then render with photographic realism.`}
+  ? `The reference images include fit model photos (real human wearing the garment) from multiple angles (front first, rotating right).
+Use these for: construction details, pocket placement, stitching, hardware, wash pattern, color, fabric drape, silhouette, and how the garment falls on a real body.
+The fit model shows the TRUTH of how this garment looks when worn.`
+  : `The reference images show the garment. Use them ALL to understand the 3D construction, then render with photographic realism.`}
 
 ${finalPrompt.includes('FLOOR-LENGTH') ? 'HEM: Floor-length — hems touch/nearly touch the ground, shoes mostly hidden.' : ''}
 ${finalPrompt.includes('ANKLE-LENGTH') ? 'HEM: Ankle-length — hem ends at the ankle, full shoe visible.' : ''}`;
@@ -847,12 +810,12 @@ ${finalPrompt.includes('ANKLE-LENGTH') ? 'HEM: Ankle-length — hem ends at the 
     // ── v35 Option B: SINGLE-PHASE M05 — skip Phase 1 entirely for detail shots ──
     // M05 is a tight back-pocket close-up. The 4K Pro garment fidelity of Phase 1 is wasted
     // on a pocket-sized area, and the Phase 1→2 handoff loses skin tone (causing ethnicity drift).
-    // Single-phase Flash with dressed base + mannequin refs + skin tone swatch = better results.
+    // Single-phase Flash with dressed base + fit model refs + skin tone swatch = better results.
     if (isDetailShot) {
       console.log(`[Generate] v35: M05 single-phase — skipping Phase 1/Phase 2 split`);
       await reportProgress('Generating detail shot (single phase)', 30);
 
-      // Build M05 references: dressed base (back) + mannequin back views + zone grids + skin swatch
+      // Build M05 references: dressed base (back) + fit model back views + zone grids + skin swatch
       const m05Refs: Array<{ buffer: Buffer; mimeType: string; label: string }> = [];
 
       // 1. Dressed base (back view) — identity + skin tone anchor
@@ -895,10 +858,11 @@ ${finalPrompt.includes('ANKLE-LENGTH') ? 'HEM: Ankle-length — hem ends at the 
         });
       }
 
-      // 4. Mannequin back views (pocket detail references)
-      const backAngles = mannequinBuffers.filter(mb => {
-        const totalAngles = image360Urls?.length || 7;
-        const backIdx = Math.floor(totalAngles / 2);
+      // 4. Fit model back views (pocket detail references)
+      // Fit model images ordered: front first, rotating right. Back ≈ middle index.
+      const totalFitAngles = fitModelBuffers.length || 1;
+      const backIdx = Math.floor(totalFitAngles / 2);
+      const backAngles = fitModelBuffers.filter(mb => {
         return mb.index >= backIdx - 1 && mb.index <= backIdx + 1;
       });
       for (const mb of backAngles) {
@@ -906,12 +870,12 @@ ${finalPrompt.includes('ANKLE-LENGTH') ? 'HEM: Ankle-length — hem ends at the 
         m05Refs.push({
           buffer: resized,
           mimeType: 'image/jpeg',
-          label: `MANNEQUIN BACK VIEW — Back pocket construction reference. Copy pocket shape, stitching pattern, arc shape, rivets, and all construction details EXACTLY.`,
+          label: `FIT MODEL BACK VIEW — Back pocket construction reference. Copy pocket shape, stitching pattern, arc shape, rivets, and all construction details EXACTLY.`,
         });
       }
-      // If no back angles found, use all mannequin refs
+      // If no back angles found, use all fit model refs
       if (backAngles.length === 0) {
-        for (const ref of referenceImages.filter(r => r.label.includes('MANNEQUIN'))) {
+        for (const ref of referenceImages.filter(r => r.label.includes('FIT MODEL'))) {
           m05Refs.push(ref);
         }
       }
@@ -926,18 +890,18 @@ ${finalPrompt.includes('ANKLE-LENGTH') ? 'HEM: Ankle-length — hem ends at the 
       }
 
       // 6. Flat image for color reference
-      if (flatImageUrl) {
+      if (flatFrontUrl) {
         const flatRef = referenceImages.find(r => r.label.includes('FLAT IMAGE'));
         if (flatRef) m05Refs.push(flatRef);
       }
 
-      // 7. v37: COLOR ANCHOR — mannequin front view (index 0) with hex label
-      // M05 was missing this entirely, causing dark denim drift. The front mannequin
-      // is the definitive color reference — it's studio-lit and has the hex injected.
+      // 7. v37: COLOR ANCHOR — fit model front view (index 0) with hex label
+      // M05 was missing this entirely, causing dark denim drift. The front fit model
+      // is the definitive color reference — it has the hex injected.
       const colorAnchorRef = referenceImages.find(r => r.label.includes('COLOR ANCHOR'));
       if (colorAnchorRef) {
         m05Refs.push(colorAnchorRef);
-        console.log(`[Generate] v37: M05 — COLOR ANCHOR mannequin front injected`);
+        console.log(`[Generate] v37: M05 — COLOR ANCHOR fit model front injected`);
       }
 
       // 8. v37: M03 garment template as cross-shot color lock (same as M04 gets)
@@ -964,14 +928,14 @@ FRAMING: Camera at hip height, ~40cm away. Frame from just above the back waistb
 PRODUCT PHOTOGRAPHY — like a detail zoom on an e-commerce product page.
 
 GARMENT FIDELITY (CRITICAL):
-- Reproduce the pocket EXACTLY as it appears in the mannequin reference photos.
+- Reproduce the pocket EXACTLY as it appears in the fit model reference photos.
 - Every stitch line, arc shape, rivet, and denim texture must match the references precisely.
 - Do NOT invent, add, or hallucinate ANY details not visible in the references — no extra stitch lines, no horizontal lines across the pocket, no extra creases, no labels, no patches.
 - If the reference pocket has a clean curved arc stitch and nothing else, show ONLY that.
 - POCKET PROPORTIONS: MEASURE the pocket height relative to the waistband-to-crotch distance in the references and reproduce that EXACT ratio.
 ${garmentHexColor ? `- GARMENT COLOR LOCK: ${garmentHexColor}. The denim MUST match this exact color.` : ''}
 
-BACK POCKET STITCHING COLOR: Match the EXACT stitching color from the mannequin. Tone-on-tone stays tone-on-tone. Do NOT default to white/contrast stitching.
+BACK POCKET STITCHING COLOR: Match the EXACT stitching color from the fit model reference. Tone-on-tone stays tone-on-tone. Do NOT default to white/contrast stitching.
 
 SKIN TONE (CRITICAL): ${skinToneHex ? `This model has ${skinToneDesc} (measured: ${skinToneHex}). A skin tone swatch is included — ALL visible skin MUST match it. Wrong skin tone is a CRITICAL FAILURE. Do NOT default to lighter skin.` : 'Match skin tone to the model reference.'}
 
@@ -1143,7 +1107,7 @@ ${garmentDNA ? garmentDNA.dna : ''}`;
     // For back-view shots: always run own Phase 1 (different angle)
     // For M03 or when no anchor available: run Phase 1
     if (!phase1ImageData) {
-      console.log(`[Generate] Phase 1 (Pro garment template) starting — ${phase1Refs.length} refs, ${isBackView ? 'back' : 'front'} view${hasFitModelRefs ? ', fit+mannequin combined' : ''}...`);
+      console.log(`[Generate] Phase 1 (Pro garment template) starting — ${phase1Refs.length} refs, ${isBackView ? 'back' : 'front'} view${hasFitModelRefs ? ', fit model refs' : ''}...`);
       await reportProgress('Generating garment template (Phase 1)', 30);
       const phase1Result = await generateImage({
         prompt: phase1Prompt,
@@ -1311,6 +1275,22 @@ ${garmentDNA ? garmentDNA.dna : ''}`;
       console.log(`[Generate] Phase 2: injected ${keyZones.length} zone grid crops for construction detail fidelity`);
     }
 
+    // 5. Flat back image for back-view shots (M02, M04, M05) — back pocket/label ground truth
+    if (isBackView && flatBackUrl) {
+      try {
+        const flatBackBuffer = await downloadGarmentImage(flatBackUrl.split('?')[0]);
+        const resizedFlatBack = await resizeForFeed(flatBackBuffer, 1400);
+        phase2Refs.push({
+          buffer: resizedFlatBack,
+          mimeType: 'image/jpeg',
+          label: `FLAT BACK IMAGE — Back view of the garment laid flat. This is the GROUND TRUTH for back pocket shape, stitching pattern, label placement, and back panel construction. Reproduce these details EXACTLY.`,
+        });
+        console.log(`[Generate] Phase 2: flat back image injected for ${shotType} (back-view shot)`);
+      } catch (flatBackErr) {
+        console.error(`[Generate] Phase 2: flat back image load failed (non-blocking):`, flatBackErr);
+      }
+    }
+
     const isCroppedPhase2 = isCroppedShot && !fullBodyThenCrop; // v30: false for M01/M02 — generate full body
     const expressionRule = 'EXPRESSION: Relaxed, confident, chin up, energy through eyes. Lips TOGETHER — NO smile showing teeth, NO grinning, NO laughing. Cool self-assured composure.';
     const ecomPoseHint = modelGender === 'female'
@@ -1339,7 +1319,7 @@ RULES:
 - GARMENT SILHOUETTE: Match the garment silhouette EXACTLY from the garment template — same width at waist, hip, knee, and hem. Do NOT widen or narrow the legs. If the garment template shows wide/barrel legs, the output MUST show the same wide/barrel proportion.
 - CONSTRUCTION DETAILS (CRITICAL): Reproduce EVERY visible construction detail from the garment template — knee panel seams, articulated knee construction lines, yoke seams, back pocket stitching arcs, rivets, belt loops, fly stitching. If the garment template shows 3D articulated knee panels with horizontal or diagonal seam lines across the knee area, those lines MUST appear in the output at the SAME position. Smooth knees when the template shows seam construction = CRITICAL FAILURE.
 
-CRITICAL — BACK POCKET STITCHING COLOR: The stitching on the back pockets MUST match the EXACT color shown in the mannequin back-view reference. If the mannequin shows tone-on-tone stitching (same color as denim), the output MUST show tone-on-tone stitching. Do NOT default to white/contrast stitching unless the mannequin reference CLEARLY shows white stitching. White stitching when the reference shows tone-on-tone = CRITICAL FAILURE.
+CRITICAL — BACK POCKET STITCHING COLOR: The stitching on the back pockets MUST match the EXACT color shown in the fit model back-view reference. If the reference shows tone-on-tone stitching (same color as denim), the output MUST show tone-on-tone stitching. Do NOT default to white/contrast stitching unless the reference CLEARLY shows white stitching. White stitching when the reference shows tone-on-tone = CRITICAL FAILURE.
 
 ${!isCroppedPhase2 ? `- MODEL IDENTITY (CRITICAL): The person in the output MUST be the EXACT same person from the model card/dressed base reference. Same face, same skin tone, same hair color/style/length, same body build. A different-looking person is a CRITICAL FAILURE. Do NOT generate a random model — match the reference identity precisely. Do NOT change body type (slim model must stay slim, NOT become plus-size).` : `- MODEL: ${modelGender} model (cropped shot — no face visible). ${skinToneHex ? `CRITICAL — SKIN TONE: This model has ${skinToneDesc} (measured: ${skinToneHex}). All visible skin (hands, wrists, ankles, calves) MUST match this EXACT tone. Do NOT default to lighter skin. Wrong skin color is a CRITICAL FAILURE.` : ''}`}
 - POSE: ${shotPoseDesc}
@@ -1593,7 +1573,7 @@ The most critical thing: the GARMENT must be IDENTICAL to the garment template. 
     // POST-PROCESS 5: Label composite — DISABLED for now, testing separately
     // TODO: Re-enable after label quality validation
     // const isBackShot = shotType === 'M02' || shotType === 'M04';
-    // if (isBackShot && mannequinBuffers.length > 0) { ... }
+    // if (isBackShot && fitModelBuffers.length > 0) { ... }
     console.log(`[Generate] POST5: Label composite SKIPPED (disabled for testing)`);
 
     // Upload to GCS

@@ -19,17 +19,17 @@ export async function GET(req: NextRequest) {
 
 /**
  * POST /api/wardrobe
- * Create a new wardrobe stock item with 360° images.
- * Body: { name, category, description, images360Base64[], flatImageBase64? }
+ * Create a new wardrobe stock item with fit model images + flat front/back.
+ * Body: { name, category, description, fitModelBase64[] (up to 8, front-first rotating right), flatFrontBase64?, flatBackBase64? }
  */
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
-    const { name, category, description, images360Base64, flatImageBase64, imageUrls: gcsImageUrls, flatImageUrl: gcsFlatImageUrl, fitModelUrls: gcsFitModelUrls, isPrimary, gender, openShoes, hasHeels } = body;
+    const { name, category, description, fitModelBase64, flatFrontBase64, flatBackBase64, fitModelUrls: gcsFitModelUrls, flatFrontUrl: gcsFlatFrontUrl, flatBackUrl: gcsFlatBackUrl, isPrimary, gender, openShoes, hasHeels } = body;
 
-    if (!name || !category || !description || (!images360Base64?.length && !gcsImageUrls?.length)) {
+    if (!name || !category || !description || (!fitModelBase64?.length && !gcsFitModelUrls?.length)) {
       return NextResponse.json(
-        { error: 'name, category, description, and images360Base64 (or imageUrls) are required' },
+        { error: 'name, category, description, and fitModelBase64 (or fitModelUrls) are required' },
         { status: 400 }
       );
     }
@@ -37,27 +37,27 @@ export async function POST(req: NextRequest) {
     // Resolve gender — shoes default to 'unisex', other categories require a value (default 'unisex' if omitted)
     const resolvedGender: 'male' | 'female' | 'unisex' = gender || (category === 'shoes' ? 'unisex' : 'unisex');
 
-    // ── Fast path: GCS URLs already uploaded (e.g. from job auto-save backfill) ──
-    if (gcsImageUrls?.length && !images360Base64?.length) {
+    // ── Fast path: GCS URLs already uploaded ──
+    if (gcsFitModelUrls?.length && !fitModelBase64?.length) {
       const wardrobeId = await createWardrobeItem({
         name,
         category,
         description,
         gender: resolvedGender,
-        imageUrls: gcsImageUrls,
-        fitModelUrls: gcsFitModelUrls?.length ? gcsFitModelUrls : undefined,
-        flatImageUrl: gcsFlatImageUrl || undefined,
-        thumbnailUrl: gcsImageUrls[0] || gcsFlatImageUrl || '',
+        fitModelUrls: gcsFitModelUrls,
+        flatFrontUrl: gcsFlatFrontUrl || undefined,
+        flatBackUrl: gcsFlatBackUrl || undefined,
+        thumbnailUrl: gcsFitModelUrls[0] || gcsFlatFrontUrl || '',
         isPrimary: isPrimary !== undefined ? isPrimary : undefined,
         openShoes: openShoes !== undefined ? openShoes : undefined,
         hasHeels: hasHeels !== undefined ? hasHeels : undefined,
       });
       return NextResponse.json({
         wardrobeId,
-        imageUrls: gcsImageUrls,
-        fitModelUrls: gcsFitModelUrls || [],
-        flatImageUrl: gcsFlatImageUrl || '',
-        thumbnailUrl: gcsImageUrls[0],
+        fitModelUrls: gcsFitModelUrls,
+        flatFrontUrl: gcsFlatFrontUrl || '',
+        flatBackUrl: gcsFlatBackUrl || '',
+        thumbnailUrl: gcsFitModelUrls[0],
       });
     }
 
@@ -67,45 +67,55 @@ export async function POST(req: NextRequest) {
       category,
       description,
       gender: resolvedGender,
-      imageUrls: [],       // Will update after upload
+      fitModelUrls: [],    // Will update after upload
       thumbnailUrl: '',    // Will update after upload
       isPrimary: isPrimary !== undefined ? isPrimary : undefined,
     });
 
-    // Upload 360° images to GCS
-    const maxImages = Math.min(images360Base64.length, 9);
-    const imageUrls: string[] = [];
+    // Upload fit model images to GCS (up to 8, ordered front-first rotating right)
+    const maxImages = Math.min(fitModelBase64.length, 8);
+    const fitModelUrls: string[] = [];
 
     for (let i = 0; i < maxImages; i++) {
-      const base64 = images360Base64[i].replace(/^data:image\/\w+;base64,/, '');
+      const base64 = fitModelBase64[i].replace(/^data:image\/\w+;base64,/, '');
       const buffer = Buffer.from(base64, 'base64');
-      const filename = `360_${String(i).padStart(2, '0')}.jpg`;
+      const filename = `fitmodel_${String(i).padStart(2, '0')}.jpg`;
       const url = await uploadWardrobeImage(category, wardrobeId, filename, buffer);
-      imageUrls.push(url);
+      fitModelUrls.push(url);
     }
 
-    // Upload flat image if provided
-    let flatImageUrl: string | undefined;
-    if (flatImageBase64) {
-      const base64 = flatImageBase64.replace(/^data:image\/\w+;base64,/, '');
+    // Upload flat front image if provided
+    let flatFrontUrl: string | undefined;
+    if (flatFrontBase64) {
+      const base64 = flatFrontBase64.replace(/^data:image\/\w+;base64,/, '');
       const buffer = Buffer.from(base64, 'base64');
-      flatImageUrl = await uploadWardrobeImage(category, wardrobeId, 'flat.jpg', buffer);
+      flatFrontUrl = await uploadWardrobeImage(category, wardrobeId, 'flat_front.jpg', buffer);
+    }
+
+    // Upload flat back image if provided
+    let flatBackUrl: string | undefined;
+    if (flatBackBase64) {
+      const base64 = flatBackBase64.replace(/^data:image\/\w+;base64,/, '');
+      const buffer = Buffer.from(base64, 'base64');
+      flatBackUrl = await uploadWardrobeImage(category, wardrobeId, 'flat_back.jpg', buffer);
     }
 
     // Update doc with image URLs
     const { wardrobeCol } = await import('@/lib/firestore');
     await wardrobeCol.doc(wardrobeId).update({
-      imageUrls,
-      flatImageUrl: flatImageUrl || '',
-      thumbnailUrl: imageUrls[0] || '',
+      fitModelUrls,
+      flatFrontUrl: flatFrontUrl || '',
+      flatBackUrl: flatBackUrl || '',
+      thumbnailUrl: fitModelUrls[0] || flatFrontUrl || '',
       updatedAt: new Date(),
     });
 
     return NextResponse.json({
       wardrobeId,
-      imageUrls,
-      flatImageUrl,
-      thumbnailUrl: imageUrls[0],
+      fitModelUrls,
+      flatFrontUrl,
+      flatBackUrl,
+      thumbnailUrl: fitModelUrls[0],
     });
   } catch (err: any) {
     console.error('[Wardrobe POST]', err);

@@ -372,7 +372,7 @@ function NewJobContent() {
                               <div className="grid grid-cols-4 sm:grid-cols-5 md:grid-cols-6 gap-3">
                                 {catItems.map((item: any) => {
                                   const isSelected = wardrobeSourceItem?.id === item.id;
-                                  const totalPhotos = (item.imageUrls?.length || 0) + ((item as any).fitModelUrls?.length || 0) + (item.flatImageUrl ? 1 : 0);
+                                  const totalPhotos = (item.fitModelUrls?.length || item.imageUrls?.length || 0) + (item.flatFrontUrl || item.flatImageUrl ? 1 : 0) + (item.flatBackUrl ? 1 : 0);
                                   return (
                                     <button
                                       key={item.id}
@@ -425,7 +425,7 @@ function NewJobContent() {
                   <svg className="w-4 h-4 text-green-600 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
                   </svg>
-                  <span className="text-sm text-neutral-700">Using <strong>{wardrobeSourceItem.name}</strong> ({(wardrobeSourceItem.imageUrls?.length || 0) + ((wardrobeSourceItem as any).fitModelUrls?.length || 0) + (wardrobeSourceItem.flatImageUrl ? 1 : 0)} photos)</span>
+                  <span className="text-sm text-neutral-700">Using <strong>{wardrobeSourceItem.name}</strong> ({(wardrobeSourceItem.fitModelUrls?.length || wardrobeSourceItem.imageUrls?.length || 0) + (wardrobeSourceItem.flatFrontUrl || wardrobeSourceItem.flatImageUrl ? 1 : 0) + (wardrobeSourceItem.flatBackUrl ? 1 : 0)} photos)</span>
                   <button type="button" onClick={() => { setWardrobeSourceItem(null); setDesignNumber(''); }} className="ml-auto text-xs text-neutral-400 hover:text-neutral-700">Clear</button>
                 </div>
               )}
@@ -952,8 +952,8 @@ function NewJobContent() {
                   setSubmitError('');
                   try {
                     // Wardrobe source — pass GCS URLs directly (no base64 upload)
-                    const image360Urls_passthrough = wardrobeSourceItem?.imageUrls || [];
-                    const flatImageUrl_passthrough = wardrobeSourceItem?.flatImageUrl || undefined;
+                    const flatFrontUrl_passthrough = wardrobeSourceItem?.flatFrontUrl || wardrobeSourceItem?.flatImageUrl || undefined;
+                    const flatBackUrl_passthrough = wardrobeSourceItem?.flatBackUrl || undefined;
 
                     // Build wardrobe item IDs (only non-null selections)
                     const wardrobeItemIds: Record<string, string> = {};
@@ -981,8 +981,8 @@ function NewJobContent() {
                         flatImageBase64: '',
                         flatImageMimeType: '',
                         images360Base64: [],
-                        ...(flatImageUrl_passthrough ? { flatImageUrl: flatImageUrl_passthrough } : {}),
-                        ...(image360Urls_passthrough.length > 0 ? { image360Urls: image360Urls_passthrough } : {}),
+                        ...(flatFrontUrl_passthrough ? { flatFrontUrl: flatFrontUrl_passthrough } : {}),
+                        ...(flatBackUrl_passthrough ? { flatBackUrl: flatBackUrl_passthrough } : {}),
                         wardrobeItemIds,
                       }),
                     });

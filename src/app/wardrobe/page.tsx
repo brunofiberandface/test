@@ -15,9 +15,9 @@ interface WardrobeItem {
   category: WardrobeCategory;
   gender?: WardrobeGender;
   description: string;
-  imageUrls: string[];
-  fitModelUrls?: string[];
-  flatImageUrl?: string;
+  fitModelUrls: string[];       // Fit model images (up to 8, front-first rotating right)
+  flatFrontUrl?: string;        // Flat product photo — front
+  flatBackUrl?: string;         // Flat product photo — back
   thumbnailUrl: string;
   isPrimary?: boolean;  // true = focus garment (step 1), false = styling item (step 3)
   openShoes?: boolean;  // true = open-toe shoes (sandals, slides) — triggers foot resize
@@ -68,8 +68,10 @@ export default function WardrobePage() {
   const [saving, setSaving] = useState(false);
   const [deleteConfirm, setDeleteConfirm] = useState(false);
   const [imageActionLoading, setImageActionLoading] = useState<string | null>(null); // URL being acted on
-  const [editFlatFile, setEditFlatFile] = useState<File | null>(null);
-  const [editFlatPreview, setEditFlatPreview] = useState<string | null>(null);
+  const [editFlatFrontFile, setEditFlatFrontFile] = useState<File | null>(null);
+  const [editFlatFrontPreview, setEditFlatFrontPreview] = useState<string | null>(null);
+  const [editFlatBackFile, setEditFlatBackFile] = useState<File | null>(null);
+  const [editFlatBackPreview, setEditFlatBackPreview] = useState<string | null>(null);
 
   // Add form state
   const [name, setName] = useState('');
@@ -79,8 +81,9 @@ export default function WardrobePage() {
   const [openShoesCreate, setOpenShoesCreate] = useState<boolean>(false);
   const [hasHeelsCreate, setHasHeelsCreate] = useState<boolean>(false);
   const [description, setDescription] = useState('');
-  const [files360, setFiles360] = useState<File[]>([]);
-  const [fileFlat, setFileFlat] = useState<File | null>(null);
+  const [filesFitModel, setFilesFitModel] = useState<File[]>([]);
+  const [fileFlatFront, setFileFlatFront] = useState<File | null>(null);
+  const [fileFlatBack, setFileFlatBack] = useState<File | null>(null);
   const [uploading, setUploading] = useState(false);
 
   // Translation state — create form
@@ -141,8 +144,10 @@ export default function WardrobePage() {
     setEditIsPrimary(item.isPrimary !== undefined ? item.isPrimary : defaultIsPrimary(item.category));
     setEditOpenShoes(item.openShoes || false);
     setEditHasHeels((item as any).hasHeels || false);
-    setEditFlatFile(null);
-    setEditFlatPreview(null);
+    setEditFlatFrontFile(null);
+    setEditFlatFrontPreview(null);
+    setEditFlatBackFile(null);
+    setEditFlatBackPreview(null);
     setDeleteConfirm(false);
   }
 
@@ -156,17 +161,18 @@ export default function WardrobePage() {
     if (!selectedItem) return;
     setSaving(true);
     try {
-      // Convert flat image to base64 if a new one was selected
-      let flatImageBase64: string | undefined;
-      if (editFlatFile) {
-        flatImageBase64 = await fileToBase64(editFlatFile);
-      }
+      // Convert flat images to base64 if new ones were selected
+      let flatFrontBase64: string | undefined;
+      let flatBackBase64: string | undefined;
+      if (editFlatFrontFile) flatFrontBase64 = await fileToBase64(editFlatFrontFile);
+      if (editFlatBackFile) flatBackBase64 = await fileToBase64(editFlatBackFile);
 
       const patchBody: Record<string, any> = {
         name: editName, description: editDescription, category: editCategory,
         isPrimary: editIsPrimary, gender: editGender, openShoes: editOpenShoes, hasHeels: editHasHeels,
       };
-      if (flatImageBase64) patchBody.flatImageBase64 = flatImageBase64;
+      if (flatFrontBase64) patchBody.flatFrontBase64 = flatFrontBase64;
+      if (flatBackBase64) patchBody.flatBackBase64 = flatBackBase64;
 
       const res = await fetch(`/api/wardrobe/${selectedItem.wardrobeId || selectedItem.id}`, {
         method: 'PATCH',
@@ -175,19 +181,18 @@ export default function WardrobePage() {
       });
       if (res.ok) {
         const data = await res.json();
-        // Update local state — include new flatImageUrl if returned
+        // Update local state — include new flat URLs if returned
         const updated = {
           ...selectedItem, name: editName, description: editDescription, category: editCategory,
           isPrimary: editIsPrimary, gender: editGender, openShoes: editOpenShoes, hasHeels: editHasHeels,
-          ...(data.flatImageUrl ? { flatImageUrl: data.flatImageUrl } : {}),
+          ...(data.flatFrontUrl ? { flatFrontUrl: data.flatFrontUrl } : {}),
+          ...(data.flatBackUrl ? { flatBackUrl: data.flatBackUrl } : {}),
         } as any;
         setSelectedItem(updated);
         setItems(prev => prev.map(i => (i.id === selectedItem.id ? updated : i)));
         // Clear flat file state after successful upload
-        if (editFlatFile) {
-          setEditFlatFile(null);
-          setEditFlatPreview(null);
-        }
+        if (editFlatFrontFile) { setEditFlatFrontFile(null); setEditFlatFrontPreview(null); }
+        if (editFlatBackFile) { setEditFlatBackFile(null); setEditFlatBackPreview(null); }
       }
     } finally {
       setSaving(false);
@@ -203,7 +208,7 @@ export default function WardrobePage() {
     }
   }
 
-  async function handleImageAction(action: 'rotate' | 'rotate-left' | 'delete', url: string, imageType: 'mannequin' | 'flat' | 'fitModel') {
+  async function handleImageAction(action: 'rotate' | 'rotate-left' | 'delete', url: string, imageType: 'fitModel' | 'flatFront' | 'flatBack') {
     if (!selectedItem || imageActionLoading) return;
     if (action === 'delete' && !confirm('Delete this image?')) return;
     setImageActionLoading(url);
@@ -256,19 +261,21 @@ export default function WardrobePage() {
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-    if (!name || !description || files360.length === 0) return;
+    if (!name || !description || filesFitModel.length === 0) return;
     setUploading(true);
     try {
-      const images360Base64 = await Promise.all(files360.map(f => fileToBase64(f)));
-      let flatImageBase64: string | undefined;
-      if (fileFlat) flatImageBase64 = await fileToBase64(fileFlat);
+      const fitModelBase64 = await Promise.all(filesFitModel.map(f => fileToBase64(f)));
+      let flatFrontBase64: string | undefined;
+      let flatBackBase64: string | undefined;
+      if (fileFlatFront) flatFrontBase64 = await fileToBase64(fileFlatFront);
+      if (fileFlatBack) flatBackBase64 = await fileToBase64(fileFlatBack);
       const res = await fetch('/api/wardrobe', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, category, description, images360Base64, flatImageBase64, isPrimary: isPrimaryCreate, gender: genderCreate, openShoes: openShoesCreate, hasHeels: hasHeelsCreate }),
+        body: JSON.stringify({ name, category, description, fitModelBase64, flatFrontBase64, flatBackBase64, isPrimary: isPrimaryCreate, gender: genderCreate, openShoes: openShoesCreate, hasHeels: hasHeelsCreate }),
       });
       if (res.ok) {
-        setName(''); setDescription(''); setFiles360([]); setFileFlat(null); setShowForm(false);
+        setName(''); setDescription(''); setFilesFitModel([]); setFileFlatFront(null); setFileFlatBack(null); setShowForm(false);
         setIsPrimaryCreate(false);
         setGenderCreate('unisex');
         fetchItems();
@@ -283,11 +290,10 @@ export default function WardrobePage() {
     }
   }
 
-  // All images for selected item (360° + flat + fit model)
-  const mannequinImages = selectedItem?.imageUrls || [];
+  // All images for selected item (fit model + flat front/back)
   const fitModelImages = selectedItem?.fitModelUrls || [];
   const allImages = selectedItem
-    ? [...mannequinImages, ...(selectedItem.flatImageUrl ? [selectedItem.flatImageUrl] : [])]
+    ? [...fitModelImages]
     : [];
 
   return (
@@ -387,18 +393,22 @@ export default function WardrobePage() {
               </div>
             )}
           </div>
+          <div>
+            <label className="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-1">Fit Model Photos (up to 8 — front first, rotating right)</label>
+            <input type="file" multiple accept="image/*" onChange={(e) => setFilesFitModel(Array.from(e.target.files || []).slice(0, 8))} className="w-full text-sm" />
+            {filesFitModel.length > 0 && <p className="text-xs text-neutral-400 mt-1">{filesFitModel.length} photos selected</p>}
+          </div>
           <div className="grid grid-cols-2 gap-4">
             <div>
-              <label className="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-1">360° Photos</label>
-              <input type="file" multiple accept="image/*" onChange={(e) => setFiles360(Array.from(e.target.files || []))} className="w-full text-sm" />
-              {files360.length > 0 && <p className="text-xs text-neutral-400 mt-1">{files360.length} photos selected</p>}
+              <label className="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-1">Flat Front</label>
+              <input type="file" accept="image/*" onChange={(e) => setFileFlatFront(e.target.files?.[0] || null)} className="w-full text-sm" />
             </div>
             <div>
-              <label className="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-1">Flat Image (optional)</label>
-              <input type="file" accept="image/*" onChange={(e) => setFileFlat(e.target.files?.[0] || null)} className="w-full text-sm" />
+              <label className="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-1">Flat Back</label>
+              <input type="file" accept="image/*" onChange={(e) => setFileFlatBack(e.target.files?.[0] || null)} className="w-full text-sm" />
             </div>
           </div>
-          <button type="submit" disabled={uploading || !name || !description || files360.length === 0}
+          <button type="submit" disabled={uploading || !name || !description || filesFitModel.length === 0}
             className="px-6 py-2 bg-neutral-900 text-white text-sm hover:bg-neutral-800 disabled:opacity-40 transition-colors">
             {uploading ? 'Uploading...' : 'Save to Wardrobe'}
           </button>
@@ -460,9 +470,9 @@ export default function WardrobePage() {
                   {item.openShoes && <span className="ml-1 text-[9px] text-orange-500">open</span>}
                                   {(item as any).hasHeels && <span className="ml-1 text-[9px] text-purple-500">heels</span>}
                 </span>
-                {item.imageUrls?.length > 1 && (
+                {item.fitModelUrls?.length > 1 && (
                   <span className="absolute bottom-2 right-2 px-2 py-0.5 bg-black/60 text-white text-xs">
-                    {item.imageUrls.length + (item.flatImageUrl ? 1 : 0)} imgs
+                    {item.fitModelUrls.length} imgs
                   </span>
                 )}
               </div>
@@ -492,66 +502,12 @@ export default function WardrobePage() {
             {/* Scrollable content */}
             <div className="flex-1 overflow-y-auto p-6 space-y-6">
 
-              {/* Mannequin / 360° image thumbnails */}
+              {/* Fit model images (primary garment reference) */}
               <div>
                 <p className="text-xs font-medium text-neutral-500 uppercase tracking-wider mb-3">
-                  Mannequin / 360° ({allImages.length})
+                  Fit Model Photos ({fitModelImages.length}/8) — front first, rotating right
                 </p>
-                {allImages.length > 0 ? (
-                  <div className="grid grid-cols-4 gap-2">
-                    {allImages.map((url, i) => {
-                      const isFlat = selectedItem.flatImageUrl && url.split('?')[0] === selectedItem.flatImageUrl.split('?')[0];
-                      const imgType = isFlat ? 'flat' as const : 'mannequin' as const;
-                      const isLoading = imageActionLoading?.split('?')[0] === url.split('?')[0];
-                      return (
-                        <div key={`m-${i}-${url}`}
-                          className="aspect-square bg-neutral-100 overflow-hidden cursor-pointer hover:ring-2 hover:ring-neutral-900 transition-all relative group">
-                          <img src={url} alt={`View ${i + 1}`} onClick={() => setLightboxUrl(url)}
-                            className={`w-full h-full object-cover group-hover:scale-105 transition-transform duration-200 ${isLoading ? 'opacity-40' : ''}`} />
-                          {isFlat && (
-                            <span className="absolute bottom-0 left-0 right-0 bg-black/60 text-white text-xs text-center py-0.5">flat</span>
-                          )}
-                          {/* Rotate + Delete overlay */}
-                          <div className="absolute top-1 right-1 flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                            <button
-                              onClick={(e) => { e.stopPropagation(); handleImageAction('rotate-left', url, imgType); }}
-                              disabled={!!imageActionLoading}
-                              className="w-6 h-6 bg-black/70 text-white text-xs flex items-center justify-center hover:bg-black/90 disabled:opacity-40"
-                              title="Rotate 90° left"
-                            >↺</button>
-                            <button
-                              onClick={(e) => { e.stopPropagation(); handleImageAction('rotate', url, imgType); }}
-                              disabled={!!imageActionLoading}
-                              className="w-6 h-6 bg-black/70 text-white text-xs flex items-center justify-center hover:bg-black/90 disabled:opacity-40"
-                              title="Rotate 90° right"
-                            >↻</button>
-                            <button
-                              onClick={(e) => { e.stopPropagation(); handleImageAction('delete', url, imgType); }}
-                              disabled={!!imageActionLoading}
-                              className="w-6 h-6 bg-red-600/80 text-white text-xs flex items-center justify-center hover:bg-red-700 disabled:opacity-40"
-                              title="Delete image"
-                            >✕</button>
-                          </div>
-                          {isLoading && (
-                            <div className="absolute inset-0 flex items-center justify-center bg-black/30">
-                              <span className="text-white text-xs animate-pulse">...</span>
-                            </div>
-                          )}
-                        </div>
-                      );
-                    })}
-                  </div>
-                ) : (
-                  <p className="text-sm text-neutral-400">No images</p>
-                )}
-              </div>
-
-              {/* Fit model images */}
-              {fitModelImages.length > 0 && (
-                <div>
-                  <p className="text-xs font-medium text-neutral-500 uppercase tracking-wider mb-3">
-                    Fit Model ({fitModelImages.length})
-                  </p>
+                {fitModelImages.length > 0 ? (
                   <div className="grid grid-cols-4 gap-2">
                     {fitModelImages.map((url, i) => {
                       const isLoading = imageActionLoading?.split('?')[0] === url.split('?')[0];
@@ -591,8 +547,10 @@ export default function WardrobePage() {
                       );
                     })}
                   </div>
-                </div>
-              )}
+                ) : (
+                  <p className="text-xs text-neutral-400 italic">No fit model photos uploaded yet.</p>
+                )}
+              </div>
 
               {/* Editable fields */}
               <div className="space-y-4">
@@ -689,44 +647,50 @@ export default function WardrobePage() {
                   )}
                 </div>
 
-                {/* Flat image (product-on-white) — used for accurate color extraction */}
+                {/* Flat images (product-on-white — front + back) */}
                 <div>
-                  <label className="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-1">
-                    Flat Image <span className="text-neutral-400 normal-case">(product-on-white — used for color extraction)</span>
+                  <label className="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-2">
+                    Flat Images <span className="text-neutral-400 normal-case">(product-on-white — front &amp; back)</span>
                   </label>
-                  {(selectedItem?.flatImageUrl || editFlatPreview) && (
-                    <div className="mb-2 relative inline-block">
-                      <img
-                        src={editFlatPreview || selectedItem?.flatImageUrl}
-                        alt="Flat image"
-                        className="h-24 w-24 object-contain border border-neutral-200 bg-white cursor-pointer"
-                        onClick={() => setLightboxUrl(editFlatPreview || selectedItem?.flatImageUrl || null)}
-                      />
-                      {editFlatPreview && (
-                        <span className="absolute -top-1 -right-1 bg-green-500 text-white text-[9px] px-1 rounded">NEW</span>
+                  <div className="grid grid-cols-2 gap-4">
+                    {/* Flat Front */}
+                    <div>
+                      <p className="text-xs text-neutral-500 mb-1">Front</p>
+                      {(selectedItem?.flatFrontUrl || editFlatFrontPreview) && (
+                        <div className="mb-2 relative inline-block">
+                          <img src={editFlatFrontPreview || selectedItem?.flatFrontUrl} alt="Flat front"
+                            className="h-24 w-24 object-contain border border-neutral-200 bg-white cursor-pointer"
+                            onClick={() => setLightboxUrl(editFlatFrontPreview || selectedItem?.flatFrontUrl || null)} />
+                          {editFlatFrontPreview && <span className="absolute -top-1 -right-1 bg-green-500 text-white text-[9px] px-1 rounded">NEW</span>}
+                        </div>
                       )}
+                      <label className="cursor-pointer px-3 py-1.5 text-xs border border-neutral-300 hover:border-neutral-500 transition-colors bg-white text-neutral-600">
+                        {selectedItem?.flatFrontUrl ? 'Replace' : 'Upload front'}
+                        <input type="file" accept="image/*" className="hidden" onChange={(e) => {
+                          const f = e.target.files?.[0]; if (f) { setEditFlatFrontFile(f); setEditFlatFrontPreview(URL.createObjectURL(f)); } e.target.value = '';
+                        }} />
+                      </label>
+                      {editFlatFrontFile && <span className="block text-xs text-green-600 mt-1">{editFlatFrontFile.name}</span>}
                     </div>
-                  )}
-                  <div className="flex items-center gap-2">
-                    <label className="cursor-pointer px-3 py-1.5 text-xs border border-neutral-300 hover:border-neutral-500 transition-colors bg-white text-neutral-600">
-                      {selectedItem?.flatImageUrl ? 'Replace flat image' : 'Upload flat image'}
-                      <input
-                        type="file"
-                        accept="image/*"
-                        className="hidden"
-                        onChange={(e) => {
-                          const f = e.target.files?.[0];
-                          if (f) {
-                            setEditFlatFile(f);
-                            setEditFlatPreview(URL.createObjectURL(f));
-                          }
-                          e.target.value = '';
-                        }}
-                      />
-                    </label>
-                    {editFlatFile && (
-                      <span className="text-xs text-green-600">{editFlatFile.name} — will upload on Save</span>
-                    )}
+                    {/* Flat Back */}
+                    <div>
+                      <p className="text-xs text-neutral-500 mb-1">Back</p>
+                      {(selectedItem?.flatBackUrl || editFlatBackPreview) && (
+                        <div className="mb-2 relative inline-block">
+                          <img src={editFlatBackPreview || selectedItem?.flatBackUrl} alt="Flat back"
+                            className="h-24 w-24 object-contain border border-neutral-200 bg-white cursor-pointer"
+                            onClick={() => setLightboxUrl(editFlatBackPreview || selectedItem?.flatBackUrl || null)} />
+                          {editFlatBackPreview && <span className="absolute -top-1 -right-1 bg-green-500 text-white text-[9px] px-1 rounded">NEW</span>}
+                        </div>
+                      )}
+                      <label className="cursor-pointer px-3 py-1.5 text-xs border border-neutral-300 hover:border-neutral-500 transition-colors bg-white text-neutral-600">
+                        {selectedItem?.flatBackUrl ? 'Replace' : 'Upload back'}
+                        <input type="file" accept="image/*" className="hidden" onChange={(e) => {
+                          const f = e.target.files?.[0]; if (f) { setEditFlatBackFile(f); setEditFlatBackPreview(URL.createObjectURL(f)); } e.target.value = '';
+                        }} />
+                      </label>
+                      {editFlatBackFile && <span className="block text-xs text-green-600 mt-1">{editFlatBackFile.name}</span>}
+                    </div>
                   </div>
                 </div>
               </div>

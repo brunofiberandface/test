@@ -71,41 +71,27 @@ export async function POST(req: NextRequest) {
       images360Base64,      // array of base64 encoded 360° images (optional, send best few)
       wardrobeItemIds,      // { shoes?: id, shirt?: id, jacket?: id, pants?: id }
       // Passthrough: pre-existing GCS URLs (e.g. from wardrobe picker — skip re-upload)
-      flatImageUrl: flatImageUrlPassthrough,
-      image360Urls: image360UrlsPassthrough,
+      flatFrontUrl: flatFrontUrlPassthrough,
+      flatBackUrl: flatBackUrlPassthrough,
+      flatImageUrl: flatImageUrlPassthrough, // legacy compat
     } = body;
 
     if (!designNumber || !garmentCategory || !description || !modelIds?.length) {
       return NextResponse.json({ error: 'Missing required fields' }, { status: 400 });
     }
 
-    // Upload flat image to GCS if provided, or use passthrough GCS URL directly
-    let flatImageUrl = flatImageUrlPassthrough || '';
-    if (!flatImageUrl && flatImageBase64) {
+    // Upload flat front image to GCS if provided, or use passthrough GCS URL directly
+    let flatFrontUrl = flatFrontUrlPassthrough || flatImageUrlPassthrough || '';
+    if (!flatFrontUrl && flatImageBase64) {
       const flatBuffer = Buffer.from(flatImageBase64, 'base64');
       const mime = flatImageMimeType || 'image/jpeg';
       const ext = mime.includes('png') ? 'png' : 'jpg';
-      flatImageUrl = await uploadGarmentImage(
-        designNumber, 'flat', `flat.${ext}`, flatBuffer, mime
+      flatFrontUrl = await uploadGarmentImage(
+        designNumber, 'flat', `flat_front.${ext}`, flatBuffer, mime
       );
-      console.log(`[Job] Flat image uploaded: ${flatImageUrl}`);
+      console.log(`[Job] Flat front image uploaded: ${flatFrontUrl}`);
     }
-
-    // Upload 360° images to GCS if provided, or use passthrough GCS URLs directly
-    const image360Urls: string[] = image360UrlsPassthrough?.length ? image360UrlsPassthrough : [];
-    if (!image360Urls.length && images360Base64?.length) {
-      const maxImages = Math.min(images360Base64.length, 9);
-      for (let i = 0; i < maxImages; i++) {
-        const buf = Buffer.from(images360Base64[i], 'base64');
-        const url = await uploadGarmentImage(
-          designNumber, '360', `360_${String(i).padStart(2, '0')}.jpg`, buf
-        );
-        image360Urls.push(url);
-      }
-      console.log(`[Job] ${image360Urls.length} 360° images uploaded`);
-    } else if (image360UrlsPassthrough?.length) {
-      console.log(`[Job] Using ${image360Urls.length} pre-existing 360° GCS URLs`);
-    }
+    let flatBackUrl = flatBackUrlPassthrough || '';
 
     // Create job with garment image URLs
     const jobId = await createJob({
@@ -120,8 +106,8 @@ export async function POST(req: NextRequest) {
 
     // Store garment image URLs and wardrobe selections on the job document
     const jobUpdate: Record<string, any> = {};
-    if (flatImageUrl) jobUpdate.flatImageUrl = flatImageUrl;
-    if (image360Urls.length) jobUpdate.image360Urls = image360Urls;
+    if (flatFrontUrl) jobUpdate.flatFrontUrl = flatFrontUrl;
+    if (flatBackUrl) jobUpdate.flatBackUrl = flatBackUrl;
     if (wardrobeItemIds && Object.keys(wardrobeItemIds).length > 0) {
       jobUpdate.wardrobeItemIds = wardrobeItemIds;
     }
@@ -133,7 +119,7 @@ export async function POST(req: NextRequest) {
     // When images are uploaded, automatically create/update a wardrobe item
     // so the garment can be reused across future jobs without re-uploading.
     const wardrobeCategory = GARMENT_TO_WARDROBE[garmentCategory];
-    if (wardrobeCategory && (flatImageUrl || image360Urls.length > 0)) {
+    if (wardrobeCategory && flatFrontUrl) {
       try {
         // Check if a wardrobe item for this design number already exists
         const existing = await wardrobeCol
@@ -147,9 +133,10 @@ export async function POST(req: NextRequest) {
             name: designNumber,
             category: wardrobeCategory,
             description: description.slice(0, 400),
-            imageUrls: image360Urls,
-            flatImageUrl: flatImageUrl || undefined,
-            thumbnailUrl: image360Urls[0] || flatImageUrl || '',
+            fitModelUrls: [],
+            flatFrontUrl: flatFrontUrl || undefined,
+            flatBackUrl: flatBackUrl || undefined,
+            thumbnailUrl: flatFrontUrl || '',
           });
           await jobsCol.doc(jobId).update({ garmentWardrobeId });
           console.log(`[Job] Auto-created wardrobe item ${garmentWardrobeId} for ${designNumber}`);
@@ -157,11 +144,11 @@ export async function POST(req: NextRequest) {
           // Update existing item with fresh images if we have them
           const existingId = existing.docs[0].id;
           const wardrobeUpdate: Record<string, any> = { updatedAt: new Date() };
-          if (image360Urls.length) {
-            wardrobeUpdate.imageUrls = image360Urls;
-            wardrobeUpdate.thumbnailUrl = image360Urls[0];
+          if (flatFrontUrl) {
+            wardrobeUpdate.flatFrontUrl = flatFrontUrl;
+            wardrobeUpdate.thumbnailUrl = flatFrontUrl;
           }
-          if (flatImageUrl) wardrobeUpdate.flatImageUrl = flatImageUrl;
+          if (flatBackUrl) wardrobeUpdate.flatBackUrl = flatBackUrl;
           await wardrobeCol.doc(existingId).update(wardrobeUpdate);
           await jobsCol.doc(jobId).update({ garmentWardrobeId: existingId });
           console.log(`[Job] Updated wardrobe item ${existingId} for ${designNumber}`);

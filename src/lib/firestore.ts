@@ -342,9 +342,9 @@ export async function createWardrobeItem(data: {
   category: string;
   gender?: 'male' | 'female' | 'unisex';
   description: string;
-  imageUrls: string[];
-  fitModelUrls?: string[];
-  flatImageUrl?: string;
+  fitModelUrls: string[];
+  flatFrontUrl?: string;
+  flatBackUrl?: string;
   thumbnailUrl: string;
   isPrimary?: boolean;
   openShoes?: boolean;

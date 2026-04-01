@@ -31,7 +31,7 @@ export async function PATCH(
   try {
     const { id } = await params;
     const body = await req.json();
-    const { name, description, category, isPrimary, gender, openShoes, hasHeels, fitModelUrls, flatImageBase64 } = body;
+    const { name, description, category, isPrimary, gender, openShoes, hasHeels, fitModelUrls, flatFrontBase64, flatBackBase64 } = body;
 
     const updates: Record<string, any> = { updatedAt: new Date() };
     if (name !== undefined) updates.name = name;
@@ -43,19 +43,32 @@ export async function PATCH(
     if (hasHeels !== undefined) updates.hasHeels = hasHeels;
     if (fitModelUrls !== undefined) updates.fitModelUrls = fitModelUrls;
 
-    // Upload flat image if provided as base64
-    if (flatImageBase64) {
+    // Upload flat front image if provided as base64
+    if (flatFrontBase64) {
       const item = await getWardrobeItem(id) as Record<string, any> | null;
       const cat = category || item?.category || 'shirt';
-      const base64Clean = flatImageBase64.replace(/^data:image\/\w+;base64,/, '');
+      const base64Clean = flatFrontBase64.replace(/^data:image\/\w+;base64,/, '');
       const buffer = Buffer.from(base64Clean, 'base64');
-      const flatUrl = await uploadWardrobeImage(cat, id, 'flat.jpg', buffer);
-      updates.flatImageUrl = flatUrl;
+      const flatFrontUrl = await uploadWardrobeImage(cat, id, 'flat_front.jpg', buffer);
+      updates.flatFrontUrl = flatFrontUrl;
+    }
+
+    // Upload flat back image if provided as base64
+    if (flatBackBase64) {
+      const item = updates._item || await getWardrobeItem(id) as Record<string, any> | null;
+      const cat = category || item?.category || 'shirt';
+      const base64Clean = flatBackBase64.replace(/^data:image\/\w+;base64,/, '');
+      const buffer = Buffer.from(base64Clean, 'base64');
+      const flatBackUrl = await uploadWardrobeImage(cat, id, 'flat_back.jpg', buffer);
+      updates.flatBackUrl = flatBackUrl;
     }
 
     await wardrobeCol.doc(id).update(updates);
-    const flatImageUrl = updates.flatImageUrl;
-    return NextResponse.json({ ok: true, ...(flatImageUrl ? { flatImageUrl } : {}) });
+    return NextResponse.json({
+      ok: true,
+      ...(updates.flatFrontUrl ? { flatFrontUrl: updates.flatFrontUrl } : {}),
+      ...(updates.flatBackUrl ? { flatBackUrl: updates.flatBackUrl } : {}),
+    });
   } catch (err: any) {
     return NextResponse.json({ error: err.message }, { status: 500 });
   }
