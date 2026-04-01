@@ -1,0 +1,14 @@
+--- patch49: thumbnail head cutoff fix
+--- File: src/app/jobs/[id]/results/page.tsx
+--- Line 453
+
+CHANGE:
+  className="w-full h-full object-cover"
+TO:
+  className="w-full h-full object-cover object-top"
+
+WHY:
+  Thumbnail grid uses aspect-[3/4] container. Generated shots are 9:16.
+  Default object-cover centers vertically — cuts head AND shoes.
+  object-top pins image to top of container → head always visible in thumbnail.
+  Applies to all shot types (M01-M05).

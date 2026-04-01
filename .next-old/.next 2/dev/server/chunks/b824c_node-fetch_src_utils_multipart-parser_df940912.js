@@ -1,0 +1,13 @@
+module.exports = [
+"[project]/node_modules/google-gax/node_modules/node-fetch/src/utils/multipart-parser.js [app-route] (ecmascript, async loader)", ((__turbopack_context__) => {
+
+__turbopack_context__.v((parentImport) => {
+    return Promise.all([
+  "server/chunks/node_modules_51899b19._.js",
+  "server/chunks/[externals]__54b28cae._.js"
+].map((chunk) => __turbopack_context__.l(chunk))).then(() => {
+        return parentImport("[project]/node_modules/google-gax/node_modules/node-fetch/src/utils/multipart-parser.js [app-route] (ecmascript)");
+    });
+});
+}),
+];

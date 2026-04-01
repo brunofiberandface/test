@@ -1,0 +1,36 @@
+[00:00:08.522] Server  LOG     ✓ Ready in 4.9s
+[00:00:11.554] Server  LOG     ○ Compiling /api/models/generate-dressed-all ...
+[00:00:16.595] Server  LOG     [GenerateDressedAll] Starting all 4 views for model=TEST_LOOPBACK via http://localhost:3099
+[00:00:16.597] Server  LOG     [GenerateDressedAll] Starting front view...
+[00:00:19.917] Server  LOG     [GenerateDressed] model=TEST_LOOPBACK hash=62efb77d82bf view=front
+[00:00:20.128] Server  ERROR   [GenerateDressed POST] error: Error: Unable to detect a Project Id in the current environment. 
+To learn more about authentication and Google APIs, visit: 
+https://cloud.google.com/docs/authentication/getting-started
+[00:00:20.140] Server  ERROR   [GenerateDressedAll] front failed: Error: Unable to detect a Project Id in the current environment. 
+To learn more about authentication and Google APIs, visit: 
+https://cloud.google.com/docs/authentication/getting-started
+[00:00:20.140] Server  LOG     [GenerateDressedAll] Starting right view...
+[00:00:20.171] Server  LOG     [GenerateDressed] model=TEST_LOOPBACK hash=62efb77d82bf view=right
+[00:00:20.216] Server  ERROR   [GenerateDressed POST] error: Error: Unable to detect a Project Id in the current environment. 
+To learn more about authentication and Google APIs, visit: 
+https://cloud.google.com/docs/authentication/getting-started
+[00:00:20.219] Server  ERROR   [GenerateDressedAll] right failed: Error: Unable to detect a Project Id in the current environment. 
+To learn more about authentication and Google APIs, visit: 
+https://cloud.google.com/docs/authentication/getting-started
+[00:00:20.219] Server  LOG     [GenerateDressedAll] Starting back view...
+[00:00:20.236] Server  LOG     [GenerateDressed] model=TEST_LOOPBACK hash=62efb77d82bf view=back
+[00:00:20.285] Server  ERROR   [GenerateDressed POST] error: Error: Unable to detect a Project Id in the current environment. 
+To learn more about authentication and Google APIs, visit: 
+https://cloud.google.com/docs/authentication/getting-started
+[00:00:20.288] Server  ERROR   [GenerateDressedAll] back failed: Error: Unable to detect a Project Id in the current environment. 
+To learn more about authentication and Google APIs, visit: 
+https://cloud.google.com/docs/authentication/getting-started
+[00:00:20.288] Server  LOG     [GenerateDressedAll] Starting left view...
+[00:00:20.298] Server  LOG     [GenerateDressed] model=TEST_LOOPBACK hash=62efb77d82bf view=left
+[00:00:20.337] Server  ERROR   [GenerateDressed POST] error: Error: Unable to detect a Project Id in the current environment. 
+To learn more about authentication and Google APIs, visit: 
+https://cloud.google.com/docs/authentication/getting-started
+[00:00:20.339] Server  ERROR   [GenerateDressedAll] left failed: Error: Unable to detect a Project Id in the current environment. 
+To learn more about authentication and Google APIs, visit: 
+https://cloud.google.com/docs/authentication/getting-started
+[00:00:20.340] Server  LOG     [GenerateDressedAll] Complete: 0/4 succeeded

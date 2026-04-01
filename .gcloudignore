@@ -1,0 +1,52 @@
+# This file controls what gets uploaded to Cloud Build.
+# Without this, ALL files in the directory are uploaded — including old patch archives, node_modules, etc.
+# See: https://cloud.google.com/sdk/gcloud/reference/topic/gcloudignore
+
+.gcloudignore
+
+# Node / Next.js build artifacts — large and not needed (rebuilt in Docker)
+node_modules/
+.next/
+.cache/
+out/
+
+# Test files — not needed in production build
+src/__tests__/
+
+# Test image directories — 357MB of fit model / mannequin test data, never needed in prod
+test_inputs/
+test_outputs/
+
+# Old build artifacts
+.next-old/
+
+# Coverage reports
+coverage/
+
+# Local scripts — label_composite.py is needed for the label composite pipeline
+# Other scripts are excluded individually if needed
+
+# Old patch archives and scripts — frequently left in root, massively inflate upload size
+*.tar.gz
+patch*/
+
+# Markdown docs — not part of the app
+*.md
+LEARNINGS.md
+SETUP.md
+README.md
+
+# Local dev / secrets (never upload)
+.env
+.env.local
+.env*.local
+sa_key.json
+*.key
+*.pem
+
+# Editor/OS artifacts
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/

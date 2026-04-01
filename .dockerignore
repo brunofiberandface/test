@@ -1,0 +1,33 @@
+# Prevents large/unnecessary files from entering the Docker build context.
+# Keeps the image lean and build fast.
+
+node_modules
+.next
+.cache
+out
+
+src/__tests__
+
+*.tar.gz
+patch*
+
+*.md
+LEARNINGS.md
+SETUP.md
+README.md
+
+.env
+.env.local
+.env*.local
+sa_key.json
+*.key
+*.pem
+
+.DS_Store
+.git
+.gitignore
+.gcloudignore
+*.swp
+*.swo
+.idea
+.vscode

@@ -1,0 +1,4 @@
+{
+  "/api/models/generate-dressed-all/route": "app/api/models/generate-dressed-all/route.js",
+  "/api/models/generate-dressed/route": "app/api/models/generate-dressed/route.js"
+}

@@ -1,0 +1,11 @@
+var R=require("../../../chunks/[turbopack]_runtime.js")("server/app/api/wardrobe/route.js")
+R.c("server/chunks/[root-of-the-server]__23eb907e._.js")
+R.c("server/chunks/0aa17_@opentelemetry_api_build_esm_index_c7af77ff.js")
+R.c("server/chunks/[root-of-the-server]__6c7794b5._.js")
+R.c("server/chunks/[root-of-the-server]__9637c327._.js")
+R.c("server/chunks/[root-of-the-server]__4d3e2296._.js")
+R.c("server/chunks/[root-of-the-server]__346a479f._.js")
+R.c("server/chunks/0aa17_next_e26cd462._.js")
+R.c("server/chunks/f94e2_gstar-studio__next-internal_server_app_api_wardrobe_route_actions_67390b44.js")
+R.m(36747)
+module.exports=R.m(36747).exports
