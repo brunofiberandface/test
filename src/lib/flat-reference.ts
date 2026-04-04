@@ -220,18 +220,26 @@ export interface FlatSilhouette {
   /** Width in pixels at each measurement point */
   widths: {
     waist: number;
+    hip: number;
+    midFemur: number;
+    knee: number;
+    midTibia: number;
+    hem: number;
+    /** @deprecated use midFemur */
     thigh: number;
-    knee: number;
-    hem: number;
   };
-  /** Width ratios normalized to thigh width (thigh = 1.0) */
+  /** Width ratios normalized to waist width (waist = 1.0) */
   ratios: {
-    waist: number;
+    hip: number;
+    midFemur: number;
     knee: number;
+    midTibia: number;
     hem: number;
   };
-  /** hem_width / thigh_width */
+  /** hem_width / knee_width — primary taper indicator */
   taperRatio: number;
+  /** hem_width / waist_width — overall shape ratio */
+  hemToWaistRatio: number;
   /** Fit classification derived from taper ratio */
   classification: 'barrel' | 'wide-straight' | 'straight' | 'tapered' | 'slim' | 'skinny';
   /** How clear the garment edges were (0-1) */
@@ -327,30 +335,39 @@ export async function extractFlatSilhouette(flatBuffer: Buffer): Promise<FlatSil
     );
   };
 
-  const waistW = measureAvg(0.12);
-  const thighW = measureAvg(0.32);
-  const kneeW = measureAvg(0.62);
-  const hemW = measureAvg(0.90);
+  // 6 measurement points matching anatomical landmarks
+  const waistW = measureAvg(0.10);
+  const hipW = measureAvg(0.22);
+  const midFemurW = measureAvg(0.40);
+  const kneeW = measureAvg(0.58);
+  const midTibiaW = measureAvg(0.75);
+  const hemW = measureAvg(0.92);
 
   // Scale measurements back to original image pixels
   const scale = imgW / binW;
   const widths = {
     waist: Math.round(waistW * scale),
-    thigh: Math.round(thighW * scale),
+    hip: Math.round(hipW * scale),
+    midFemur: Math.round(midFemurW * scale),
     knee: Math.round(kneeW * scale),
+    midTibia: Math.round(midTibiaW * scale),
     hem: Math.round(hemW * scale),
+    thigh: Math.round(midFemurW * scale), // backwards compat
   };
 
-  // Compute ratios (normalized to thigh)
-  const thighRef = thighW || 1;
+  // Compute ratios (normalized to waist — most intuitive reference)
+  const waistRef = waistW || 1;
   const ratios = {
-    waist: Math.round((waistW / thighRef) * 100) / 100,
-    knee: Math.round((kneeW / thighRef) * 100) / 100,
-    hem: Math.round((hemW / thighRef) * 100) / 100,
+    hip: Math.round((hipW / waistRef) * 100) / 100,
+    midFemur: Math.round((midFemurW / waistRef) * 100) / 100,
+    knee: Math.round((kneeW / waistRef) * 100) / 100,
+    midTibia: Math.round((midTibiaW / waistRef) * 100) / 100,
+    hem: Math.round((hemW / waistRef) * 100) / 100,
   };
-  const taperRatio = ratios.hem;
+  const taperRatio = kneeW ? Math.round((hemW / kneeW) * 100) / 100 : 1;
+  const hemToWaistRatio = Math.round((hemW / waistRef) * 100) / 100;
 
-  // Classify fit
+  // Classify fit based on hem-to-knee ratio
   let classification: FlatSilhouette['classification'];
   if (taperRatio > 1.10) classification = 'barrel';
   else if (taperRatio > 0.95) classification = 'wide-straight';
@@ -360,22 +377,23 @@ export async function extractFlatSilhouette(flatBuffer: Buffer): Promise<FlatSil
   else classification = 'skinny';
 
   // Confidence based on how clear the measurements are
-  const allWidths = [waistW, thighW, kneeW, hemW];
+  const allWidths = [waistW, hipW, midFemurW, kneeW, midTibiaW, hemW];
   const validWidths = allWidths.filter(w => w > 5);
-  const confidence = Math.min(1, validWidths.length / 4);
+  const confidence = Math.min(1, validWidths.length / 6);
 
-  const description = buildSilhouetteDescription(classification, taperRatio, ratios);
+  const description = buildSilhouetteDescription(classification, taperRatio, ratios, hemToWaistRatio);
 
-  console.log(`[FlatRef] Silhouette: ${classification} (taper=${taperRatio.toFixed(2)}) — waist=${widths.waist}px thigh=${widths.thigh}px knee=${widths.knee}px hem=${widths.hem}px — confidence=${confidence.toFixed(1)}`);
+  console.log(`[FlatRef] Silhouette: ${classification} (ankle/knee=${taperRatio.toFixed(2)}, ankle/waist=${hemToWaistRatio.toFixed(2)}) — waist=${widths.waist} hip=${widths.hip} midFemur=${widths.midFemur} knee=${widths.knee} midTibia=${widths.midTibia} hem=${widths.hem} — conf=${confidence.toFixed(1)}`);
 
-  return { widths, ratios, taperRatio, classification, confidence, description };
+  return { widths, ratios, taperRatio, hemToWaistRatio, classification, confidence, description };
 }
 
 function defaultSilhouette(): FlatSilhouette {
   return {
-    widths: { waist: 0, thigh: 0, knee: 0, hem: 0 },
-    ratios: { waist: 1, knee: 1, hem: 1 },
+    widths: { waist: 0, hip: 0, midFemur: 0, knee: 0, midTibia: 0, hem: 0, thigh: 0 },
+    ratios: { hip: 1, midFemur: 1, knee: 1, midTibia: 1, hem: 1 },
     taperRatio: 1,
+    hemToWaistRatio: 1,
     classification: 'straight',
     confidence: 0,
     description: 'straight fit (default — silhouette could not be measured)',
@@ -385,46 +403,51 @@ function defaultSilhouette(): FlatSilhouette {
 function buildSilhouetteDescription(
   classification: string,
   taperRatio: number,
-  ratios: { waist: number; knee: number; hem: number },
+  ratios: { hip: number; midFemur: number; knee: number; midTibia: number; hem: number },
+  hemToWaistRatio: number,
 ): string {
   const parts: string[] = [];
 
+  // Width profile as a visual guide for Gemini
+  parts.push(`MEASURED WIDTH PROFILE (waist = 100%):`);
+  parts.push(`  Waist: 100% | Hip: ${Math.round(ratios.hip * 100)}% | Mid-thigh: ${Math.round(ratios.midFemur * 100)}% | Knee: ${Math.round(ratios.knee * 100)}% | Mid-calf: ${Math.round(ratios.midTibia * 100)}% | Ankle: ${Math.round(ratios.hem * 100)}%`);
+
   switch (classification) {
     case 'barrel':
-      parts.push(`BARREL FIT — leg WIDENS below the knee (hem is ${Math.round(taperRatio * 100)}% of thigh width).`);
-      parts.push('The hem opening must be WIDER than the thigh. This is a relaxed, wide silhouette.');
+      parts.push(`This is a BARREL/FLARE FIT — the legs get PROGRESSIVELY WIDER from hip to hem.`);
+      parts.push(`The ankle opening is ${Math.round(hemToWaistRatio * 100)}% of waist width and ${Math.round(taperRatio * 100)}% of knee width — WIDER than both.`);
+      parts.push(`This is an EXTREMELY wide, loose garment. The fabric must billow out dramatically below the knee. If the generated legs look like a normal straight or relaxed fit, it is WRONG — they must be visibly, dramatically wide.`);
       break;
     case 'wide-straight':
-      parts.push(`WIDE STRAIGHT FIT — consistent width from thigh to hem (taper ratio ${taperRatio.toFixed(2)}).`);
-      parts.push('Minimal tapering. Generous through thigh and knee, hem nearly same width as thigh.');
+      parts.push(`WIDE STRAIGHT FIT — consistent generous width from thigh to hem.`);
+      parts.push(`Ankle is ${Math.round(hemToWaistRatio * 100)}% of waist width. Minimal tapering throughout.`);
       break;
     case 'straight':
-      parts.push(`STRAIGHT FIT — slight taper from thigh to hem (taper ratio ${taperRatio.toFixed(2)}).`);
-      parts.push('Classic proportions. Some narrowing from thigh to hem but not slim.');
+      parts.push(`STRAIGHT FIT — slight taper from thigh to hem.`);
+      parts.push(`Ankle is ${Math.round(hemToWaistRatio * 100)}% of waist width. Classic proportions.`);
       break;
     case 'tapered':
-      parts.push(`TAPERED FIT — clear narrowing from thigh to hem (taper ratio ${taperRatio.toFixed(2)}).`);
-      parts.push(`Hem is ${Math.round(taperRatio * 100)}% of thigh width. Noticeably slimmer at the ankle.`);
+      parts.push(`TAPERED FIT — clear narrowing from thigh to ankle.`);
+      parts.push(`Ankle is ${Math.round(hemToWaistRatio * 100)}% of waist width. Noticeably slimmer at the ankle.`);
       break;
     case 'slim':
-      parts.push(`SLIM FIT — significant taper (taper ratio ${taperRatio.toFixed(2)}).`);
-      parts.push('Close-fitting through knee and ankle. Hem is much narrower than thigh.');
+      parts.push(`SLIM FIT — significant taper, close-fitting through knee and ankle.`);
+      parts.push(`Ankle is only ${Math.round(hemToWaistRatio * 100)}% of waist width.`);
       break;
     case 'skinny':
-      parts.push(`SKINNY FIT — extreme taper (taper ratio ${taperRatio.toFixed(2)}).`);
-      parts.push('Very tight from knee to hem. Body-hugging silhouette throughout.');
+      parts.push(`SKINNY FIT — extreme taper, body-hugging from knee to hem.`);
+      parts.push(`Ankle is only ${Math.round(hemToWaistRatio * 100)}% of waist width.`);
       break;
   }
 
-  // Add ratio context
-  if (ratios.knee < 0.80) {
-    parts.push(`Knee width is only ${Math.round(ratios.knee * 100)}% of thigh — narrowing starts above the knee.`);
-  }
-  if (ratios.waist > 1.05) {
-    parts.push(`Waist is wider than thigh — high-rise or paperbag waist effect.`);
+  // Highlight the progression direction
+  if (hemToWaistRatio > 1.15) {
+    parts.push(`KEY: The leg opening is ${Math.round((hemToWaistRatio - 1) * 100)}% WIDER than the waist. The silhouette EXPANDS from waist to ankle — do NOT compress it.`);
+  } else if (hemToWaistRatio < 0.70) {
+    parts.push(`KEY: The leg opening is ${Math.round((1 - hemToWaistRatio) * 100)}% NARROWER than the waist. Significant tapering.`);
   }
 
-  return parts.join(' ');
+  return parts.join('\n');
 }
 
 // ─── POST-GENERATION COLOR CORRECTION ───────────────────────────────────────

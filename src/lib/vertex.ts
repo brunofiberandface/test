@@ -35,7 +35,13 @@ const RETRY_DELAYS = [45000, 60000, 90000];
 const NETWORK_RETRY_DELAYS = [10000, 20000, 30000];
 
 // GCP project for Vertex AI — the project linked to the service account
-const GCP_PROJECT = process.env.GCP_PROJECT || 'gen-lang-client-0396152930';
+// v40-build-7: Force runtime evaluation — prevent Next.js build-time inlining
+function getGcpProject(): string {
+  const p = process.env['GCP_PROJECT'] || 'gstar-ai-studio';
+  console.log(`[Vertex] BUILD v40-7 | GCP_PROJECT=${p}`);
+  return p;
+}
+const GCP_PROJECT = getGcpProject();
 
 // Token cache — reuse OAuth tokens (metadata server returns expires_in)
 let cachedToken: { token: string; expiresAt: number } | null = null;
@@ -111,8 +117,9 @@ export async function generateImage(params: GenerateImageParams): Promise<Genera
   // Add the main prompt
   parts.push({ text: prompt });
 
-  // Vertex AI global endpoint — 3-4x faster than generativelanguage.googleapis.com
-  const url = `https://aiplatform.googleapis.com/v1/projects/${GCP_PROJECT}/locations/global/publishers/google/models/${model}:generateContent`;
+  // Vertex AI global endpoint — HARDCODED to avoid Next.js build-time inlining issues
+  const url = 'https://aiplatform.googleapis.com/v1/projects/gstar-ai-studio/locations/global/publishers/google/models/' + model + ':generateContent';
+  console.log('[Vertex] v40-8 URL: ' + url);
 
   // Get OAuth token (cached, auto-refreshes)
   const accessToken = await getCachedAccessToken();

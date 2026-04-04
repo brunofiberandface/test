@@ -3,6 +3,8 @@
 
 node_modules
 .next
+.next-old
+.next-old*
 .cache
 out
 

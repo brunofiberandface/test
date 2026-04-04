@@ -59,7 +59,7 @@ THE GOLDEN RULE: Every detail in the output MUST trace back to a reference image
 GARMENT FIDELITY — copy the references exactly:
 - Reproduce the garment EXACTLY as shown in the reference images — every seam, pocket, rivet, and closure
 - The pocket openings, shape, and placement are UNIQUE per design — copy EXACTLY from references
-- BACK POCKET PROPORTIONS: MEASURE the pocket height relative to the waistband-to-crotch distance in the mannequin/fit model references and reproduce that EXACT ratio. Some designs have tall pockets, others short — always match the reference.
+- BACK POCKET DEPTH — MEASURE FROM FIT MODEL BACK (not flat): On the fit model back photo, measure how far the LOWEST point of each back pocket reaches relative to the inseam junction (the point where the legs join/crotch seam). This ratio is critical — some designs have deep pockets that end very close to the inseam, others are shallow. Body curvature makes pockets sit lower on a real body than they appear on a flat — ALWAYS use the fit model back as your measurement reference. Reproduce that EXACT pocket-bottom-to-inseam ratio.
 - The BACK PANEL is PLAIN unless the reference shows otherwise — keep it clean fabric only (Learning #34)
 - For zip closures: show ONLY what is visible from the OUTSIDE. When closed, only the zip pull is visible (Learning #33)
 - The model wears ONLY what is shown in the reference images — the exact garments, exact colors, exact styles. Nothing more, nothing different.
@@ -437,5 +437,55 @@ export const ZONE_DEFS = {
   default: {
     upper: { y1: 0.0, y2: 0.4, x1: 0.15, x2: 0.85, angles: [0, 1, 6], name: 'Upper Zone' },
     lower: { y1: 0.4, y2: 1.0, x1: 0.15, x2: 0.85, angles: [0, 1, 6], name: 'Lower Zone' },
+  },
+} as const;
+
+// ── Panoramic Zone Definitions — Full 360° strips with flat image integration ──
+// Each zone gets ALL fit model angles (0-7) + flat front + flat back crops.
+// Fit model images: 8 angles at ~45° intervals (0=front, 2=right, 4=back, 6=left).
+// Flat images: laid flat, no body distortion — ground truth for garment WIDTH.
+//
+// Fit model crop regions (after 90° CW rotation to vertical):
+//   Same Y ranges as ZONE_DEFS above, but using ALL angles for full 360° coverage.
+//
+// Flat image crop regions (garment fills most of frame, top-to-bottom):
+//   Flat waist: y1=0.0, y2=0.30 (waistband through hip)
+//   Flat knee:  y1=0.28, y2=0.58 (thigh through knee)
+//   Flat ankle: y1=0.55, y2=0.88 (calf through hem)
+export const PANORAMIC_ZONES = {
+  pants: {
+    waist: {
+      // v40: Recalibrated for navel-to-feet fit model images (not full-body head-to-toe).
+      // Old coords (v39) assumed full-body framing → zones landed ~30% too low.
+      // Pixel-verified: fit model waistband at y≈3%, flat waistband at y≈5-8%.
+      name: 'Waist 360° — waistband, belt loops, pockets (front+back), fly, yoke, hip label',
+      fitModel:  { y1: 0.03, y2: 0.30, x1: 0.15, x2: 0.85 },
+      flatFront: { y1: 0.03, y2: 0.30, x1: 0.10, x2: 0.90 },
+      flatBack:  { y1: 0.05, y2: 0.32, x1: 0.10, x2: 0.90 },
+      // Angle order for front-focused shots (M01, M03)
+      frontOrder: [0, 7, 1, 6, 2, 5, 3, 4],  // front-center, expanding outward
+      // Angle order for back-focused shots (M02, M04, M05)
+      backOrder:  [4, 3, 5, 2, 6, 1, 7, 0],  // back-center, expanding outward
+    },
+    knee: {
+      // v40: Pixel-verified knee zone for navel-to-feet framing.
+      name: 'Knee 360° — seam construction, articulation, thigh-to-calf transition',
+      fitModel:  { y1: 0.40, y2: 0.65, x1: 0.15, x2: 0.85 },
+      flatFront: { y1: 0.45, y2: 0.68, x1: 0.05, x2: 0.95 },
+      flatBack:  { y1: 0.48, y2: 0.70, x1: 0.05, x2: 0.95 },
+      frontOrder: [0, 7, 1, 6, 2, 5, 3, 4],
+      backOrder:  [4, 3, 5, 2, 6, 1, 7, 0],
+    },
+    ankle: {
+      // v40: Pixel-verified ankle zone. Flat crops single left leg (full pipe visible,
+      // both edges + hem). Measured: front hem at y≈92.5%, back hem at y≈95.5%.
+      // Left leg: front x=2.3%-40.4%, back x=2.9%-42.7%.
+      name: 'Ankle 360° — hem, cuff, leg opening width, ankle details',
+      fitModel:  { y1: 0.78, y2: 0.97, x1: 0.10, x2: 0.90 },
+      flatFront: { y1: 0.78, y2: 0.94, x1: 0.02, x2: 0.42 },
+      flatBack:  { y1: 0.78, y2: 0.97, x1: 0.02, x2: 0.44 },
+      frontOrder: [0, 7, 1, 6, 2, 5, 3, 4],
+      backOrder:  [4, 3, 5, 2, 6, 1, 7, 0],
+    },
   },
 } as const;

@@ -4,7 +4,7 @@ import { generateImage } from '@/lib/vertex';
 import { uploadGeneratedImage, downloadGarmentImage } from '@/lib/gcs';
 import sharp from 'sharp';
 
-// v40: Drastically simplified — M03 only, single phase with gemini-3-pro-image-preview
+// v40: Drastically simplified — M03 only, single phase with gemini-3.0-pro-image-preview
 export async function POST(req: NextRequest) {
   let shotId: string | undefined;
   try {
@@ -265,13 +265,13 @@ REFERENCE IMAGES PROVIDED:
     console.log(`[Generate] Built prompt with ${referenceImages.length} reference images`);
     await reportProgress('Generating image', 20);
 
-    // ── Single phase generation ──
+    // ── Single phase generation with gemini-3.0-pro-image-preview ──
     const result = await generateImage({
       prompt: promptText,
       referenceImages,
       aspectRatio: '9:16',
       imageSize: '2K',
-      model: 'gemini-3-pro-image-preview',
+      model: 'gemini-3.0-pro-image-preview',
     });
 
     let finalImageData = result.imageData;

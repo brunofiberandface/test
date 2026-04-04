@@ -4,6 +4,12 @@
 
 .gcloudignore
 
+# Git history — 410MB, never needed in Cloud Build
+.git/
+
+# Claude skill/session files
+.claude/
+
 # Node / Next.js build artifacts — large and not needed (rebuilt in Docker)
 node_modules/
 .next/

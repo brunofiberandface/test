@@ -1,0 +1,859 @@
+diff --git a/src/app/api/generate/route.ts b/src/app/api/generate/route.ts
+index c56ded4..457399f 100644
+--- a/src/app/api/generate/route.ts
++++ b/src/app/api/generate/route.ts
+@@ -4,7 +4,7 @@ import { computeWardrobeHash } from '@/lib/wardrobe-hash';
+ import { generateImage } from '@/lib/vertex';
+ import { uploadGeneratedImage, downloadGarmentImage } from '@/lib/gcs';
+ import { buildGenerationPrompt, REF_LABELS, ZONE_DEFS, getEcomPosingRules, getEcomFootwear, getEcomStylingTop, ECOM_NO_GOS } from '@/lib/prompts';
+-import { generateZoneGrids, resizeForFeed } from '@/lib/zone-grids';
++import { generateZoneGrids, generatePanoramicStrips, resizeForFeed } from '@/lib/zone-grids';
+ import { getGarmentDNA } from '@/lib/garment-dna';
+ 
+ import { extractFlatColor, extractFlatSilhouette, correctColorToFlat, type FlatColor, type FlatSilhouette } from '@/lib/flat-reference';
+@@ -12,6 +12,7 @@ import { matchColorsToReference } from '@/lib/color-match';
+ import { extractSkinTone } from '@/lib/skin-tone';
+ import { extractLabel, compositeLabel } from '@/lib/label-composite';
+ import sharp from 'sharp';
++import { smartCropFromWaistband } from '@/lib/waistband-detect';
+ 
+ // ── Shot-specific aspect ratios ──
+ // M01/M02: 3:4 — programmatic crop pipeline requires portrait (full body generated, then waist-cropped)
+@@ -43,41 +44,48 @@ export async function POST(req: NextRequest) {
+       originalPrompt,
+       version,
+       garmentCategory,
+-      // Auto-regen tracking
+-      autoRegenAttempt = 0,
+     } = body;
+     shotId = shotIdParsed; // assign to outer var so catch can reset it
+ 
+-    // ── Resolve missing fields from Firestore (regeneration/re-run case) ──
++    // ── Resolve missing fields from Firestore ──
++    // The worker queue sends modelId + shotType but NOT flatFrontUrl/flatBackUrl.
+     // The UI re-run may only send shotId + jobId + modification.
+-    // Fill in anything undefined from the shot and job documents.
+-    if (shotId && jobId && (!modelId || !shotType)) {
+-      console.log(`[Generate] Resolving missing fields from Firestore for shot=${shotId}`);
+-      try {
+-        const shotDoc = await shotsCol.doc(shotId).get();
+-        const shotDocData = shotDoc.data();
+-        if (shotDocData) {
+-          modelId = modelId || shotDocData.modelId;
+-          shotType = shotType || shotDocData.shotType;
+-          variant = variant || shotDocData.variant || 'A';
+-          prompt = prompt || shotDocData.prompt || '';
++    // ALWAYS resolve flat URLs and other missing fields from Firestore.
++    if (shotId && jobId) {
++      // Resolve shot-level fields if missing
++      if (!modelId || !shotType) {
++        console.log(`[Generate] Resolving missing shot fields from Firestore for shot=${shotId}`);
++        try {
++          const shotDoc = await shotsCol.doc(shotId).get();
++          const shotDocData = shotDoc.data();
++          if (shotDocData) {
++            modelId = modelId || shotDocData.modelId;
++            shotType = shotType || shotDocData.shotType;
++            variant = variant || shotDocData.variant || 'A';
++            prompt = prompt || shotDocData.prompt || '';
++          }
++        } catch (e) {
++          console.error(`[Generate] Failed to resolve shot fields:`, e);
+         }
+-      } catch (e) {
+-        console.error(`[Generate] Failed to resolve shot fields:`, e);
+       }
+-      try {
+-        const jobDoc = await jobsCol.doc(jobId).get();
+-        const jobDocData = jobDoc.data();
+-        if (jobDocData) {
+-          designNumber = designNumber || jobDocData.designNumber;
+-          garmentCategory = garmentCategory || jobDocData.garmentCategory;
+-          flatFrontUrl = flatFrontUrl || jobDocData.flatFrontUrl || jobDocData.flatImageUrl || '';
+-          flatBackUrl = flatBackUrl || jobDocData.flatBackUrl || '';
++
++      // ALWAYS resolve job-level fields (flat URLs, category, etc.) — the worker
++      // doesn't send flatFrontUrl/flatBackUrl, so these must come from Firestore.
++      if (!flatFrontUrl || !flatBackUrl || !garmentCategory) {
++        try {
++          const jobDoc = await jobsCol.doc(jobId).get();
++          const jobDocData = jobDoc.data();
++          if (jobDocData) {
++            designNumber = designNumber || jobDocData.designNumber;
++            garmentCategory = garmentCategory || jobDocData.garmentCategory;
++            flatFrontUrl = flatFrontUrl || jobDocData.flatFrontUrl || jobDocData.flatImageUrl || '';
++            flatBackUrl = flatBackUrl || jobDocData.flatBackUrl || '';
++          }
++        } catch (e) {
++          console.error(`[Generate] Failed to resolve job fields:`, e);
+         }
+-      } catch (e) {
+-        console.error(`[Generate] Failed to resolve job fields:`, e);
++        console.log(`[Generate] Resolved from Firestore: flatFront=${!!flatFrontUrl}, flatBack=${!!flatBackUrl}, category=${garmentCategory}`);
+       }
+-      console.log(`[Generate] Resolved: modelId=${modelId}, shotType=${shotType}, garmentCategory=${garmentCategory}`);
+     }
+ 
+     // Progress reporter — updates Firestore so the UI can poll step-level progress
+@@ -194,23 +202,13 @@ export async function POST(req: NextRequest) {
+         let dressedBase = await findDressedBase(modelId, hash, preferredView)
+           ?? (preferredView === 'back' ? await findDressedBase(modelId, hash, 'front') : null);
+ 
+-        // Fallback: if no exact wardrobe hash match, try ANY dressed base for this model + view.
+-        // Body proportions, sleeve length, and skin tone from any dressed base are far better
+-        // than no reference at all (which causes sleeve length, texture, and proportion issues).
++        // NO FALLBACK: if no exact wardrobe hash match, block generation.
++        // Using a dressed base from a different outfit poisons Phase 2 with wrong shirt color,
++        // shoe style, and silhouette cues. Better to fail explicitly than degrade silently.
+         if (!dressedBase) {
+-          try {
+-            const allBases = await listDressedBases(modelId);
+-            // Prefer matching view, then fall back to any view
+-            const viewMatch = allBases.find((b: any) => b.view === preferredView && b.imageUrl);
+-            const anyMatch = allBases.find((b: any) => b.imageUrl);
+-            const fallbackBase = viewMatch || anyMatch;
+-            if (fallbackBase) {
+-              dressedBase = fallbackBase;
+-              console.log(`[Generate] 1b. No exact hash match — using FALLBACK dressed base (${(fallbackBase as any).wardrobeHash || 'unknown'}, view: ${(fallbackBase as any).view || 'unknown'})`);
+-            }
+-          } catch (fbErr) {
+-            console.warn(`[Generate] 1b. Fallback dressed base lookup failed:`, fbErr);
+-          }
++          const errorMsg = `No dressed base found for wardrobe hash ${hash} (model ${modelId}, view ${preferredView}). Generate dressed bases for this wardrobe combination first.`;
++          console.error(`[Generate] 1b. BLOCKED — ${errorMsg}`);
++          return NextResponse.json({ error: errorMsg, code: 'MISSING_DRESSED_BASE' }, { status: 400 });
+         }
+ 
+         if (dressedBase) {
+@@ -264,19 +262,13 @@ export async function POST(req: NextRequest) {
+     // The actual pants come from fit model reference photos only.
+     // When garment is upper-body (jacket), the dressed base pants ARE correct — use them.
+     if (isCroppedShot && !fullBodyThenCrop && dressedBaseBuffer) {
+-      // Pre-crop dressed base to waist-down for M01/M02 — consistent with pre-cropped garment template
+-      // v30: DISABLED when fullBodyThenCrop — M01/M02 now generate full-body, dressed base used full in Phase 2
++      // v38: Smart waistband detection — find actual waistband position instead of fixed %
++      // Fallback 0.42 is below waistband, ensures hands/forearms are cropped out
+       let croppedDressedBase = dressedBaseBuffer;
+       try {
+-        const dbMeta = await sharp(dressedBaseBuffer).metadata();
+-        const dbH = dbMeta.height || 2400;
+-        const dbW = dbMeta.width || 1800;
+-        const dbCropTop = Math.round(dbH * 0.42); // crop from 42% — below waistband, ensures hands/forearms are cropped out
+-        croppedDressedBase = await sharp(dressedBaseBuffer)
+-          .extract({ left: 0, top: dbCropTop, width: dbW, height: dbH - dbCropTop })
+-          .jpeg({ quality: 95 })
+-          .toBuffer();
+-        console.log(`[Generate] 1c. Dressed base pre-cropped to waist-down for ${shotType}`);
++        const dbCropResult = await smartCropFromWaistband(dressedBaseBuffer, 0.42, 0.02);
++        croppedDressedBase = dbCropResult.buffer;
++        console.log(`[Generate] 1c. Dressed base cropped for ${shotType} — ${dbCropResult.detected ? 'SMART' : 'FALLBACK'} at ${(dbCropResult.cropFrac * 100).toFixed(1)}%`);
+       } catch (dbCropErr) {
+         console.error(`[Generate] 1c. Dressed base crop failed (using full):`, dbCropErr);
+       }
+@@ -307,9 +299,13 @@ export async function POST(req: NextRequest) {
+     // The flat image is the ABSOLUTE GROUND TRUTH for color/wash and shape/silhouette.
+     let flatColor: FlatColor | null = null;
+     let flatSilhouette: FlatSilhouette | null = null;
++    // Store raw (unresized) flat buffers for panoramic zone strip generation
++    let rawFlatFrontBuffer: Buffer | null = null;
++    let rawFlatBackBuffer: Buffer | null = null;
+     if (flatFrontUrl) {
+       try {
+         const flatBuffer = await downloadGarmentImage(flatFrontUrl.split('?')[0]);
++        rawFlatFrontBuffer = flatBuffer;
+ 
+         // 2a. Extract mathematical color + silhouette from flat (ground truth)
+         try {
+@@ -320,25 +316,56 @@ export async function POST(req: NextRequest) {
+           console.warn(`[Generate] 2a. Flat reference extraction failed (non-blocking):`, refErr);
+         }
+ 
+-        const resizedFlat = await resizeForFeed(flatBuffer, 1400);
++        // v38: Front now isolated to 3 angles — flat can go to 2000px (same budget as back)
++        const resizedFlat = await resizeForFeed(flatBuffer, 2000);
+ 
+-        // v33: Simple label — no LAB/silhouette data bloat
+-        referenceImages.push({
+-          buffer: resizedFlat,
+-          mimeType: 'image/jpeg',
+-          label: REF_LABELS.flatImage,
+-        });
+-        console.log(`[Generate] 2. Flat image loaded (resized to 1400px)`);
++        // v37: Flat FRONT only goes into front shot references — back shots don't need it
++        const isBackShotForFlat = shotType === 'M02' || shotType === 'M04' || shotType === 'M05';
++        if (!isBackShotForFlat) {
++          referenceImages.push({
++            buffer: resizedFlat,
++            mimeType: 'image/jpeg',
++            label: REF_LABELS.flatImage,
++          });
++          console.log(`[Generate] 2. Flat front image loaded (resized to 2000px)`);
++        } else {
++          console.log(`[Generate] 2. Flat front image loaded but SKIPPED for back shot ${shotType} (v37 isolation)`);
++        }
+       } catch (err) {
+         console.error(`[Generate] Failed to load flat image:`, err);
+       }
+     }
++    // 2b. Pre-load flat back buffer — injected directly for back-view shots + used in panoramic strips
++    if (flatBackUrl) {
++      try {
++        rawFlatBackBuffer = await downloadGarmentImage(flatBackUrl.split('?')[0]);
++        console.log(`[Generate] 2b. Flat back buffer loaded`);
++
++        // v37: For back-view shots, inject flat back at MAXIMUM resolution (2000px).
++        // This is the #1 reference for back construction — seam lines, panels, pockets.
++        // Only 4 total references for back shots, so we can afford high resolution.
++        const isBackShotForFlatBack = shotType === 'M02' || shotType === 'M04' || shotType === 'M05';
++        if (isBackShotForFlatBack) {
++          const resizedFlatBack = await resizeForFeed(rawFlatBackBuffer, 2000);
++          referenceImages.push({
++            buffer: resizedFlatBack,
++            mimeType: 'image/jpeg',
++            label: `FLAT BACK IMAGE — GROUND TRUTH for ALL back construction details. Study this image carefully:\n- Back pocket shape, stitching arcs, and placement\n- Yoke seam shape and position\n- Back panel seam lines (diagonal lines running from pocket area down to ankle)\n- Knee-level panel boundaries\n- Every seam, stitch line, and panel boundary visible here MUST appear in the generated image at the EXACT same position and angle.\nDo NOT invent any seam lines not shown here. Do NOT omit any seam lines shown here.`,
++          });
++          console.log(`[Generate] 2b. Flat back image injected at 2000px for ${shotType} (v37 back isolation)`);
++        }
++      } catch (err) {
++        console.warn(`[Generate] 2b. Failed to load flat back buffer (non-blocking):`, err);
++      }
++    }
+ 
+-    // 3. FIT MODEL IMAGES — primary garment reference (replaces mannequin 360°)
+-    // Fit model photos show real human wearing garment: drape, silhouette, construction, wash.
+-    // Ordered: front first, rotating right (up to 8 images).
++    // 3. FIT MODEL IMAGES — primary garment reference
++    // v37: FULL FRONT/BACK ISOLATION — back shots get ONLY back angles (3,4,5),
++    // front shots get ONLY front angles (0,1,7). No cross-contamination.
++    // This prevents front seam details bleeding into back generation and vice versa.
+     const fitModelBuffers: Array<{ buffer: Buffer; index: number }> = [];
+     let hasFitModelRefs = false;
++    const isBackShot = shotType === 'M02' || shotType === 'M04' || shotType === 'M05';
+     try {
+       const jobDocFit = await jobsCol.doc(jobId).get();
+       const garmentWardrobeId = jobDocFit.data()?.garmentWardrobeId;
+@@ -347,31 +374,58 @@ export async function POST(req: NextRequest) {
+         const fitUrls = (focusItem as any)?.fitModelUrls;
+         if (fitUrls?.length) {
+           const maxFitImages = Math.min(fitUrls.length, 8);
+-          for (let i = 0; i < maxFitImages; i++) {
++
++          // v38: FULL ISOLATION — both front and back get only 3 relevant angles at 2000px.
++          // Back shots: angles around center (3,4,5). Front shots: angles 0, 1, last (front-facing).
++          // Fewer angles + higher resolution = better garment fidelity. No cross-contamination.
++          const backCenterIdx = Math.floor(maxFitImages / 2);
++          const backIndices = new Set<number>();
++          for (let b = backCenterIdx - 1; b <= backCenterIdx + 1; b++) {
++            if (b >= 0 && b < maxFitImages) backIndices.add(b);
++          }
++
++          // Front: angles 0 (front), 1 (front-right), last (front-left) — the 3 front-facing views
++          const frontIndices = new Set<number>([0, Math.min(1, maxFitImages - 1), maxFitImages - 1]);
++
++          const fitOrder = isBackShot
++            ? [...backIndices].sort((a, b) => a - b)              // Back: only 3 back angles
++            : [...frontIndices].sort((a, b) => a - b);            // Front: only 3 front angles
++
++          // Both front and back: 3 images → 2000px each (same budget, max detail)
++          const fitResolution = 2000;
++
++          console.log(`[Generate] 3. v38 refs: ${isBackShot ? 'BACK ISOLATED' : 'FRONT ISOLATED'} — angles [${fitOrder.join(',')}] at ${fitResolution}px`);
++
++          for (const i of fitOrder) {
+             try {
+               const buf = await downloadGarmentImage(fitUrls[i].split('?')[0]);
+-              const resizedBuf = await resizeForFeed(buf, 1200);
++              const resizedBuf = await resizeForFeed(buf, fitResolution);
+ 
+               fitModelBuffers.push({ buffer: buf, index: i });
+ 
+-              // First image (front) gets the COLOR ANCHOR label
+-              const colorAnchor = i === 0
+-                ? `\nCOLOR ANCHOR — THIS IS THE DEFINITIVE WASH/COLOR REFERENCE. The exact shade, wash intensity, fading pattern, and color tone in this front view is the GROUND TRUTH. All other angles confirm it. Do NOT deviate from this color in the generated image.`
+-                : '';
++              const isBackAngle = backIndices.has(i);
++
++              // View-specific labels
++              const viewLabel = isBackShot
++                ? `BACK CONSTRUCTION REFERENCE — This shows the BACK of the garment on a real body. Study and reproduce: back panel seam lines, pocket shapes and stitching arcs, yoke construction, diagonal seams below knee, and how the fabric drapes from behind. Every seam line visible here MUST appear in the output.`
++                : (i === 0
++                  ? `FRONT COLOR ANCHOR — DEFINITIVE WASH/COLOR REFERENCE. Match this exact shade, wash intensity, fading pattern.\nThis is the GROUND TRUTH color. Study front pocket shape, fly stitching, front panel seams, and waistband construction.`
++                  : `FRONT CONSTRUCTION REFERENCE — front-facing angle showing fabric drape, silhouette, front pocket placement, seam lines, and how the garment falls on a real body from this angle.`);
+ 
+-              const angleDesc = i === 0 ? 'front' : `angle ${i + 1}/${maxFitImages}, rotating right`;
++              const angleDesc = isBackAngle ? `BACK (angle ${i + 1}/${maxFitImages})` : (i === 0 ? 'front' : `angle ${i + 1}/${maxFitImages}, rotating right`);
++              const totalInSet = fitOrder.length;
+               referenceImages.push({
+                 buffer: resizedBuf,
+                 mimeType: 'image/jpeg',
+-                label: `FIT MODEL REFERENCE (${i + 1}/${maxFitImages}, ${angleDesc}) — Real human wearing this EXACT garment. Match wash, color, construction details, fabric drape, silhouette, and how the garment falls on a real body.${colorAnchor}`,
++                label: `FIT MODEL (${fitOrder.indexOf(i) + 1}/${totalInSet}, ${angleDesc}) — Real human wearing this EXACT garment. ${viewLabel}`,
+               });
+-              console.log(`[Generate] 3. Fit model image ${i + 1}/${maxFitImages} loaded (${angleDesc})`);
++              console.log(`[Generate] 3. Fit model image ${i + 1}/${maxFitImages} loaded (${angleDesc}, ${fitResolution}px)`);
+             } catch (err) {
+               console.error(`[Generate] Failed to load fit model image ${i}:`, err);
+             }
+           }
+           hasFitModelRefs = true;
+-          console.log(`[Generate] 3. ${maxFitImages} fit model references loaded`);
++          console.log(`[Generate] 3. v38: ${fitOrder.length}/${maxFitImages} fit model refs loaded (${isBackShot ? 'BACK ISOLATED' : 'FRONT ISOLATED'})`);
+         }
+       }
+     } catch (fitErr) {
+@@ -435,32 +489,68 @@ export async function POST(req: NextRequest) {
+       }
+     }
+ 
+-    // 4. ZONE GRIDS — the v5 secret weapon (Learning #2, #20)
+-    // Generate cropped detail grids from fit model images
++    // 4. ZONE GRIDS — 360° panoramic strips (replaces old partial-angle grids)
++    // For pants: generates 3 high-res panoramic strips (waist, knee, ankle) with ALL
++    // fit model angles + flat front + flat back crops. Full 360° coverage per zone.
++    // Falls back to legacy grids for jackets/other categories.
+     const category = garmentCategory || detectCategory(shotType);
++    // Store panoramic strips separately — they replace zoneGridRefs for Phase 2
++    const panoramicStripRefs: Array<{ buffer: Buffer; mimeType: string; label: string; zoneName: string }> = [];
++    let usedPanoramicStrips = false;
++
+     if (fitModelBuffers.length >= 2) {
+       try {
+-        const zoneGrids = await generateZoneGrids(fitModelBuffers, category);
+-        let gridNum = 1;
+-        const totalGrids = zoneGrids.length;
+-
+-        for (const grid of zoneGrids) {
+-          const gridLabel = `CONSTRUCTION DETAIL GRID ${gridNum}/${totalGrids}: ${grid.zoneName} zone from multiple angles. Copy seam patterns, hardware, and trim EXACTLY as shown.`;
+-          referenceImages.push({
+-            buffer: grid.buffer,
+-            mimeType: grid.mimeType,
+-            label: gridLabel,
+-          });
+-          // Store for Phase 2 injection
+-          zoneGridRefs.push({
+-            buffer: grid.buffer,
+-            mimeType: grid.mimeType,
+-            label: gridLabel,
+-            zoneName: grid.zoneName,
+-          });
+-          gridNum++;
++        // v38: Full isolation — each view gets only its own flat. No cross-contamination.
++        const strips = await generatePanoramicStrips(
++          fitModelBuffers,
++          isBackShot ? null : rawFlatFrontBuffer,    // front flat for front shots only
++          isBackShot ? rawFlatBackBuffer : null,      // back flat for back shots only
++          shotType,
++          category
++        );
++
++        if (strips.length > 0) {
++          usedPanoramicStrips = true;
++          let stripNum = 1;
++          for (const strip of strips) {
++            const stripLabel = `360° ZONE STRIP ${stripNum}/${strips.length}: ${strip.label}`;
++            referenceImages.push({
++              buffer: strip.buffer,
++              mimeType: strip.mimeType,
++              label: stripLabel,
++            });
++            panoramicStripRefs.push({
++              buffer: strip.buffer,
++              mimeType: strip.mimeType,
++              label: stripLabel,
++              zoneName: strip.zoneName,
++            });
++            stripNum++;
++          }
++          console.log(`[Generate] 4. Panoramic strips: ${strips.length} strips generated (${strips.map(s => `${s.zoneName}:${s.panelCount}panels`).join(', ')})`);
++        } else {
++          // Fallback to legacy zone grids (jackets, other categories)
++          const zoneGrids = await generateZoneGrids(fitModelBuffers, category);
++          let gridNum = 1;
++          const totalGrids = zoneGrids.length;
++
++          for (const grid of zoneGrids) {
++            const gridLabel = `CONSTRUCTION DETAIL GRID ${gridNum}/${totalGrids}: ${grid.zoneName} zone from multiple angles. Copy seam patterns, hardware, and trim EXACTLY as shown.`;
++            referenceImages.push({
++              buffer: grid.buffer,
++              mimeType: grid.mimeType,
++              label: gridLabel,
++            });
++            zoneGridRefs.push({
++              buffer: grid.buffer,
++              mimeType: grid.mimeType,
++              label: gridLabel,
++              zoneName: grid.zoneName,
++            });
++            gridNum++;
++          }
++          console.log(`[Generate] 4. Legacy zone grids: ${zoneGrids.length} grids generated (fallback)`);
+         }
+-        console.log(`[Generate] 4. Zone grids: ${zoneGrids.length} grids generated`);
+       } catch (err) {
+         console.error(`[Generate] Zone grid generation failed (non-blocking):`, err);
+       }
+@@ -775,12 +865,34 @@ ${garmentCategory ? `\nGARMENT TYPE: This product is "${garmentCategory.toUpperC
+ 
+ CRITICAL — GARMENT FIDELITY:
+ - The fit model reference images are the GROUND TRUTH. Match the exact wash, color, fading pattern.
+-- Match every construction detail: pockets (shape, placement, stitching), seams, belt loops, waistband, hardware.
+-- Match the silhouette exactly — if it's a flare, the flare width must match. If straight, keep straight.
+-- Do NOT invent details. No labels, patches, or stitching that don't exist in the reference.
++- Match every construction detail visible in the references: seams, pockets, stitching, belt loops, waistband, hardware.
++- Do NOT invent details. No labels, patches, seam lines, or stitching that don't exist in the reference images.
++- ONLY reproduce what you SEE in the references — nothing more, nothing less.
+ ${garmentHexColor ? `- GARMENT COLOR LOCK: ${garmentHexColor}. The fabric MUST match this exact color.` : ''}
+-
+-CRITICAL — BACK POCKET STITCHING COLOR: The stitching on the back pockets MUST match the EXACT color shown in the fit model back-view reference. If the reference shows tone-on-tone stitching (same color as denim), the output MUST show tone-on-tone stitching. Do NOT default to white/contrast stitching unless the reference CLEARLY shows white stitching. White stitching when the reference shows tone-on-tone = CRITICAL FAILURE.
++${flatSilhouette && flatSilhouette.confidence > 0 ? `
++CRITICAL — GARMENT SILHOUETTE (measured from flat product image — HARD CONSTRAINTS):
++${flatSilhouette.description}
++These measurements are GROUND TRUTH from the actual garment. The generated image MUST match this width profile. Deviating from these proportions is a CRITICAL FAILURE.` : ''}
++${isBackView ? `
++CRITICAL — BACK VIEW CONSTRUCTION:
++You are generating a BACK VIEW. ALL reference images show the BACK of the garment — there are NO front views.
++Study every reference image carefully for BACK-SPECIFIC details:
++- Back pocket shape, size, placement, and stitching arc pattern — match the flat back image EXACTLY
++- Back pocket stitching COLOR: must match references. If tone-on-tone (same color as denim), output MUST be tone-on-tone. Do NOT default to white/contrast stitching.
++- Yoke seam shape and position across the upper back
++- Back panel seam lines — diagonal lines running from pocket area down toward ankle. Count them, trace their path, reproduce EXACTLY.
++- Knee-level panel boundaries (horizontal or shaped seams at knee height)
++- Do NOT generate a "generic jeans back". This garment has SPECIFIC back construction. Every seam line in the flat back image MUST appear in the output.
++- Do NOT add ANY seam lines, horizontal lines, or construction details that are NOT visible in the reference images.` : `
++CRITICAL — FRONT VIEW CONSTRUCTION:
++You are generating a FRONT VIEW. ALL reference images show the FRONT of the garment — there are NO back views.
++Study every reference image carefully for FRONT-SPECIFIC details:
++- Front pocket shape, placement, and stitching
++- Fly stitching and button/rivet placement
++- Front panel seam lines — trace their exact path from the references
++- Waistband construction, belt loops, top button
++- Do NOT add any back-view construction details (back pockets, yoke seams) to the front.
++- Do NOT add ANY seam lines or construction details that are NOT visible in the reference images.`}
+ 
+ CRITICAL — DO NOT ADD DISTRESSING:
+ - Do NOT add tears, rips, fraying, distressing, or worn patches UNLESS they are CLEARLY visible in the fit model photos.
+@@ -799,9 +911,15 @@ ASPECT: 9:16 portrait, full body head to toe visible.
+ ${ECOM_NO_GOS}
+ 
+ ${hasFitModelRefs
+-  ? `The reference images include fit model photos (real human wearing the garment) from multiple angles (front first, rotating right).
+-Use these for: construction details, pocket placement, stitching, hardware, wash pattern, color, fabric drape, silhouette, and how the garment falls on a real body.
+-The fit model shows the TRUTH of how this garment looks when worn.`
++  ? (isBackView
++    ? `The reference images show the BACK of the garment ONLY — 3 back-view fit model angles + 1 flat back image.
++These are ALL back views. Study every seam line, panel boundary, and pocket detail visible from behind.
++The fit model photos show the TRUTH of how this garment's back construction looks when worn on a real body.
++The flat back image shows the garment laid flat — GROUND TRUTH for exact seam positions and pocket shapes.`
++    : `The reference images show the FRONT of the garment ONLY — 3 front-view fit model angles + 1 flat front image.
++These are ALL front views. Study every seam line, pocket shape, fly stitching, and construction detail visible from the front.
++The fit model photos show the TRUTH of how this garment's front construction looks when worn on a real body.
++The flat front image shows the garment laid flat — GROUND TRUTH for exact front seam positions, pocket shapes, and silhouette width.`)
+   : `The reference images show the garment. Use them ALL to understand the 3D construction, then render with photographic realism.`}
+ 
+ ${finalPrompt.includes('FLOOR-LENGTH') ? 'HEM: Floor-length — hems touch/nearly touch the ground, shoes mostly hidden.' : ''}
+@@ -859,49 +977,76 @@ ${finalPrompt.includes('ANKLE-LENGTH') ? 'HEM: Ankle-length — hem ends at the
+       }
+ 
+       // 4. Fit model back views (pocket detail references)
+-      // Fit model images ordered: front first, rotating right. Back ≈ middle index.
+-      const totalFitAngles = fitModelBuffers.length || 1;
+-      const backIdx = Math.floor(totalFitAngles / 2);
+-      const backAngles = fitModelBuffers.filter(mb => {
+-        return mb.index >= backIdx - 1 && mb.index <= backIdx + 1;
+-      });
+-      for (const mb of backAngles) {
+-        const resized = await resizeForFeed(mb.buffer, 1200);
++      // v38: fitModelBuffers already contains ONLY back angles (3 images at 2000px)
++      // thanks to the v38 isolation. Use them all directly — no index filtering needed.
++      for (const mb of fitModelBuffers) {
++        const resized = await resizeForFeed(mb.buffer, 2000);
+         m05Refs.push({
+           buffer: resized,
+           mimeType: 'image/jpeg',
+           label: `FIT MODEL BACK VIEW — Back pocket construction reference. Copy pocket shape, stitching pattern, arc shape, rivets, and all construction details EXACTLY.`,
+         });
+       }
+-      // If no back angles found, use all fit model refs
+-      if (backAngles.length === 0) {
++      if (fitModelBuffers.length === 0) {
++        // Fallback: use whatever fit model refs are in referenceImages
+         for (const ref of referenceImages.filter(r => r.label.includes('FIT MODEL'))) {
+           m05Refs.push(ref);
+         }
+       }
++      console.log(`[Generate] v38: M05 — ${fitModelBuffers.length} back fit model refs injected directly at 2000px`);
+ 
+-      // 5. Back hip zone grid (if available)
+-      for (const zone of zoneGridRefs.filter(z => z.zoneName.toLowerCase().includes('back hip') || z.zoneName.toLowerCase().includes('hip'))) {
+-        m05Refs.push({
+-          buffer: zone.buffer,
+-          mimeType: zone.mimeType,
+-          label: `BACK POCKET DETAIL GRID — ${zone.zoneName}. Copy every stitch, arc, and rivet EXACTLY.`,
+-        });
++      // 5. Zone detail references — panoramic strips or legacy grids
++      if (usedPanoramicStrips) {
++        // Inject the waist panoramic strip — it has back pocket detail from ALL angles + flat back
++        const waistStrip = panoramicStripRefs.find(s => s.zoneName === 'waist');
++        if (waistStrip) {
++          m05Refs.push({
++            buffer: waistStrip.buffer,
++            mimeType: waistStrip.mimeType,
++            label: `360° WAIST PANORAMIC — Full 360° view of back pocket area with flat back reference. Copy every stitch, arc, and rivet EXACTLY.`,
++          });
++        }
++        console.log(`[Generate] v35: M05 — panoramic waist strip injected for pocket detail`);
++      } else {
++        // Legacy: back hip zone grid
++        for (const zone of zoneGridRefs.filter(z => z.zoneName.toLowerCase().includes('hip') || z.zoneName.toLowerCase() === 'back')) {
++          m05Refs.push({
++            buffer: zone.buffer,
++            mimeType: zone.mimeType,
++            label: `BACK POCKET DETAIL GRID — ${zone.zoneName}. Copy every stitch, arc, and rivet EXACTLY.`,
++          });
++        }
+       }
+ 
+-      // 6. Flat image for color reference
+-      if (flatFrontUrl) {
+-        const flatRef = referenceImages.find(r => r.label.includes('FLAT IMAGE'));
+-        if (flatRef) m05Refs.push(flatRef);
++      // 6. Flat back for construction reference (M05 is a back shot — flat back is the relevant flat)
++      const flatBackRef = referenceImages.find(r => r.label.includes('FLAT BACK IMAGE'));
++      if (flatBackRef) {
++        m05Refs.push(flatBackRef);
++        console.log(`[Generate] v38: M05 — flat back image injected for pocket construction reference`);
+       }
+ 
+-      // 7. v37: COLOR ANCHOR — fit model front view (index 0) with hex label
+-      // M05 was missing this entirely, causing dark denim drift. The front fit model
+-      // is the definitive color reference — it has the hex injected.
+-      const colorAnchorRef = referenceImages.find(r => r.label.includes('COLOR ANCHOR'));
+-      if (colorAnchorRef) {
+-        m05Refs.push(colorAnchorRef);
+-        console.log(`[Generate] v37: M05 — COLOR ANCHOR fit model front injected`);
++      // 7. v38: COLOR ANCHOR — load fit model front view (index 0) directly.
++      // With v38 isolation, referenceImages for back shots no longer contain front angles.
++      // M05 needs the front fit model as color ground truth to prevent dark denim drift.
++      try {
++        const jobDocColor = await jobsCol.doc(jobId).get();
++        const colorWardrobeId = jobDocColor.data()?.garmentWardrobeId;
++        if (colorWardrobeId) {
++          const colorItem = await getWardrobeItem(colorWardrobeId);
++          const colorFitUrls = (colorItem as any)?.fitModelUrls;
++          if (colorFitUrls?.length > 0) {
++            const frontBuf = await downloadGarmentImage(colorFitUrls[0].split('?')[0]);
++            const resizedFront = await resizeForFeed(frontBuf, 1200);
++            m05Refs.push({
++              buffer: resizedFront,
++              mimeType: 'image/jpeg',
++              label: `COLOR ANCHOR — DEFINITIVE WASH/COLOR REFERENCE (front view). Match this exact shade, wash intensity, fading pattern. ${garmentHexColor ? `GARMENT COLOR LOCK: ${garmentHexColor}.` : ''}`,
++            });
++            console.log(`[Generate] v38: M05 — COLOR ANCHOR loaded directly from fit model front`);
++          }
++        }
++      } catch (colorErr) {
++        console.warn(`[Generate] v38: M05 color anchor load failed (non-blocking):`, colorErr);
+       }
+ 
+       // 8. v37: M03 garment template as cross-shot color lock (same as M04 gets)
+@@ -1079,7 +1224,6 @@ ${garmentDNA ? garmentDNA.dna : ''}`;
+         }
+       } catch { /* non-blocking */ }
+ 
+-      console.log(`[Generate] Auto-QC SUSPENDED (v28) — use manual QC via results page`);
+       return NextResponse.json({ success: true, shotId, imageUrl, filename, qc: null });
+     }
+ 
+@@ -1147,23 +1291,16 @@ ${garmentDNA ? garmentDNA.dna : ''}`;
+     }
+ 
+     // ── PRE-CROP Phase 1 template for M01/M02 ──
+-    // This is THE fix for cropped shots. Instead of generating full body then cropping post-hoc,
+-    // we crop the Phase 1 garment template to waist-to-shoes BEFORE passing to Phase 2.
+-    // Phase 2 then sees a cropped reference and composes the image correctly from the start.
++    // v38: Smart waistband detection — finds the actual waistband in the Phase 1 template
++    // and crops with a small margin above. Works with heels, low-rise, high-rise, etc.
+     let phase2GarmentRef = phase1ImageData!;
+     if (isCroppedShot && !fullBodyThenCrop && phase1ImageData) {
+-      // v30: DISABLED when fullBodyThenCrop — Phase 2 gets full-body template, crop happens on OUTPUT
+       try {
+-        const templateMeta = await sharp(phase1ImageData).metadata();
+-        const tH = templateMeta.height || 2400;
+-        const tW = templateMeta.width || 1800;
+-        const cropFromTop = Math.round(tH * 0.35);
+-        const cropHeight = tH - cropFromTop;
+-        phase2GarmentRef = await sharp(phase1ImageData)
+-          .extract({ left: 0, top: cropFromTop, width: tW, height: cropHeight })
+-          .jpeg({ quality: 95 })
+-          .toBuffer();
+-        console.log(`[Generate] PRE-CROP: Phase 1 template cropped for ${shotType} — top=${cropFromTop} (35%), remaining height=${cropHeight}px.`);
++        const cropResult = await smartCropFromWaistband(phase1ImageData, 0.35, 0.03);
++        phase2GarmentRef = cropResult.buffer;
++        const tH = (await sharp(phase1ImageData).metadata()).height || 2400;
++        const cropFromTop = Math.round(tH * cropResult.cropFrac);
++        console.log(`[Generate] PRE-CROP: Phase 1 template cropped for ${shotType} — ${cropResult.detected ? 'SMART' : 'FALLBACK'} at ${(cropResult.cropFrac * 100).toFixed(1)}%, removed top ${cropFromTop}px.`);
+       } catch (preCropErr) {
+         console.error(`[Generate] PRE-CROP failed (using full template):`, preCropErr);
+         phase2GarmentRef = phase1ImageData!;
+@@ -1210,15 +1347,11 @@ ${garmentDNA ? garmentDNA.dna : ''}`;
+       // Legacy: cropped dressed base for M01/M02 when not using full-body-then-crop
+       try {
+         const dbMeta2 = await sharp(dressedBaseBuffer).metadata();
+-        const dbH2 = dbMeta2.height || 2400;
+-        const dbW2 = dbMeta2.width || 1800;
+-        const dbCropTop2 = Math.round(dbH2 * 0.35);
+-        const croppedDbForPhase2 = await sharp(dressedBaseBuffer)
+-          .extract({ left: 0, top: dbCropTop2, width: dbW2, height: dbH2 - dbCropTop2 })
+-          .jpeg({ quality: 95 })
+-          .toBuffer();
++        // v38: Smart waistband crop for Phase 2 dressed base
++        const dbCropResult2 = await smartCropFromWaistband(dressedBaseBuffer, 0.35, 0.03);
++        console.log(`[Generate] Phase 2: dressed base cropped — ${dbCropResult2.detected ? 'SMART' : 'FALLBACK'} at ${(dbCropResult2.cropFrac * 100).toFixed(1)}%`);
+         phase2Refs.push({
+-          buffer: croppedDbForPhase2,
++          buffer: dbCropResult2.buffer,
+           mimeType: 'image/jpeg',
+           label: `BODY REFERENCE (CROPPED) — Match body proportions, sleeve length, shoes, skin tone. IGNORE legwear.`,
+         });
+@@ -1257,37 +1390,51 @@ ${garmentDNA ? garmentDNA.dna : ''}`;
+       });
+     }
+ 
+-    // 4. Key zone grid crops — gives Flash construction detail references alongside the template
+-    // Hip grid = pockets, waistband, rivets, labels. Knee grid = seam construction, articulation.
+-    const keyZones = zoneGridRefs.filter(z =>
+-      z.zoneName.toLowerCase().includes('hip') ||
+-      z.zoneName.toLowerCase().includes('knee') ||
+-      z.zoneName.toLowerCase().includes('back hip')
+-    );
+-    for (const zone of keyZones) {
+-      phase2Refs.push({
+-        buffer: zone.buffer,
+-        mimeType: zone.mimeType,
+-        label: `PHASE 2 DETAIL REFERENCE — ${zone.zoneName}. Reproduce ONLY the construction details visible in this reference — nothing more, nothing less. Do NOT add any stitch lines, creases, or features not present in this image. If a pocket shows only a curved arc stitch, output only that curved arc stitch.`,
+-      });
+-    }
+-    if (keyZones.length > 0) {
+-      console.log(`[Generate] Phase 2: injected ${keyZones.length} zone grid crops for construction detail fidelity`);
+-    }
+-
+-    // 5. Flat back image for back-view shots (M02, M04, M05) — back pocket/label ground truth
+-    if (isBackView && flatBackUrl) {
+-      try {
+-        const flatBackBuffer = await downloadGarmentImage(flatBackUrl.split('?')[0]);
+-        const resizedFlatBack = await resizeForFeed(flatBackBuffer, 1400);
++    // 4. Zone detail references — panoramic strips OR legacy zone grids
++    // Panoramic strips already include flat front + flat back crops for each zone,
++    // so no separate flat back injection needed when panoramic strips are active.
++    if (usedPanoramicStrips) {
++      // Inject ALL panoramic strips — they're already shot-type-aware (angle ordering)
++      for (const strip of panoramicStripRefs) {
+         phase2Refs.push({
+-          buffer: resizedFlatBack,
+-          mimeType: 'image/jpeg',
+-          label: `FLAT BACK IMAGE — Back view of the garment laid flat. This is the GROUND TRUTH for back pocket shape, stitching pattern, label placement, and back panel construction. Reproduce these details EXACTLY.`,
++          buffer: strip.buffer,
++          mimeType: strip.mimeType,
++          label: `PHASE 2 ${strip.label}. Reproduce ONLY the construction details visible — nothing more, nothing less. Do NOT add any stitch lines, creases, or features not present in these reference panels.`,
+         });
+-        console.log(`[Generate] Phase 2: flat back image injected for ${shotType} (back-view shot)`);
+-      } catch (flatBackErr) {
+-        console.error(`[Generate] Phase 2: flat back image load failed (non-blocking):`, flatBackErr);
++      }
++      console.log(`[Generate] Phase 2: injected ${panoramicStripRefs.length} panoramic strips (${isBackView ? 'BACK' : 'FRONT'}-only, v37 isolated)`);
++    } else {
++      // Legacy path: old zone grids + separate flat back injection
++      const keyZones = zoneGridRefs.filter(z =>
++        z.zoneName.toLowerCase().includes('hip') ||
++        z.zoneName.toLowerCase().includes('knee') ||
++        z.zoneName.toLowerCase() === 'back'  // FIX: was 'back hip' which never matched
++      );
++      for (const zone of keyZones) {
++        phase2Refs.push({
++          buffer: zone.buffer,
++          mimeType: zone.mimeType,
++          label: `PHASE 2 DETAIL REFERENCE — ${zone.zoneName}. Reproduce ONLY the construction details visible in this reference — nothing more, nothing less. Do NOT add any stitch lines, creases, or features not present in this image. If a pocket shows only a curved arc stitch, output only that curved arc stitch.`,
++        });
++      }
++      if (keyZones.length > 0) {
++        console.log(`[Generate] Phase 2: injected ${keyZones.length} legacy zone grid crops for construction detail fidelity`);
++      }
++
++      // 5. Flat back image for back-view shots — only in legacy path (panoramic strips include it)
++      if (isBackView && flatBackUrl) {
++        try {
++          const flatBackBuf = rawFlatBackBuffer || await downloadGarmentImage(flatBackUrl.split('?')[0]);
++          const resizedFlatBack = await resizeForFeed(flatBackBuf, 1400);
++          phase2Refs.push({
++            buffer: resizedFlatBack,
++            mimeType: 'image/jpeg',
++            label: `FLAT BACK IMAGE — Back view of the garment laid flat. This is the GROUND TRUTH for back pocket shape, stitching pattern, label placement, and back panel construction. Reproduce these details EXACTLY.`,
++          });
++          console.log(`[Generate] Phase 2: flat back image injected for ${shotType} (back-view shot, legacy path)`);
++        } catch (flatBackErr) {
++          console.error(`[Generate] Phase 2: flat back image load failed (non-blocking):`, flatBackErr);
++        }
+       }
+     }
+ 
+@@ -1316,10 +1463,12 @@ TASK: Generate a final clean e-commerce studio photograph.
+ RULES:
+ - GARMENT: Copy the jeans/pants EXACTLY from the garment template. Same wash, same color, same pockets, same silhouette, same fading. Do not reinterpret. Do NOT add any stitch lines, creases, pocket details, or construction features that are not in the garment template — if a pocket is clean with only a curved arc stitch, it must stay clean with only that curved arc stitch.
+ - GARMENT COLOR UNIFORMITY (CRITICAL): The denim wash/shade MUST be PERFECTLY UNIFORM across the ENTIRE garment — from waistband to hem, front to back, left to right. NO two-toning. NO lighter zone at the buttock area. NO darker zone at the lower legs. NO color shift between hip and thigh. The ENTIRE garment is ONE consistent wash from the garment template. If any zone looks like a different shade than the rest, the image is WRONG.
+-- GARMENT SILHOUETTE: Match the garment silhouette EXACTLY from the garment template — same width at waist, hip, knee, and hem. Do NOT widen or narrow the legs. If the garment template shows wide/barrel legs, the output MUST show the same wide/barrel proportion.
+-- CONSTRUCTION DETAILS (CRITICAL): Reproduce EVERY visible construction detail from the garment template — knee panel seams, articulated knee construction lines, yoke seams, back pocket stitching arcs, rivets, belt loops, fly stitching. If the garment template shows 3D articulated knee panels with horizontal or diagonal seam lines across the knee area, those lines MUST appear in the output at the SAME position. Smooth knees when the template shows seam construction = CRITICAL FAILURE.
+-
+-CRITICAL — BACK POCKET STITCHING COLOR: The stitching on the back pockets MUST match the EXACT color shown in the fit model back-view reference. If the reference shows tone-on-tone stitching (same color as denim), the output MUST show tone-on-tone stitching. Do NOT default to white/contrast stitching unless the reference CLEARLY shows white stitching. White stitching when the reference shows tone-on-tone = CRITICAL FAILURE.
++- GARMENT SILHOUETTE: Match the garment silhouette EXACTLY from the garment template — same width at waist, hip, knee, and hem. Do NOT widen or narrow the legs.
++${flatSilhouette && flatSilhouette.confidence > 0 ? `- SILHOUETTE (MEASURED): ${flatSilhouette.description}` : ''}
++${isBackView
++  ? `- CONSTRUCTION DETAILS (CRITICAL — BACK VIEW): Reproduce EVERY visible back construction detail from the garment template — back panel seam lines (diagonal lines from pocket area to ankle), yoke seams, back pocket stitching arcs, knee-level panel boundaries. If the garment template shows seam lines, they MUST appear in the output at the SAME position and angle. Missing seam lines = CRITICAL FAILURE. Adding seam lines not in the template = CRITICAL FAILURE.
++- BACK POCKET STITCHING COLOR: Match the EXACT stitching color from the garment template. Tone-on-tone in template = tone-on-tone in output. Do NOT default to white/contrast stitching.`
++  : `- CONSTRUCTION DETAILS (CRITICAL — FRONT VIEW): Reproduce EVERY visible front construction detail from the garment template — front pocket shapes, fly stitching, rivet placement, belt loops, front panel seam lines. If the garment template shows seam lines or construction features, they MUST appear in the output at the SAME position. Missing details = CRITICAL FAILURE. Adding details not in the template = CRITICAL FAILURE.`}
+ 
+ ${!isCroppedPhase2 ? `- MODEL IDENTITY (CRITICAL): The person in the output MUST be the EXACT same person from the model card/dressed base reference. Same face, same skin tone, same hair color/style/length, same body build. A different-looking person is a CRITICAL FAILURE. Do NOT generate a random model — match the reference identity precisely. Do NOT change body type (slim model must stay slim, NOT become plus-size).` : `- MODEL: ${modelGender} model (cropped shot — no face visible). ${skinToneHex ? `CRITICAL — SKIN TONE: This model has ${skinToneDesc} (measured: ${skinToneHex}). All visible skin (hands, wrists, ankles, calves) MUST match this EXACT tone. Do NOT default to lighter skin. Wrong skin color is a CRITICAL FAILURE.` : ''}`}
+ - POSE: ${shotPoseDesc}
+@@ -1623,17 +1772,10 @@ The most critical thing: the GARMENT must be IDENTICAL to the garment template.
+       console.error('[Generate] Job status check failed (non-blocking):', statusErr);
+     }
+ 
+-    // ── AUTO-QC: SUSPENDED (v28) ──
+-    // QC adds failure modes (stuck shots from self-call timeouts) and cost.
+-    // Re-enable once core generation pipeline is stable.
+-    // Manual QC via "Run QC Now" button on results page still works.
+-    const qcResult: any = null;
+-    console.log(`[Generate] Auto-QC SUSPENDED (v28) — use manual QC via results page`);
+-
+     return NextResponse.json({
+       success: true,
+       shotId, imageUrl, filename,
+-      qc: qcResult?.qcScores || null,
++      qc: null,
+     });
+   } catch (error) {
+     console.error('Generation error:', error);
+diff --git a/src/app/api/jobs/process-queue/route.ts b/src/app/api/jobs/process-queue/route.ts
+index dfb4909..8b435e4 100644
+--- a/src/app/api/jobs/process-queue/route.ts
++++ b/src/app/api/jobs/process-queue/route.ts
+@@ -112,7 +112,8 @@ async function generateOneShot(
+           shotType: shotData.shotType,
+           variant: shotData.variant || 'A',
+           prompt: shotData.prompt || '',
+-          flatImageUrl: jobData.flatImageUrl || '',
++          flatFrontUrl: jobData.flatFrontUrl || jobData.flatImageUrl || '',
++          flatBackUrl: jobData.flatBackUrl || '',
+           image360Urls: jobData.image360Urls || [],
+           garmentCategory: jobData.garmentCategory,
+           version: shotData.version || 1,
+@@ -209,45 +210,61 @@ async function workerLoop(): Promise<string[]> {
+ 
+     let didWork = false;
+ 
+-    // Process each occupied slot — SEQUENTIALLY, not parallel
+-    // This eliminates race conditions between slots touching the same job's shots
++    // Process occupied slots — PARALLEL when different jobs, sequential same-job safety
++    const slotTasks: Array<{ slotIdx: number; slot: NonNullable<typeof state.slots[0]> }> = [];
+     for (let i = 0; i < state.slots.length; i++) {
+       const slot = state.slots[i];
+-      if (!slot) continue;
++      if (slot) slotTasks.push({ slotIdx: i, slot });
++    }
++
++    const processSlot = async (slotIdx: number, slot: NonNullable<typeof state.slots[0]>) => {
++      // Guard: check if job still exists (user may have deleted it)
++      const jobDoc = await getJob(slot.jobId);
++      if (!jobDoc) {
++        console.log(`[Worker] Job "${slot.jobName}" (${slot.jobId}) deleted — releasing slot ${slotIdx}`);
++        actions.push(`Released slot ${slotIdx} — job "${slot.jobName}" was deleted`);
++        await releaseSlot(slot.jobId);
++        return true;
++      }
+ 
+       // Check if this job still needs work
+       const shots = await listShots(slot.jobId);
+       const needsWork = shots.some((s: Record<string, unknown>) =>
+         s.status === 'queued' || s.status === 'failed'
+       );
+-      // Note: we no longer count 'generating' as needsWork here —
+-      // shots should only be 'generating' if THIS worker is actively processing them
+ 
+       if (!needsWork) {
+         // Check if any shots are still generating (being processed right now)
+         const stillGenerating = shots.some((s: Record<string, unknown>) => s.status === 'generating');
+         if (stillGenerating) {
+-          // Still processing — don't release yet, check again next loop
+-          didWork = true;
+-          continue;
++          return true; // still working
+         }
+ 
+         // Job is done — set status and release slot
+-        await jobsCol.doc(slot.jobId).update({
+-          status: 'review',
+-          updatedAt: new Date(),
+-          completedAt: new Date(),
+-        });
+-        actions.push(`Job "${slot.jobName}" completed (slot ${i})`);
++        try {
++          await jobsCol.doc(slot.jobId).update({
++            status: 'review',
++            updatedAt: new Date(),
++            completedAt: new Date(),
++          });
++        } catch (e) {
++          console.warn(`[Worker] Could not update job ${slot.jobId} status (may be deleted):`, e);
++        }
++        actions.push(`Job "${slot.jobName}" completed (slot ${slotIdx})`);
+         await releaseSlot(slot.jobId);
+-        console.log(`[Worker] Released slot ${i} — ${slot.jobName} done`);
+-        didWork = true;
+-        continue;
++        console.log(`[Worker] Released slot ${slotIdx} — ${slot.jobName} done`);
++        return true;
+       }
+ 
+-      // Job needs work — generate next shot for this slot
++      // Job needs work — generate next shot
++      await processOneSlot(slot.jobId, slot, slotIdx, actions);
++      return true;
++    };
++
++    if (slotTasks.length > 0) {
+       didWork = true;
+-      await processOneSlot(slot.jobId, slot, i, actions);
++      // Run slots in parallel — each slot has a different job, so no race conditions
++      await Promise.all(slotTasks.map(({ slotIdx, slot }) => processSlot(slotIdx, slot)));
+     }
+ 
+     await updateWorkerHeartbeat();
+@@ -312,8 +329,8 @@ async function processOneSlot(
+     }
+   }
+ 
+-  // Find next queued shot (not claimed by another slot)
+-  const nextShot = shots
++  // Find all queued shots (not claimed by another slot)
++  const queuedShots = shots
+     .filter((s: Record<string, unknown>) =>
+       s.status === 'queued' && (s.claimedBySlot === null || s.claimedBySlot === undefined)
+     )
+@@ -321,10 +338,14 @@ async function processOneSlot(
+       const aIdx = shotOrder.indexOf(a.shotType as string);
+       const bIdx = shotOrder.indexOf(b.shotType as string);
+       return (aIdx === -1 ? 99 : aIdx) - (bIdx === -1 ? 99 : bIdx);
+-    })[0] as Record<string, unknown> | undefined;
+-
+-  if (nextShot) {
+-    const result = await generateOneShot(jobId, jobData, nextShot, slotIdx);
++    }) as Record<string, unknown>[];
++
++  if (queuedShots.length > 0) {
++    // STRICT SEQUENTIAL: Generate exactly 1 shot at a time within a job.
++    // M03 is the front garment anchor reused by later shots — it MUST complete
++    // before M01/M02/M04/M05 start. Parallelism is only safe between jobs, not within.
++    const shot = queuedShots[0];
++    const result = await generateOneShot(jobId, jobData, shot, slotIdx);
+     actions.push(`${result.ok ? '✓' : '✗'} ${result.shotLabel} (${result.elapsed}s) — ${jobName}`);
+     // Cooldown between shots to reduce Vertex AI 429 rate-limit hits
+     await new Promise(r => setTimeout(r, SHOT_COOLDOWN_MS));

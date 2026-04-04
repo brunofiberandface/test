@@ -12,7 +12,6 @@ import { generateImage } from '@/lib/vertex';
 import { downloadGarmentImage, uploadDressedBaseImage } from '@/lib/gcs';
 import { resizeForFeed } from '@/lib/zone-grids';
 import sharp from 'sharp';
-import { getGarmentDNA } from '@/lib/garment-dna';
 import { getEcomPosingRules, ECOM_NO_GOS } from '@/lib/prompts';
 
 // ── View pose instructions (0°, 90°, 180°, 270°) ─────────────────────────────
@@ -28,133 +27,6 @@ const VIEW_POSES: Record<DressedView, string> = {
 };
 
 const VALID_VIEWS: DressedView[] = ['front', 'right', 'back', 'left'];
-
-// ── QC constants ──────────────────────────────────────────────────────────────
-// Uses Gemini REST API (same key as image generation) — no Vertex AI / OAuth needed
-const QC_MODEL = 'gemini-2.5-flash-lite';
-const QC_THRESHOLD = 7.0;
-const MAX_QC_ATTEMPTS = 1; // Dressed bases are reference anchors — generate once, score, save. No retry.
-
-function buildDressedBaseQCPrompt(view: DressedView, outfitLines: string[]): string {
-  const viewDesc: Record<DressedView, string> = {
-    front: 'FRONT VIEW (0°) — model faces camera directly, face fully visible, full frontal',
-    right: 'RIGHT SIDE PROFILE (90°) — model\'s RIGHT shoulder points at camera, face looks away to the right, only right side of body is visible, left side hidden',
-    back:  'BACK VIEW (180°) — model faces AWAY from camera, back visible, face NOT visible',
-    left:  'LEFT SIDE PROFILE (270°) — model\'s LEFT shoulder points at camera, face looks away to the left, only left side of body is visible, right side hidden',
-  };
-
-  return `You are QC for a fashion dressed base reference image.
-
-EXPECTED VIEW: ${viewDesc[view]}
-
-EXPECTED OUTFIT (all items must be present):
-${outfitLines.join('\n')}
-
-Score each dimension 1-10:
-
-1. VIEW_ANGLE (weight: 2x) — Is the model at exactly the correct angle?
-   Front: faces camera directly. Right profile: right side faces camera. Back: faces away. Left profile: left side faces camera.
-   Score 9-10 if angle is precisely correct. Score 1-4 if wrong orientation.
-
-2. GARMENT_ACCURACY (weight: 2x) — Are all listed outfit items rendered correctly?
-   Correct colors, silhouettes, materials for all items? No substitutions?
-   IMPORTANT FOR NON-FRONT VIEWS: Back and profile views naturally hide some garment details (necklines, front logos, front closures, toe shape of shoes). Do NOT penalize for details that are simply not visible from this angle. Judge only what IS visible — overall color, silhouette shape, and material texture. If the garment looks correct in color and shape from this angle, score 8-10 even if you cannot confirm every front-facing detail.
-
-3. NO_INVENTED — Any garments OR ACCESSORIES added that are NOT in the outfit list above?
-   Score 1 if ANY invented item found — this includes belts, watches, jewelry, scarves, hats, bags, sunglasses, or any accessory not listed.
-   IMPORTANT: From back/profile angles, garments may look slightly different than their front reference photo. A baby tee seen from behind may look like a tank top — that is NOT an invented garment. Only flag items that are clearly a DIFFERENT garment entirely (e.g., a jacket when none was specified, or a belt when none was listed).
-
-4. BACKGROUND — Clean warm light grey (#D5D3CC) studio backdrop, uniform and consistent?
-   Score 1 if background is very dark, has dark corners/patches, visible gradient, vignetting, bright colors, or visible objects/reflections. Background should be even and clean.
-
-5. FULL_BODY — Full body visible head to toe without cropping?
-   Score 1 if head or feet are cut off.
-
-RESPOND IN EXACT JSON (no markdown, no backticks):
-{"view_angle":{"score":0,"note":""},"garment_accuracy":{"score":0,"note":""},"no_invented":{"score":0,"note":""},"background":{"score":0,"note":""},"full_body":{"score":0,"note":""},"overall_score":0,"pass":false,"issues":[]}
-
-Calculate: overall_score = (view_angle*2 + garment_accuracy*2 + no_invented + background + full_body) / 7
-Set pass = true if overall_score >= ${QC_THRESHOLD}`;
-}
-
-interface QCResult {
-  score: number;
-  pass: boolean;
-  issues: string[];
-}
-
-async function runDressedBaseQC(
-  imageData: Buffer,
-  wardrobeQcRefs: Array<{ buffer: Buffer; mimeType: string; name: string }>,
-  view: DressedView,
-  outfitLines: string[],
-): Promise<QCResult> {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) throw new Error('GEMINI_API_KEY not set');
-
-  const parts: Array<Record<string, unknown>> = [];
-
-  // Generated image to evaluate — first
-  parts.push({ inlineData: { mimeType: 'image/png', data: imageData.toString('base64') } });
-  parts.push({ text: 'DRESSED BASE IMAGE TO EVALUATE:\n\n' });
-
-  // Wardrobe reference images for comparison
-  for (const ref of wardrobeQcRefs) {
-    parts.push({ inlineData: { mimeType: ref.mimeType, data: ref.buffer.toString('base64') } });
-    parts.push({ text: `WARDROBE REFERENCE: ${ref.name}\n\n` });
-  }
-
-  parts.push({ text: buildDressedBaseQCPrompt(view, outfitLines) });
-
-  // Use Gemini REST API — same endpoint as translation, no Vertex AI / OAuth needed
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${QC_MODEL}:generateContent?key=${apiKey}`;
-
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      contents: [{ role: 'user', parts }],
-      generationConfig: { temperature: 0.2 },
-    }),
-  });
-
-  if (!response.ok) {
-    const errText = await response.text();
-    throw new Error(`QC API error ${response.status}: ${errText.substring(0, 200)}`);
-  }
-
-  const result = await response.json();
-  // Gemini 2.5 Flash is a thinking model — filter out thought parts
-  const allParts: Array<{ text?: string; thought?: boolean }> = result.candidates?.[0]?.content?.parts || [];
-  const textContent = allParts
-    .filter(p => !p.thought && typeof p.text === 'string')
-    .map(p => p.text)
-    .join('')
-    .trim();
-  if (!textContent) throw new Error('No QC response from Gemini');
-
-  let qcText = textContent;
-  if (qcText.startsWith('```')) {
-    qcText = qcText.replace(/^```json?\n?/, '').replace(/\n?```$/, '');
-  }
-
-  const qcData = JSON.parse(qcText);
-
-  // Recalculate score server-side to be safe
-  const rawScore =
-    (qcData.view_angle?.score ?? 0) * 2 +
-    (qcData.garment_accuracy?.score ?? 0) * 2 +
-    (qcData.no_invented?.score ?? 0) +
-    (qcData.background?.score ?? 0) +
-    (qcData.full_body?.score ?? 0);
-  const overallScore = Math.round((rawScore / 7) * 10) / 10;
-
-  return {
-    score: overallScore,
-    pass: overallScore >= QC_THRESHOLD,
-    issues: qcData.issues || [],
-  };
-}
 
 // ── GET /api/models/generate-dressed?modelId=X ─────────────────────────────
 export async function GET(req: NextRequest) {
@@ -217,11 +89,10 @@ export async function POST(req: NextRequest) {
       console.log(`[GenerateDressed] Model card loaded for ${modelId}`);
     }
 
-    // 2. Load wardrobe items — build outfit lines AND QC reference list
+    // 2. Load wardrobe items — build outfit lines
     const wardrobeItemNames: Record<string, string> = {};
     const outfitLines: string[] = [];
     const garmentDnaLines: string[] = [];
-    const wardrobeQcRefs: Array<{ buffer: Buffer; mimeType: string; name: string }> = [];
     let refIdx = 2; // Image 1 = model card
 
     const sortedEntries = Object.entries(wardrobeItemIds)
@@ -247,12 +118,8 @@ export async function POST(req: NextRequest) {
       if (itemData.description) outfitLine += ` STYLING: ${itemData.description}`;
       outfitLines.push(outfitLine);
 
-      const itemName = itemData.name || '';
-      const dnaMatch = getGarmentDNA(itemName);
-      if (dnaMatch) {
-        garmentDnaLines.push(`\n--- ${category.toUpperCase()} PRODUCT DETAILS (${dnaMatch.styleName}) ---\n${dnaMatch.dna}`);
-        console.log(`[GenerateDressed] Garment DNA found for ${itemName}: ${dnaMatch.styleName}`);
-      }
+      // Note: garment DNA is now dynamically analyzed at generation time (not at dressed base time).
+      // Dressed bases don't need garment construction DNA — they're about model identity + outfit.
 
       // ── Send ALL available reference images per wardrobe item ──
       // Structure per item: fit model images (fitModelUrls) + flat front/back (flatFrontUrl/flatBackUrl)
@@ -269,9 +136,6 @@ export async function POST(req: NextRequest) {
               ? `WARDROBE ITEM — ${category.toUpperCase()}: "${itemData.name}". FIT MODEL REFERENCE. The model wears THIS EXACT item — copy color, material, silhouette, sole shape, and all details precisely.${itemData.description ? ' ' + itemData.description : ''}`
               : `${category.toUpperCase()} "${itemData.name}" — FIT MODEL angle ${imgIdx + 1}/${itemData.fitModelUrls.length}. Additional perspective for garment detail verification.`;
             referenceImages.push({ buffer: resized, mimeType: 'image/jpeg', label: angleLabel });
-            if (imgIdx === 0) {
-              wardrobeQcRefs.push({ buffer: resized, mimeType: 'image/jpeg', name: `${category}: ${itemData.name}` });
-            }
             refIdx++;
             itemImageCount++;
           } catch (dlErr) {
@@ -288,9 +152,6 @@ export async function POST(req: NextRequest) {
               ? `WARDROBE ITEM — ${category.toUpperCase()}: "${itemData.name}". REFERENCE. The model wears THIS EXACT item — copy color, material, silhouette, and all details precisely.${itemData.description ? ' ' + itemData.description : ''}`
               : `${category.toUpperCase()} "${itemData.name}" — angle ${imgIdx + 1}/${itemData.imageUrls.length}.`;
             referenceImages.push({ buffer: resized, mimeType: 'image/jpeg', label: angleLabel });
-            if (imgIdx === 0) {
-              wardrobeQcRefs.push({ buffer: resized, mimeType: 'image/jpeg', name: `${category}: ${itemData.name}` });
-            }
             refIdx++;
             itemImageCount++;
           } catch (dlErr) {
@@ -418,17 +279,12 @@ ${ECOM_NO_GOS}${garmentDnaLines.length > 0 ? '\n\n' + garmentDnaLines.join('\n')
 
     console.log(`[GenerateDressed] Generating ${view} view with ${referenceImages.length} reference images`);
 
-    // 5. Generate image — NO QC for dressed bases.
-    // Logs show QC scored 10/10 on every dressed base view — it adds 15-20s per view for zero value.
-    // QC is only meaningful for final shots where garment accuracy matters pixel-by-pixel.
+    // 5. Generate image — dressed bases generate once, no QC scoring
     let bestImageData: Buffer | null = null;
     let bestMimeType = 'image/png';
-    const bestQcScore = 0;
-    const qcPassed = true; // Dressed bases skip QC
-    const qcIssues: string[] = [];
     const attemptLog: string[] = [];
 
-    console.log(`[GenerateDressed] Generating ${view} view (no QC — dressed bases are reference anchors)`);
+    console.log(`[GenerateDressed] Generating ${view} view (dressed bases are reference anchors)`);
 
     try {
       const genResult = await generateImage({
@@ -568,7 +424,7 @@ ${ECOM_NO_GOS}${garmentDnaLines.length > 0 ? '\n\n' + garmentDnaLines.join('\n')
     const imageUrl = await uploadDressedBaseImage(modelId, wardrobeHash, view, bestImageData);
     console.log(`[GenerateDressed] Uploaded: ${imageUrl}`);
 
-    // 7. Store in Firestore with QC metadata
+    // 7. Store in Firestore
     const docId = await createDressedBase({
       modelId,
       wardrobeItemIds,
@@ -576,11 +432,9 @@ ${ECOM_NO_GOS}${garmentDnaLines.length > 0 ? '\n\n' + garmentDnaLines.join('\n')
       view,
       imageUrl,
       wardrobeItemNames,
-      qcScore: bestQcScore,
-      qcPass: qcPassed,
     });
 
-    console.log(`[GenerateDressed] Saved as ${docId} (qcPass=${qcPassed}, qcScore=${bestQcScore}/10, attempts=${attemptLog.length})`);
+    console.log(`[GenerateDressed] Saved as ${docId} (attempts=${attemptLog.length})`);
 
     return NextResponse.json({
       success: true,
@@ -588,9 +442,6 @@ ${ECOM_NO_GOS}${garmentDnaLines.length > 0 ? '\n\n' + garmentDnaLines.join('\n')
       imageUrl,
       wardrobeHash,
       wardrobeItemNames,
-      qcScore: bestQcScore,
-      qcPass: qcPassed,
-      qcIssues,
       attemptLog,
     });
 

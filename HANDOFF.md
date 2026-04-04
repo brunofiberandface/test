@@ -106,3 +106,69 @@
 | Dockerfile | Modified | Added scikit-image, color_match.py COPY |
 | src/app/api/jobs/[id]/run-all/route.ts | Modified | Retry logic, error boundary |
 | src/__tests__/prompts.test.ts | Modified | Updated test for renamed section |
+
+---
+
+# Audit Fixes — April 2, 2026
+
+## Changes Made (Architecture hardening — no image generation changes)
+
+### 1. Sequential Queue (process-queue/route.ts)
+
+Removed parallel same-job shot execution (`MAX_PARALLEL_SHOTS = 2` with `Promise.all()`). Now strictly sequential: 1 shot at a time within a job.
+
+**Why:** M03 is the front garment anchor reused by later shots. If M01 starts before M03 finishes, it picks up a stale/missing anchor. Parallelism is only safe between jobs, not within.
+
+### 2. Killed Dressed-Base Fallback (generate/route.ts)
+
+Removed permissive fallback that used ANY dressed base when no exact wardrobe hash match was found. Now returns HTTP 400 with `MISSING_DRESSED_BASE` error code.
+
+**Why:** Using a dressed base from a different outfit poisons Phase 2 with wrong shirt color, shoe style, and silhouette cues. Silent degradation was worse than explicit failure.
+
+### 3. Two-Layer QC System (NEW: shot-qc.ts + wired into pipeline)
+
+**Layer 1 — Deterministic pixel checks (no AI cost):**
+- Background cleanliness: samples bottom 10% (floor hallucination), left/right edges. Checks luminance stddev (texture) and color deviation from studio grey.
+- Framing: aspect ratio validation per shot type (9:16 for M03/M04, 3:4 for M01/M02/M05).
+- Exposure: center region luminance check (min 60, max 245).
+
+**Layer 2 — Flat-vs-generated comparison via Gemini Flash Lite (~$0.002/call):**
+- 6 scored dimensions (1-10): color_match, seam_fidelity, pocket_accuracy, silhouette_match, length_correct, background_check.
+- Uses flat front image for front shots, flat back for back shots.
+- Pass criteria: weighted_score >= 7.0 AND no dimension below 4.
+- Both images downscaled to 1024px for cost efficiency.
+
+**Pipeline integration:**
+- QC runs after all post-processing, before GCS upload.
+- Scores stored on shot Firestore document (`qcPass`, `qcScore`, `qcDetails`, `qcTimestamp`).
+- M03 anchor gate: if M03 QC fails, `phase1AnchorUrl` is revoked (prevents bad anchor from propagating to M01/M02).
+- M03 QC failure sets shot status to `qc_failed` instead of `done`.
+- QC results included in API response.
+
+**On-demand QC:** `/api/qc` endpoint re-enabled for manual re-runs on existing shots.
+
+### 4. Rollback Patch
+
+Saved at `rollback-2026-04-02-sequential-and-fallback.patch` — covers the sequential queue and dressed-base fallback changes.
+
+## Testing Done
+
+- TypeScript compilation: ✅ clean (0 errors)
+- Vitest: ✅ 103/103 tests pass
+
+## Cost Impact
+
+- QC Layer 1: $0 (CPU-only pixel analysis)
+- QC Layer 2: ~$0.002 per shot (~$0.01 per 5-shot job)
+- Estimated cost per job: ~$0.11-0.16 (was ~$0.10-0.15)
+
+## NOT YET DEPLOYED — awaiting explicit deploy instruction.
+
+## Files Changed
+
+| File | Type | Summary |
+|------|------|---------|
+| src/app/api/jobs/process-queue/route.ts | Modified | Sequential queue (removed parallel same-job shots) |
+| src/app/api/generate/route.ts | Modified | Killed dressed-base fallback, wired QC into pipeline, M03 anchor gate |
+| src/lib/shot-qc.ts | **New** | Two-layer QC module (deterministic + Gemini Flash Lite) |
+| src/app/api/qc/route.ts | Modified | Re-enabled with new flat-comparison QC logic |

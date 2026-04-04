@@ -221,19 +221,20 @@ Each dressed base:
 
 5 shot types per job:
 
-| Shot | Description | Aspect | Phases | Model(s) | Notes |
-|------|-------------|--------|--------|----------|-------|
-| M03 | Full body front | 9:16 | 2 | Pro (4K) → Flash (2K) | Generated FIRST as garment anchor |
-| M01 | Cropped front (waist to ankle) | 3:4 | 2 | Pro (4K) → Flash (2K) | No model card ref (would defeat crop) |
-| M02 | Cropped back | 3:4 | 2 | Pro (4K) → Flash (2K) | Uses back dressed base, LABEL COMPOSITE applied |
-| M04 | Full body back | 9:16 | 2 | Pro (4K) → Flash (2K) | Uses back dressed base, LABEL COMPOSITE applied |
-| M05 | Detail/Dynamic shot | 3:4 | 2 | Pro (4K) → Flash (2K) | Back pocket close-up, extra identity lock in prompt |
+| Shot | Description | Aspect | Phase 1 | Notes |
+|------|-------------|--------|---------|-------|
+| M03 | Full body front | 9:16 | Flash (2K) | Generated FIRST as garment anchor. v38: 3 front angles only |
+| M01 | Cropped front (waist to ankle) | 3:4 | Flash (2K) | No model card ref (would defeat crop) |
+| M02 | Cropped back | 3:4 | Flash (2K) | Uses back dressed base, LABEL COMPOSITE applied |
+| M04 | Full body back | 9:16 | Flash (2K) | Uses back dressed base, LABEL COMPOSITE applied. v38: 3 back angles only |
+| M05 | Detail shot (back pocket close-up) | 3:4 | Flash (2K) | Uses back dressed base, tight crop |
 
-**Two-phase pipeline** (ALL shots use this):
-- **Phase 1** (Gemini Pro, 4K): Generates garment template from flat + mannequin references. Pure garment on anonymous body.
-- **Phase 2** (Gemini Flash, 2K): Combines garment template with model identity from dressed base. Adds photographic realism.
+**Two-phase pipeline** (for full-body shots M03/M04):
+- **Phase 1** (Gemini Flash, 2K): Generates garment template from flat + fit model references. View-specific: front shots get FRONT VIEW CONSTRUCTION prompt block, back shots get BACK VIEW CONSTRUCTION block.
+- **Phase 2** (Gemini Flash, 2K): Combines garment template with model identity from dressed base. View-specific construction details in prompt.
 
-**M05 specifics**: Despite being a detail shot, M05 uses the full two-phase pipeline. Gets extra identity lock in the model card label to prevent Gemini from drifting: "Even though this shot uses a relaxed, editorial pose, the FACE and IDENTITY must be IDENTICAL to this reference." Prompt specifies: tight close-up of one back pocket, camera at hip height ~40cm, frame from waistband to mid-thigh only.
+**For cropped shots** (M01/M02): Single phase, no model card, generates anonymous model wearing garment.
+**For detail shot** (M05): Single phase, tight close-up of one back pocket. Gets M03 garment template as color lock + color anchor fit model.
 
 ### Progress Steps (reported to Firestore for UI polling)
 
@@ -328,31 +329,69 @@ We tried seamless clone twice and it failed both times:
 
 Key prompt building blocks in `src/lib/prompts.ts`:
 - `ANTI_AI_RULES` — Prevents AI-looking artifacts (plastic skin, symmetric faces, etc.)
-- `ANTI_HALLUCINATION` — Forces garment fidelity to reference images
+- `ANTI_HALLUCINATION` — Forces garment fidelity to reference images, includes BACK POCKET DEPTH rule
 - `VIEW_POSES` — View-specific pose instructions (front relaxed, back 3/4 turn, etc.)
 - `STYLING_RULES` — G-Star brand styling (raw denim aesthetic, urban, minimal)
 
 Prompts reference images by index: `"image 1 shows the flat lay, image 2 shows the mannequin front..."` — order matters and must match the images array passed to Gemini.
 
+### v38 Front/Back Reference Isolation (CRITICAL ARCHITECTURE)
+
+The generation pipeline fully isolates front and back references to prevent cross-contamination. Back shots see ZERO front references, front shots see ZERO back references.
+
+**Symmetric 3-angle isolation**:
+
+| | Back shots (M02, M04, M05) | Front shots (M01, M03) |
+|---|---|---|
+| **Fit model angles** | 3 back angles at 1200px | 3 front angles at 1200px |
+| **Flat image** | Flat BACK at 1400px (front flat SKIPPED) | Flat FRONT at 1400px (back flat SKIPPED) |
+| **Panoramic strips** | Back flat + 3 back angles in 2×2 grid | Front flat + 3 front angles in 2×2 grid |
+| **Prompt blocks** | Observational back construction | Observational front construction |
+
+### v39 Gemini-Optimized Resolutions & Layout
+
+Gemini API caps input images at 3072×3072px and tiles internally at 768×768. Optimized resolutions:
+- **Fit model**: 1200px (was 2000px) — within Gemini's sweet spot
+- **Flat front/back**: 1400px (was 2000px)
+- **Panoramic strips**: 2×2 grid layout (was 1×4 horizontal strip that got crushed from 1200×4800 to 768×3072)
+- **Dark fabric brightness correction**: Separate thresholds for dark denim (brightness < 80): tighter trigger (-10% vs -15%), higher correction cap (1.50 vs 1.30)
+
+### v39b OBSERVATIONAL PROMPTS (CRITICAL — Hallucination Prevention)
+
+**THE RULE**: All construction prompts MUST be purely observational. NEVER list specific features (panel seam lines, diagonal seams, knee boundaries) — Gemini will HALLUCINATE those features onto garments that don't have them.
+
+**Before (caused hallucination)**: "Back panel seam lines — diagonal lines running from pocket area down toward ankle"
+**After (correct)**: "Reproduce ONLY what you see. If the legs appear as clean smooth denim with no seam lines, keep them clean."
+
+This applies to ALL prompt locations: Phase 1 front/back, Phase 2 front/back, flat image labels, fit model angle labels, panoramic strip labels.
+
+### Back Pocket Depth Rule (v39c)
+
+**MEASURE FROM FIT MODEL BACK (not flat)**: On the fit model back photo, measure how far the LOWEST point of each back pocket reaches relative to the inseam junction (where legs join). Body curvature makes pockets sit deeper on a real body than on a flat. Always use the fit model back as measurement reference. This rule is in ANTI_HALLUCINATION (prompts.ts), M05 prompt, detail shot pose, and full body back view pose in route.ts.
+
+### Version History
+
+- v37: First front/back isolation
+- v37b: Asymmetric fix (back isolated, front all angles)
+- v38: Symmetric isolation (both get 3 angles)
+- v39: Gemini-optimized resolutions, 2×2 grid, dark fabric brightness correction
+- v39b: All prompts rewritten to be purely observational (hallucination fix)
+- v39c: Back pocket depth rule — measure lowest point vs inseam junction from fit model back
+
 ## Deploy Commands
+
+**CRITICAL: NEVER deploy without Bruno's explicit permission. He will say "deploy" when ready.**
 
 **From Bruno's Mac** (gcloud not in PATH):
 ```bash
-cd /Users/bdheedene/Documents/Claude\ folder/gstar/gstar-studio
+cd "/Users/bdheedene/Documents/Claude folder.nosync/gstar/gstar-studio"
 /Users/bdheedene/google-cloud-sdk/bin/gcloud run deploy gstar-ai-studio \
   --source . \
   --region europe-west1 \
   --project gstar-ai-studio
 ```
 
-**IMPORTANT**: Deploy takes 5-8 minutes. If using Desktop Commander MCP (60s timeout), run with nohup:
-```bash
-cd /Users/bdheedene/Documents/Claude\ folder/gstar/gstar-studio && \
-nohup /Users/bdheedene/google-cloud-sdk/bin/gcloud run deploy gstar-ai-studio \
-  --source . --region europe-west1 --project gstar-ai-studio \
-  > /tmp/gcloud-deploy.log 2>&1 &
-```
-Then poll with `tail -20 /tmp/gcloud-deploy.log` until you see the service URL.
+**IMPORTANT**: Deploy takes 5-8 minutes. Desktop Commander MCP has a 60s timeout. Best approach: give Bruno the command to run in his terminal, or use `gcloud builds list --project gstar-ai-studio --limit 3` to check status.
 
 **Cloud Run URL**: https://gstar-ai-studio-674145888056.europe-west1.run.app
 
@@ -378,7 +417,11 @@ Then poll with `tail -20 /tmp/gcloud-deploy.log` until you see the service URL.
 
 10. **Legacy `activeJobId` field not cleared by V2 queue** — The `system/generationQueue` document has both V2 fields (`slots`, `queue`) and legacy fields (`activeJobId`, `activeJobName`). The dashboard reads `activeJobId` for the "Generating now" header. When a job completes and releases its slot, the V2 slot is cleared but `activeJobId` is NOT updated, causing the dashboard to show a completed job as "Generating now" indefinitely. The `DELETE /api/queue` endpoint only operates on this legacy field.
 
-11. **Auto-QC suspended since v28** — QC scoring after generation is commented out to reduce failure modes. Manual QC via "Run QC Now" button on results page still works. Re-enable once the generation pipeline is stable.
+11. **NEVER list specific construction features in prompts** — Prompts that mention "back panel seam lines", "diagonal seams", "knee boundaries" etc. cause Gemini to HALLUCINATE those features onto garments that don't have them. All prompts must be purely observational: "reproduce ONLY what you see." This was the root cause of M04 consistently adding panel lines to clean denim (v39b fix).
+
+12. **Back pocket depth uses fit model back, NOT flat** — Body curvature makes pockets sit lower on a real body. The ANTI_HALLUCINATION rule and all pocket proportion prompts anchor measurement to the fit model back photo, measuring lowest pocket point relative to inseam junction.
+
+13. **Auto-QC suspended since v28** — QC scoring after generation is commented out to reduce failure modes. Manual QC via "Run QC Now" button on results page still works. Re-enable once the generation pipeline is stable.
 
 ## Shot Regeneration
 
@@ -392,7 +435,7 @@ Individual shots can be re-run from the job results page (`/jobs/[id]/results`):
 
 - **User**: email, name, role (admin/user), domain-restricted to @gstar-raw.com
 - **Model**: AI person — name, description, model card image URL, dressed bases (4 views × N wardrobe combos)
-- **WardrobeItem**: garment — name, category (top/bottom/shoes/accessory), flat image URLs, mannequin angle URLs (360° views)
+- **WardrobeItem**: garment — name, category (top/bottom/shoes/accessory), flat image URLs, mannequin angle URLs (360° views), fitModelUrls (fit model photos for v38 reference isolation)
 - **Job**: generation task — modelId, wardrobeItemIds, status (uploading/queued/generating/review/complete/failed), shot results
 - **Shot**: individual generated image — jobId, shotType (M01-M05), imageUrl, qcScore, version, approved flag, progressStep, progressPct, claimedBySlot
 - **Modification**: prompt adjustment for re-runs — shotId, instructions text, applied flag
@@ -401,10 +444,9 @@ Individual shots can be re-run from the job results page (`/jobs/[id]/results`):
 
 ## Cost Awareness
 
-- Gemini Pro (4K, Phase 1): ~$0.04/image — used only for M03 first pass
-- Gemini Flash (2K): ~$0.01/image — used for all other generations
+- Gemini Flash (2K): ~$0.01/image — used for ALL generations (Phase 1 and Phase 2)
 - Gemini Flash Lite (QC): ~$0.002/call — used for QC scoring
-- A full job (5 shots) costs roughly $0.10-0.15 depending on retries
+- A full job (5 shots) costs roughly $0.06-0.10 depending on retries
 - Dressed bases (4 views): ~$0.04-0.08 per model-wardrobe combo
 
 ## URL & Access
@@ -421,5 +463,7 @@ Individual shots can be re-run from the job results page (`/jobs/[id]/results`):
 ## Codebase Location (Bruno's Mac)
 
 ```
-/Users/bdheedene/Documents/Claude folder/gstar/gstar-studio/
+/Users/bdheedene/Documents/Claude folder.nosync/gstar/gstar-studio/
 ```
+
+Note the `.nosync` suffix — this prevents iCloud from syncing the directory. All file paths and deploy commands must use this exact path.

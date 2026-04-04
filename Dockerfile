@@ -1,5 +1,8 @@
 FROM node:20-slim AS base
 
+# v40-build-7 cache bust
+RUN echo "v40-build-7"
+
 # Install Python 3 + OpenCV headless for label composite pipeline
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip \

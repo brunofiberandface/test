@@ -282,13 +282,15 @@ export async function createShot(data: {
   shotType: string;
   variant: string;
   prompt: string;
+  status?: string;
 }) {
   const ref = shotsCol.doc();
+  const { status: initialStatus, ...rest } = data;
   await ref.set({
     shotId: ref.id,
-    ...data,
+    ...rest,
     version: 1,
-    status: 'queued',
+    status: initialStatus || 'queued',
     createdAt: new Date(),
   });
   return ref.id;

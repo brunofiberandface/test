@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getJob, listShots, updateJobStatus, getWardrobeItem, archiveJob, deleteJob, shotsCol } from '@/lib/firestore';
+import { getJob, listShots, updateJobStatus, getWardrobeItem, archiveJob, deleteJob, shotsCol, jobsCol, releaseSlot, removeFromQueue } from '@/lib/firestore';
+import { FieldValue } from '@google-cloud/firestore';
 
 // GET /api/jobs/[id] — get job details with all shots
 export async function GET(
@@ -100,8 +101,14 @@ export async function DELETE(
     if (!job) {
       return NextResponse.json({ error: 'Job not found' }, { status: 404 });
     }
+    // Release queue slot / remove from queue BEFORE deleting the job
+    try {
+      await releaseSlot(id);
+      await removeFromQueue(id);
+    } catch { /* non-blocking — job may not be in queue */ }
+
     await deleteJob(id);
-    console.log(`[Jobs] Deleted job ${id} and all associated data`);
+    console.log(`[Jobs] Deleted job ${id} and all associated data (queue cleaned up)`);
     return NextResponse.json({ success: true, deleted: id });
   } catch (error) {
     console.error('Error deleting job:', error);
@@ -117,10 +124,18 @@ export async function PATCH(
   try {
     const { id } = await params;
     const body = await req.json();
-    const { archived } = body;
+    const { archived, clearGarmentDNA } = body;
 
     if (archived !== undefined) {
       await archiveJob(id, archived);
+    }
+
+    // Clear cached garment DNA so next generation re-analyzes
+    if (clearGarmentDNA) {
+      await jobsCol.doc(id).update({
+        garmentDna: FieldValue.delete(),
+      });
+      console.log(`[Jobs] Cleared garmentDNA cache for job ${id}`);
     }
 
     return NextResponse.json({ success: true });

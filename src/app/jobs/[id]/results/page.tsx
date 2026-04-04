@@ -5,24 +5,6 @@ import { useParams } from 'next/navigation';
 import { useSession } from 'next-auth/react';
 import Shell from '@/components/Shell';
 
-interface QCScores {
-  // v2 dimensions
-  proportions?: { score: number; note: string };
-  silhouette?: { score: number; note: string };
-  color_wash?: { score: number; note: string };
-  construction?: { score: number; note: string };
-  hardware?: { score: number; note: string };
-  wardrobe?: { score: number; note: string };
-  ecommerce?: { score: number; note: string };
-  // v1 legacy dimensions (backwards compat)
-  color?: { score: number; note: string };
-  no_invented?: { score: number; note: string };
-  weighted_score: number;
-  pass: boolean;
-  critical_issues: string[];
-  summary: string;
-}
-
 interface PreviousVersion {
   imageUrl: string;
   version: number;
@@ -40,8 +22,6 @@ interface ShotData {
   modelId?: string;
   imageUrl?: string;
   previousVersions?: PreviousVersion[];
-  qcScores?: QCScores;
-  qcPass?: boolean;
   progressStep?: string;
   progressPct?: number;
   updatedAt?: string;
@@ -71,83 +51,6 @@ const SHOT_LABELS: Record<string, string> = {
 const SHOT_VARIANT_LABELS: Record<string, Record<string, string>> = {
   M03: { A: 'Full Body Front' },
 };
-
-function QCBadge({ score, pass }: { score: number; pass: boolean }) {
-  const color = pass
-    ? score >= 8 ? 'bg-green-600' : 'bg-green-500'
-    : score >= 5 ? 'bg-amber-500' : 'bg-red-500';
-  return (
-    <div className={`${color} text-white text-xs font-bold px-1.5 py-0.5 min-w-[2rem] text-center`}>
-      {score.toFixed(1)}
-    </div>
-  );
-}
-
-function QCDetail({ qc }: { qc: QCScores }) {
-  // v2 dimensions first, then v1 fallback
-  const dims = qc.proportions ? [
-    { key: 'proportions', label: 'Proportions', weight: '2x' },
-    { key: 'silhouette', label: 'Fit & Silhouette', weight: '2x' },
-    { key: 'color_wash', label: 'Color & Wash', weight: '2x' },
-    { key: 'construction', label: 'Construction', weight: '1x' },
-    { key: 'hardware', label: 'Hardware & Labels', weight: '1x' },
-    { key: 'wardrobe', label: 'Wardrobe', weight: '2x' },
-    { key: 'ecommerce', label: 'E-commerce', weight: '1x' },
-  ] : [
-    { key: 'silhouette', label: 'Silhouette', weight: '2x' },
-    { key: 'construction', label: 'Construction', weight: '1x' },
-    { key: 'hardware', label: 'Hardware', weight: '1x' },
-    { key: 'color', label: 'Color', weight: '1x' },
-    { key: 'no_invented', label: 'No Invented', weight: '1x' },
-    { key: 'ecommerce', label: 'E-commerce', weight: '1x' },
-  ];
-
-  return (
-    <div className="space-y-1.5">
-      <div className="flex items-center gap-2 mb-2">
-        <div className={`text-lg font-bold ${qc.pass ? 'text-green-600' : 'text-red-500'}`}>
-          {qc.weighted_score.toFixed(1)}/10
-        </div>
-        <span className={`text-xs px-2 py-0.5 font-medium ${qc.pass ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>
-          {qc.pass ? 'PASS' : 'FAIL'}
-        </span>
-      </div>
-      {dims.map(d => {
-        const val = (qc as unknown as Record<string, unknown>)[d.key] as { score: number; note: string } | undefined;
-        if (!val?.score && val?.score !== 0) return null;
-        const score = val.score;
-        return (
-          <div key={d.key} className="mb-2">
-            <div className="flex items-center gap-2 mb-0.5">
-              <span className="text-xs font-medium text-neutral-700 w-28">{d.label} <span className="text-neutral-400 font-normal">({d.weight})</span></span>
-              <div className="flex-1 bg-neutral-100 h-2 rounded-sm">
-                <div
-                  className={`h-full rounded-sm ${score >= 7 ? 'bg-green-500' : score >= 5 ? 'bg-amber-500' : 'bg-red-500'}`}
-                  style={{ width: `${score * 10}%` }}
-                />
-              </div>
-              <span className={`text-xs font-bold w-6 text-right ${score >= 7 ? 'text-green-600' : score >= 5 ? 'text-amber-600' : 'text-red-600'}`}>{score}</span>
-            </div>
-            {val.note && (
-              <p className="text-[11px] text-neutral-500 ml-[7.5rem] leading-tight">{val.note}</p>
-            )}
-          </div>
-        );
-      })}
-      {qc.critical_issues?.length > 0 && (
-        <div className="mt-3 p-2 bg-red-50 border border-red-200 rounded">
-          <p className="text-xs font-bold text-red-700 mb-1">Critical Issues:</p>
-          {qc.critical_issues.map((issue, i) => (
-            <p key={i} className="text-[11px] text-red-600 leading-tight mb-0.5">• {issue}</p>
-          ))}
-        </div>
-      )}
-      {qc.summary && (
-        <p className="text-[11px] text-neutral-600 mt-2 leading-tight border-t border-neutral-100 pt-2">{qc.summary}</p>
-      )}
-    </div>
-  );
-}
 
 function Lightbox({ imageUrl, onClose }: { imageUrl: string; onClose: () => void }) {
   const [zoom, setZoom] = useState(1);
@@ -443,7 +346,6 @@ export default function ResultsPage() {
   const [loading, setLoading] = useState(true);
   const [lightboxUrl, setLightboxUrl] = useState<string | null>(null);
   const [triggeringShot, setTriggeringShot] = useState<string | null>(null);
-  const [qcRunning, setQcRunning] = useState(false);
   const [queuePosition, setQueuePosition] = useState<number | null>(null);
   const [queueActiveJob, setQueueActiveJob] = useState<string | null>(null);
 
@@ -499,8 +401,6 @@ export default function ResultsPage() {
           modelId: s.modelId as string | undefined,
           imageUrl: s.imageUrl,
           previousVersions: s.previousVersions as PreviousVersion[] | undefined,
-          qcScores: s.qcScores as QCScores | undefined,
-          qcPass: s.qcPass as boolean | undefined,
           progressStep: s.progressStep as string | undefined,
           progressPct: s.progressPct as number | undefined,
           updatedAt: s.updatedAt as string | undefined,
@@ -620,6 +520,24 @@ export default function ResultsPage() {
     retryViaQueue(stuck);
   };
 
+  // Release held shots (M01, M02, M05) to 'queued' and kick the worker
+  const generateRemainingShots = async () => {
+    const held = shots.filter(s => s.status === 'held');
+    if (held.length === 0) return;
+    setRerunning(true);
+    try {
+      for (const shot of held) {
+        await fetch(`/api/shots/${shot.shotId}/reset`, { method: 'POST' });
+      }
+      await kickWorker();
+      fetchData();
+    } catch (e) {
+      console.error('Generate remaining failed:', e);
+    } finally {
+      setRerunning(false);
+    }
+  };
+
   // Rerun ALL shots in the job — resets every shot to 'queued' and kicks worker
   const rerunAllShots = async () => {
     if (!confirm(`Rerun all ${shots.length} shots? This will regenerate every shot in this job.`)) return;
@@ -641,19 +559,6 @@ export default function ResultsPage() {
     }
   };
 
-  const runQC = async (shotId: string) => {
-    setQcRunning(true);
-    try {
-      await fetch('/api/qc', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ shotId }),
-      });
-      await fetchData();
-    } finally {
-      setQcRunning(false);
-    }
-  };
 
   const allApproved = shots.length > 0 && shots.every(s => s.status === 'approved');
   const approvedCount = shots.filter(s => s.status === 'approved').length;
@@ -763,10 +668,11 @@ export default function ResultsPage() {
                 const isDone = shot.status === 'done' || shot.status === 'approved';
                 const isActive = shot.status === 'generating';
                 const isFailed = shot.status === 'failed';
+                const isHeld = shot.status === 'held';
                 return (
                   <div key={shot.id} className="flex-1 min-w-0">
                     <div className={`h-1 rounded-full transition-all duration-300 ${
-                      isDone ? 'bg-green-500' : isActive ? 'bg-amber-500' : isFailed ? 'bg-red-400' : 'bg-neutral-200'
+                      isDone ? 'bg-green-500' : isActive ? 'bg-amber-500' : isFailed ? 'bg-red-400' : isHeld ? 'bg-neutral-300 opacity-50' : 'bg-neutral-200'
                     }`}>
                       {isActive && (
                         <div
@@ -813,6 +719,15 @@ export default function ResultsPage() {
             </button>
           </>
         )}
+        {shots.some(s => s.status === 'held') && !generating && (
+          <button
+            onClick={generateRemainingShots}
+            disabled={rerunning}
+            className="px-4 py-2 text-xs font-medium bg-green-700 text-white hover:bg-green-600 transition-colors disabled:opacity-50"
+          >
+            {rerunning ? 'Generating...' : `Generate Remaining ${shots.filter(s => s.status === 'held').length} Shots`}
+          </button>
+        )}
         {shots.length > 0 && !generating && (
           <button
             onClick={rerunAllShots}
@@ -832,11 +747,9 @@ export default function ResultsPage() {
             className={`border bg-white cursor-pointer transition-all ${
               shot.status === 'approved'
                 ? 'border-green-300 bg-green-50/30'
-                : shot.qcScores && !shot.qcScores.pass
-                  ? 'border-red-300 bg-red-50/30'
-                  : selectedShot?.id === shot.id
-                    ? 'border-neutral-900 ring-1 ring-neutral-900'
-                    : 'border-neutral-200 hover:border-neutral-400'
+                : selectedShot?.id === shot.id
+                  ? 'border-neutral-900 ring-1 ring-neutral-900'
+                  : 'border-neutral-200 hover:border-neutral-400'
             }`}
             onClick={() => setSelectedShot(shot)}
             onDoubleClick={() => {
@@ -884,6 +797,14 @@ export default function ResultsPage() {
                   </button>
                 </div>
               )}
+              {shot.status === 'held' && (
+                <div className="absolute inset-0 flex flex-col items-center justify-center bg-neutral-100 gap-2">
+                  <svg className="w-6 h-6 text-neutral-300" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M12 6v6h4.5m4.5 0a9 9 0 11-18 0 9 9 0 0118 0z" />
+                  </svg>
+                  <p className="text-[11px] text-neutral-400">Waiting</p>
+                </div>
+              )}
               {shot.status === 'failed' && (
                 <div className="absolute inset-0 flex flex-col items-center justify-center bg-red-50 gap-2">
                   <svg className="w-6 h-6 text-red-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
@@ -904,12 +825,6 @@ export default function ResultsPage() {
                   <svg className="w-3 h-3 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
                     <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
                   </svg>
-                </div>
-              )}
-              {/* QC Score badge — top left */}
-              {shot.qcScores && (
-                <div className="absolute top-2 left-2">
-                  <QCBadge score={shot.qcScores.weighted_score} pass={shot.qcScores.pass} />
                 </div>
               )}
               <div className="absolute bottom-0 inset-x-0 bg-black/60 px-2 py-1 flex justify-between items-center">
@@ -955,26 +870,6 @@ export default function ResultsPage() {
               </div>
             </div>
 
-            {/* QC Scores — displayed next to image */}
-            <div className="w-96 flex-shrink-0">
-              {selectedShot.qcScores ? (
-                <QCDetail qc={selectedShot.qcScores} />
-              ) : selectedShot.status === 'done' ? (
-                <div>
-                  <p className="text-sm text-neutral-500 mb-2">No QC scores yet</p>
-                  <button
-                    onClick={() => !qcRunning && runQC(selectedShot.shotId)}
-                    disabled={qcRunning}
-                    className="border border-neutral-300 px-4 py-2 text-sm font-medium text-neutral-600 hover:bg-neutral-50 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
-                  >
-                    {qcRunning && <span className="w-3 h-3 border border-neutral-400 border-t-neutral-700 rounded-full animate-spin inline-block" />}
-                    {qcRunning ? 'Running QC…' : 'Run QC Now'}
-                  </button>
-                </div>
-              ) : (
-                <p className="text-sm text-neutral-400">QC runs after generation completes</p>
-              )}
-            </div>
 
             {/* Actions */}
             <div className="flex-1 space-y-4">

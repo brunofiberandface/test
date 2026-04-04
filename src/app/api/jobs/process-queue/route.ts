@@ -112,7 +112,8 @@ async function generateOneShot(
           shotType: shotData.shotType,
           variant: shotData.variant || 'A',
           prompt: shotData.prompt || '',
-          flatImageUrl: jobData.flatImageUrl || '',
+          flatFrontUrl: jobData.flatFrontUrl || jobData.flatImageUrl || '',
+          flatBackUrl: jobData.flatBackUrl || '',
           image360Urls: jobData.image360Urls || [],
           garmentCategory: jobData.garmentCategory,
           version: shotData.version || 1,
@@ -209,45 +210,61 @@ async function workerLoop(): Promise<string[]> {
 
     let didWork = false;
 
-    // Process each occupied slot — SEQUENTIALLY, not parallel
-    // This eliminates race conditions between slots touching the same job's shots
+    // Process occupied slots — PARALLEL when different jobs, sequential same-job safety
+    const slotTasks: Array<{ slotIdx: number; slot: NonNullable<typeof state.slots[0]> }> = [];
     for (let i = 0; i < state.slots.length; i++) {
       const slot = state.slots[i];
-      if (!slot) continue;
+      if (slot) slotTasks.push({ slotIdx: i, slot });
+    }
+
+    const processSlot = async (slotIdx: number, slot: NonNullable<typeof state.slots[0]>) => {
+      // Guard: check if job still exists (user may have deleted it)
+      const jobDoc = await getJob(slot.jobId);
+      if (!jobDoc) {
+        console.log(`[Worker] Job "${slot.jobName}" (${slot.jobId}) deleted — releasing slot ${slotIdx}`);
+        actions.push(`Released slot ${slotIdx} — job "${slot.jobName}" was deleted`);
+        await releaseSlot(slot.jobId);
+        return true;
+      }
 
       // Check if this job still needs work
       const shots = await listShots(slot.jobId);
       const needsWork = shots.some((s: Record<string, unknown>) =>
         s.status === 'queued' || s.status === 'failed'
       );
-      // Note: we no longer count 'generating' as needsWork here —
-      // shots should only be 'generating' if THIS worker is actively processing them
 
       if (!needsWork) {
         // Check if any shots are still generating (being processed right now)
         const stillGenerating = shots.some((s: Record<string, unknown>) => s.status === 'generating');
         if (stillGenerating) {
-          // Still processing — don't release yet, check again next loop
-          didWork = true;
-          continue;
+          return true; // still working
         }
 
         // Job is done — set status and release slot
-        await jobsCol.doc(slot.jobId).update({
-          status: 'review',
-          updatedAt: new Date(),
-          completedAt: new Date(),
-        });
-        actions.push(`Job "${slot.jobName}" completed (slot ${i})`);
+        try {
+          await jobsCol.doc(slot.jobId).update({
+            status: 'review',
+            updatedAt: new Date(),
+            completedAt: new Date(),
+          });
+        } catch (e) {
+          console.warn(`[Worker] Could not update job ${slot.jobId} status (may be deleted):`, e);
+        }
+        actions.push(`Job "${slot.jobName}" completed (slot ${slotIdx})`);
         await releaseSlot(slot.jobId);
-        console.log(`[Worker] Released slot ${i} — ${slot.jobName} done`);
-        didWork = true;
-        continue;
+        console.log(`[Worker] Released slot ${slotIdx} — ${slot.jobName} done`);
+        return true;
       }
 
-      // Job needs work — generate next shot for this slot
+      // Job needs work — generate next shot
+      await processOneSlot(slot.jobId, slot, slotIdx, actions);
+      return true;
+    };
+
+    if (slotTasks.length > 0) {
       didWork = true;
-      await processOneSlot(slot.jobId, slot, i, actions);
+      // Run slots in parallel — each slot has a different job, so no race conditions
+      await Promise.all(slotTasks.map(({ slotIdx, slot }) => processSlot(slotIdx, slot)));
     }
 
     await updateWorkerHeartbeat();
@@ -312,8 +329,8 @@ async function processOneSlot(
     }
   }
 
-  // Find next queued shot (not claimed by another slot)
-  const nextShot = shots
+  // Find all queued shots (not claimed by another slot)
+  const queuedShots = shots
     .filter((s: Record<string, unknown>) =>
       s.status === 'queued' && (s.claimedBySlot === null || s.claimedBySlot === undefined)
     )
@@ -321,10 +338,14 @@ async function processOneSlot(
       const aIdx = shotOrder.indexOf(a.shotType as string);
       const bIdx = shotOrder.indexOf(b.shotType as string);
       return (aIdx === -1 ? 99 : aIdx) - (bIdx === -1 ? 99 : bIdx);
-    })[0] as Record<string, unknown> | undefined;
+    }) as Record<string, unknown>[];
 
-  if (nextShot) {
-    const result = await generateOneShot(jobId, jobData, nextShot, slotIdx);
+  if (queuedShots.length > 0) {
+    // STRICT SEQUENTIAL: Generate exactly 1 shot at a time within a job.
+    // M03 is the front garment anchor reused by later shots — it MUST complete
+    // before M01/M02/M04/M05 start. Parallelism is only safe between jobs, not within.
+    const shot = queuedShots[0];
+    const result = await generateOneShot(jobId, jobData, shot, slotIdx);
     actions.push(`${result.ok ? '✓' : '✗'} ${result.shotLabel} (${result.elapsed}s) — ${jobName}`);
     // Cooldown between shots to reduce Vertex AI 429 rate-limit hits
     await new Promise(r => setTimeout(r, SHOT_COOLDOWN_MS));

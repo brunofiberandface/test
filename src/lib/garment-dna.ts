@@ -1,162 +1,392 @@
 /**
- * Garment DNA — per-product critical details for generation prompts.
+ * Garment DNA — dynamic construction analysis via Gemini vision.
  *
- * Each garment has unique construction details that Gemini MUST reproduce.
- * These are observed from mannequin + flat reference images and product descriptions.
- * Without these, the model generates generic jeans instead of the specific product.
+ * Instead of a hardcoded registry, we send the fit model + flat images to Gemini
+ * and ask it to describe every construction detail it sees: zippers, panel seams,
+ * knee articulation, pocket shapes, hardware, special features, etc.
  *
- * IMPORTANT: The zone crops feed Gemini the visual details, but the text DNA
- * tells it WHAT to look for and WHERE. Both are needed for 9+/10 quality.
+ * Uses Vertex AI endpoint with OAuth (same auth as image generation) — works on Cloud Run.
+ *
+ * This runs ONCE per job (cached on the job document in Firestore) so subsequent
+ * shot generations reuse the same analysis without extra API calls.
+ *
+ * Cost: ~$0.003 per analysis (Gemini Flash Lite, 2-4 images).
+ * Latency: 1-3 seconds.
  */
 
+import sharp from 'sharp';
+
+const ANALYSIS_MODEL = 'gemini-2.5-flash-lite';
+const GCP_PROJECT = process.env.GCP_PROJECT || 'gen-lang-client-0396152930';
+
+/** A single distinguishing feature with importance score */
+export interface GarmentFeature {
+  /** Short name, e.g., "exposed outer leg zipper" */
+  name: string;
+  /** Where on the garment: "outer leg seam, knee to ankle" */
+  location: string;
+  /** How important is this for reproducing the garment accurately (1-10, 10 = defines the garment) */
+  importance: number;
+  /** Detailed description for the generation prompt */
+  description: string;
+  /** Which shot types need to show this feature: M01-M05 */
+  visibleInShots: string[];
+}
+
 export interface GarmentDNA {
-  designNumber: string;
-  styleName: string;
-  gender: 'male' | 'female';
-  category: string;
-  fit: string;
-  /** Critical construction details — appended to every generation prompt */
+  /** Combined construction analysis text (for logging/debugging) */
   dna: string;
-  /** Per-shot pose overrides (e.g., "hands behind back" for carpenter pocket visibility) */
+  /** FRONT-only DNA — injected into M01 (cropped front) and M03 (full body front) prompts */
+  frontDna: string;
+  /** BACK-only DNA — injected into M02 (cropped back) and M04 (full body back) prompts */
+  backDna: string;
+  /** Per-shot overrides extracted from the analysis (e.g., M05 framing changes) */
   shotOverrides?: Record<string, string>;
-  /** Special zone crops (e.g., carpenter pocket location) */
-  specialZones?: Array<{
-    name: string;
-    y1: number; y2: number;
-    x1: number; x2: number;
-    upscale: number;
-    angles: number[];
-    label: string;
-  }>;
+  /** Dynamic feature list — open-ended, Gemini decides what matters */
+  features: GarmentFeature[];
+  /** Waist height and length proportions — text-based classification */
+  proportions?: {
+    waistRise: string;
+    inseamLength: string;
+    hemToFloor: string;
+  };
 }
 
 /**
- * Registry of known garments with their DNA.
- * Add new garments here as they are photographed.
+ * Get OAuth access token for Vertex AI — same approach as vertex.ts.
+ * Uses Cloud Run metadata server (production) or service account key (local dev).
  */
-export const GARMENT_REGISTRY: Record<string, GarmentDNA> = {
+async function getAccessToken(): Promise<string> {
+  // Try Cloud Run metadata server first
+  try {
+    const resp = await fetch(
+      'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token',
+      { headers: { 'Metadata-Flavor': 'Google' }, signal: AbortSignal.timeout(5000) }
+    );
+    if (resp.ok) {
+      const data = await resp.json();
+      return data.access_token;
+    }
+  } catch {
+    // Not on Cloud Run — fall through to service account
+  }
 
-  'D27463-D945-001': {
-    designNumber: 'D27463-D945-001',
-    styleName: 'Carpenter Straight Jeans',
-    gender: 'male',
-    category: 'pants',
-    fit: 'wide straight leg',
-    dna: `CRITICAL GARMENT DETAILS — match EVERY detail from the reference images:
+  // Fall back to service account key (local development)
+  const keyPath = process.env.GOOGLE_APPLICATION_CREDENTIALS;
+  if (!keyPath) {
+    throw new Error('No OAuth token available (not on Cloud Run and no GOOGLE_APPLICATION_CREDENTIALS)');
+  }
 
-FABRIC & COLOR:
-- Dark raw indigo denim — deep navy, almost black with indigo hue, UNWASHED
-- NO fading, NO distressing, NO wash effects, NO whiskering
-- Gold/yellow contrast topstitching on ALL major seams
+  const fs = await import('fs');
+  const crypto = await import('crypto');
+  const key = JSON.parse(fs.readFileSync(keyPath, 'utf8'));
 
-WAISTBAND & FLY:
-- Button fly — single metal shank button at center waist
-- Mid-rise waistband with belt loops (5-6 loops)
-- Gold topstitching along waistband edges
+  const now = Math.floor(Date.now() / 1000);
+  const header = { alg: 'RS256', typ: 'JWT' };
+  const payload = {
+    iss: key.client_email,
+    scope: 'https://www.googleapis.com/auth/cloud-platform',
+    aud: 'https://oauth2.googleapis.com/token',
+    iat: now,
+    exp: now + 3600,
+  };
 
-POCKETS:
-- Two front slash pockets with topstitched edges
-- Small coin pocket at right front (viewer's left)
-- CARPENTER/TOOL POCKET on outer thigh — rectangular patch pocket with topstitching, SIGNATURE DETAIL
-- Two back patch pockets
-- Copper/bronze rivets at stress points
+  const encode = (obj: unknown) => Buffer.from(JSON.stringify(obj)).toString('base64url');
+  const unsigned = `${encode(header)}.${encode(payload)}`;
+  const sign = crypto.createSign('RSA-SHA256');
+  sign.update(unsigned);
+  const signature = sign.sign(key.private_key, 'base64url');
+  const jwt = `${unsigned}.${signature}`;
 
-LEG SHAPE:
-- Wide straight leg / relaxed fit — NOT slim, NOT skinny
-- Generous through thigh, minimal taper
+  const tokenResp = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${jwt}`,
+  });
 
-HEM/CUFFS:
-- Selvedge turn-up cuffs at hem showing white/natural selvedge edge line
-- Single fold, approximately 3-4cm deep`,
-    shotOverrides: {
-      M01: 'POSE: Hands clasped BEHIND BACK — arms behind body, chest open. This ensures the CARPENTER POCKET on the outer thigh is FULLY visible and unobstructed.',
-    },
-    specialZones: [
-      {
-        name: 'Carpenter Pocket',
-        y1: 0.44, y2: 0.58,
-        x1: 0.55, x2: 0.85,
-        upscale: 2.5,
-        angles: [0, 1, 2],
-        label: 'CARPENTER POCKET CLOSE-UP — rectangular patch pocket on outer thigh with topstitching. This SIGNATURE DETAIL must be clearly visible.',
-      },
-    ],
-  },
-
-  'D28831-E358-H938': {
-    designNumber: 'D28831-E358-H938',
-    styleName: 'Stevey 3D Flare Jeans',
-    gender: 'female',
-    category: 'pants',
-    fit: 'bootcut flare',
-    dna: `CRITICAL GARMENT DETAILS — match EVERY detail from the reference images:
-
-FABRIC & COLOR:
-- Greencast denim — medium/vintage wash with SOFT GREEN UNDERTONE
-- Indigo base with greenish cast — NOT pure blue, NOT grey, NOT black
-- Heavy WHISKERING at hip/thigh — horizontal fading lines from fly/pocket area
-- HONEYCOMB FADING behind knees
-- Overall vintage worn-in appearance — lighter at stress points, darker in creases
-- 13 oz sturdy denim
-
-WAISTBAND & FLY:
-- Zip + button fly — single metal button at center waist
-- Mid-rise waistband — NOT high, NOT low
-- Belt loops (5-6)
-
-POCKETS:
-- Two front slash pockets
-- Small coin pocket at right front (viewer's left)
-- Two back patch pockets — simple
-- NO carpenter pocket
-
-G-STAR BRANDING:
-- Small yellow/gold G-STAR woven label on front left pocket area (viewer's right)
-- Paper/leather-look G-STAR RAW patch on back right pocket area
-- DO NOT add any branding not visible in references
-
-LEG SHAPE — SIGNATURE FLARE:
-- BOOTCUT/FLARE fit — the DEFINING feature
-- Fitted through hip and thigh (3D sculpted construction)
-- From the knee, the leg FLARES DRAMATICALLY outward
-- At the hem, the leg opening is very wide — much wider than the knee
-- Match the exact flare angle from the mannequin references
-
-3D CONSTRUCTION:
-- Sculpted fit through hip and upper thigh — shaped seaming
-- Body-hugging above the knee, transitions to wide flare below
-
-HEM:
-- Clean hem — NO selvedge cuffs, NO turn-ups
-- Straight cut at full length, should touch top of shoes`,
-    specialZones: [
-      {
-        name: 'Flare Opening',
-        y1: 0.65, y2: 0.88,
-        x1: 0.05, x2: 0.95,
-        upscale: 1.5,
-        angles: [0, 2, 4],
-        label: 'FLARE ZONE — the dramatic leg opening from knee to hem. This is WIDER than the hip. Copy this silhouette EXACTLY.',
-      },
-    ],
-  },
-
-};
+  if (!tokenResp.ok) throw new Error(`Token exchange failed: ${tokenResp.status}`);
+  const tokenData = await tokenResp.json();
+  return tokenData.access_token;
+}
 
 /**
- * Look up garment DNA by design number.
- * Returns null if not in registry — the system still works with generic prompts.
+ * Analyze garment construction by sending fit model + flat images to Gemini.
+ * Returns a structured GarmentDNA with both the text analysis and feature flags.
+ *
+ * @param fitModelBuffers Array of fit model image buffers (ideally front, side, back)
+ * @param flatFrontBuffer Flat front image buffer (optional)
+ * @param flatBackBuffer Flat back image buffer (optional)
+ * @param garmentDescription Text description from the wardrobe item (optional, supplements vision)
  */
-export function getGarmentDNA(designNumber: string): GarmentDNA | null {
-  // Try exact match first
-  if (GARMENT_REGISTRY[designNumber]) {
-    return GARMENT_REGISTRY[designNumber];
-  }
-  // Try prefix match (e.g., "D27463" matches "D27463-D945-001")
-  for (const [key, dna] of Object.entries(GARMENT_REGISTRY)) {
-    if (key.startsWith(designNumber) || designNumber.startsWith(key.split('-').slice(0, 2).join('-'))) {
-      return dna;
+export async function analyzeGarmentConstruction(
+  fitModelBuffers: Buffer[],
+  flatFrontBuffer: Buffer | null,
+  flatBackBuffer: Buffer | null,
+  garmentDescription?: string,
+): Promise<GarmentDNA> {
+  // Select up to 4 images for analysis: front, side, back fit model + flat back
+  const imageParts: Array<{ inlineData: { mimeType: string; data: string } }> = [];
+  const imageLabels: string[] = [];
+
+  // Pick representative fit model angles: front (0), side (~2), back (~4)
+  const totalAngles = fitModelBuffers.length;
+  const selectedIndices: number[] = [];
+  if (totalAngles >= 1) selectedIndices.push(0); // front
+  if (totalAngles >= 3) selectedIndices.push(Math.floor(totalAngles * 0.25)); // side
+  if (totalAngles >= 5) selectedIndices.push(Math.floor(totalAngles / 2)); // back
+  if (totalAngles >= 7) selectedIndices.push(Math.floor(totalAngles * 0.75)); // other side
+
+  for (const idx of selectedIndices) {
+    if (fitModelBuffers[idx]) {
+      try {
+        const resized = await sharp(fitModelBuffers[idx])
+          .resize(1200, 1200, { fit: 'inside' })
+          .jpeg({ quality: 80 })
+          .toBuffer();
+        imageParts.push({
+          inlineData: { mimeType: 'image/jpeg', data: resized.toString('base64') },
+        });
+        const viewName = idx === 0 ? 'FRONT' : idx === Math.floor(totalAngles / 2) ? 'BACK' : `ANGLE ${idx}`;
+        imageLabels.push(`Image ${imageParts.length}: Fit model ${viewName} view`);
+      } catch (err) {
+        console.warn(`[GarmentDNA] Failed to process fit model angle ${idx}:`, err);
+      }
     }
   }
+
+  // Add flat back if available (shows construction details cleanly)
+  if (flatBackBuffer) {
+    try {
+      const resized = await sharp(flatBackBuffer)
+        .resize(1200, 1200, { fit: 'inside' })
+        .jpeg({ quality: 80 })
+        .toBuffer();
+      imageParts.push({
+        inlineData: { mimeType: 'image/jpeg', data: resized.toString('base64') },
+      });
+      imageLabels.push(`Image ${imageParts.length}: FLAT BACK (product-on-white)`);
+    } catch (err) {
+      console.warn('[GarmentDNA] Failed to process flat back:', err);
+    }
+  }
+
+  // Add flat front if available
+  if (flatFrontBuffer) {
+    try {
+      const resized = await sharp(flatFrontBuffer)
+        .resize(1200, 1200, { fit: 'inside' })
+        .jpeg({ quality: 80 })
+        .toBuffer();
+      imageParts.push({
+        inlineData: { mimeType: 'image/jpeg', data: resized.toString('base64') },
+      });
+      imageLabels.push(`Image ${imageParts.length}: FLAT FRONT (product-on-white)`);
+    } catch (err) {
+      console.warn('[GarmentDNA] Failed to process flat front:', err);
+    }
+  }
+
+  if (imageParts.length === 0) {
+    throw new Error('No images available for analysis');
+  }
+
+  const prompt = `You are an expert denim garment analyst. Study these reference images of a pair of jeans/trousers and IDENTIFY every construction feature you can see.
+
+${imageLabels.join('\n')}
+${garmentDescription ? `\nProduct description (for context only — trust what you SEE in the images over this text):\n${garmentDescription}` : ''}
+
+PURPOSE: Your output will be used as an AWARENESS CHECKLIST for an AI image generator that already has the reference images. The generator will use your list to know WHAT features to look for in the images, then reproduce them from the images directly. You are NOT describing how features look — you are listing WHAT EXISTS so nothing gets missed.
+
+Respond in EXACT JSON (no markdown, no backticks).
+
+{
+  "silhouette_fit": "Classify the OVERALL leg silhouette based on what you SEE in the fit model images. Choose ONE: skinny / slim / straight / relaxed / wide-leg / bootcut / tapered.",
+  "proportions": {
+    "waist_rise": "low-rise / mid-rise / high-rise",
+    "inseam_length": "full length / 7/8 length / cropped",
+    "hem_to_floor": "stacking on shoe / resting on shoe / at ankle / above ankle"
+  },
+  "front_features": [
+    {
+      "name": "short name, e.g. 'exposed outer leg zipper' or '3D knee articulation'",
+      "location": "where on the garment, e.g. 'outer leg seam, hip to ankle'",
+      "importance": 8,
+      "visibleInShots": ["M01", "M03"]
+    }
+  ],
+  "back_features": [
+    {
+      "name": "short name",
+      "location": "where on the garment",
+      "importance": 8,
+      "visibleInShots": ["M02", "M04"]
+    }
+  ],
+  "m05_focus": "What is THE most distinctive/interesting construction detail for a detail close-up shot? Name it and say WHERE it is.",
+  "m05_framing_override": "If the most interesting detail is NOT in the back pocket area (waistband-to-mid-thigh), provide alternative framing. Return null if back pocket framing is correct."
+}
+
+IMPORTANT — FEATURES:
+- List EVERY distinguishing feature. A basic 5-pocket jean: 3-5 features. Complex 3D/zip garment: 8-15.
+- Give SHORT names only — no descriptions of how they look. The image generator will find them in the reference images.
+- Importance: 1-3 subtle, 4-6 noticeable, 7-9 defining, 10 = signature element
+- Features visible from BOTH front and back should appear in BOTH arrays.
+- visibleInShots: M01 (cropped front), M02 (cropped back), M03 (full body front), M04 (full body back), M05 (detail close-up). No M06+.
+- FRONT shots = M01, M03. BACK shots = M02, M04.
+- Be thorough: check for panel seams, knee darts/articulation, zippers, pocket shapes, hardware, stitching details, hem treatments, yoke seams.`;
+
+  // Use Vertex AI endpoint with OAuth (same as image generation — works on Cloud Run)
+  const accessToken = await getAccessToken();
+  const url = `https://aiplatform.googleapis.com/v1/projects/${GCP_PROJECT}/locations/global/publishers/google/models/${ANALYSIS_MODEL}:generateContent`;
+
+  try {
+    const parts: any[] = [
+      ...imageParts,
+      { text: prompt },
+    ];
+
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${accessToken}`,
+      },
+      signal: AbortSignal.timeout(30_000),
+      body: JSON.stringify({
+        contents: [{ role: 'user', parts }],
+        generationConfig: { temperature: 0.2, responseMimeType: 'application/json' },
+      }),
+    });
+
+    if (!response.ok) {
+      const errorBody = await response.text().catch(() => 'no body');
+      throw new Error(`Vertex AI ${response.status}: ${errorBody.slice(0, 500)}`);
+    }
+
+    const result = await response.json();
+    const textPart = result.candidates?.[0]?.content?.parts?.find((p: any) => p.text);
+    if (!textPart?.text) {
+      throw new Error(`No text in Gemini response: ${JSON.stringify(result).slice(0, 300)}`);
+    }
+
+    let parsed: any;
+    try {
+      parsed = JSON.parse(textPart.text);
+    } catch (parseErr) {
+      // Try to extract JSON from markdown fences
+      const jsonMatch = textPart.text.match(/```(?:json)?\s*([\s\S]*?)```/);
+      if (jsonMatch) {
+        parsed = JSON.parse(jsonMatch[1]);
+      } else {
+        throw new Error(`Failed to parse JSON: ${textPart.text.slice(0, 300)}`);
+      }
+    }
+
+    // ── Build awareness-checklist DNA ──
+    // DNA v2: feature NAMES only, no descriptions. The reference images are the
+    // primary source of truth — DNA just tells Gemini WHAT to look for so nothing
+    // gets missed. Gemini reproduces features from the images, not from text.
+
+    const m05Focus = parsed.m05_focus || '';
+    const proportions = parsed.proportions || {};
+    const silhouetteFit = parsed.silhouette_fit || '';
+
+    // Parse features from both front and back arrays
+    const VALID_SHOTS = new Set(['M01', 'M02', 'M03', 'M04', 'M05']);
+    const parseFeatures = (arr: any[]): GarmentFeature[] =>
+      (Array.isArray(arr) ? arr : [])
+        .filter((f: any) => f && typeof f.name === 'string')
+        .map((f: any) => ({
+          name: String(f.name),
+          location: String(f.location || ''),
+          importance: typeof f.importance === 'number' ? Math.min(10, Math.max(1, f.importance)) : 5,
+          description: '', // v2: no descriptions — awareness only
+          visibleInShots: (Array.isArray(f.visibleInShots) ? f.visibleInShots.map(String) : []).filter((s: string) => VALID_SHOTS.has(s)),
+        }))
+        .sort((a: GarmentFeature, b: GarmentFeature) => b.importance - a.importance);
+
+    const frontFeatures = parseFeatures(parsed.front_features);
+    const backFeatures = parseFeatures(parsed.back_features);
+    // Combined deduplicated list for logging
+    const allFeatureNames = new Set<string>();
+    const features: GarmentFeature[] = [];
+    for (const f of [...frontFeatures, ...backFeatures]) {
+      if (!allFeatureNames.has(f.name.toLowerCase())) {
+        allFeatureNames.add(f.name.toLowerCase());
+        features.push(f);
+      }
+    }
+
+    // Build the awareness checklist for each direction
+    const buildChecklist = (feats: GarmentFeature[]) =>
+      feats.map(f => `- ${f.name} (${f.location})`).join('\n');
+
+    const silhouetteAnchor = silhouetteFit
+      ? `SILHOUETTE: ${silhouetteFit.toUpperCase()} FIT — maintain this silhouette. Do NOT distort leg shape.\n`
+      : '';
+
+    const proportionsLine = `PROPORTIONS: ${proportions.waist_rise || '?'} rise, ${proportions.inseam_length || '?'}, hem ${proportions.hem_to_floor || '?'}`;
+
+    // FRONT DNA — short awareness block
+    const frontDna = `GARMENT DNA (awareness checklist — reference images are your PRIMARY truth):
+${silhouetteAnchor}${proportionsLine}
+FEATURES TO FIND IN REFERENCE IMAGES (front view):
+${buildChecklist(frontFeatures) || '- Standard 5-pocket construction'}
+IMPORTANT: Each feature above EXISTS in the reference images. Find it, then reproduce EXACTLY as you see it. Do NOT invent appearance from text — LOOK at the images.`;
+
+    // BACK DNA — short awareness block
+    const backDna = `GARMENT DNA (awareness checklist — reference images are your PRIMARY truth):
+${silhouetteAnchor}${proportionsLine}
+FEATURES TO FIND IN REFERENCE IMAGES (back view):
+${buildChecklist(backFeatures) || '- Standard 5-pocket construction'}
+IMPORTANT: Each feature above EXISTS in the reference images. Find it, then reproduce EXACTLY as you see it. Do NOT invent appearance from text — LOOK at the images.`;
+
+    // Combined DNA for logging
+    const dna = `GARMENT DNA CHECKLIST:\nSilhouette: ${silhouetteFit}\n${proportionsLine}\nFront: ${frontFeatures.map(f => f.name).join(', ')}\nBack: ${backFeatures.map(f => f.name).join(', ')}`;
+
+    // Shot overrides — M05 only (framing guidance for detail shot)
+    // No more per-shot CRITICAL FEATURE overrides — those caused Gemini to
+    // over-emphasize text-described features instead of following images.
+    const shotOverrides: Record<string, string> = {};
+    if (parsed.m05_framing_override && parsed.m05_framing_override !== 'null' && parsed.m05_framing_override !== null) {
+      shotOverrides['M05'] = `M05 FRAMING OVERRIDE: ${parsed.m05_framing_override}\nM05 DETAIL FOCUS: ${m05Focus}`;
+    } else if (m05Focus) {
+      shotOverrides['M05'] = `M05 DETAIL FOCUS: ${m05Focus}`;
+    }
+
+    const garmentDNA: GarmentDNA = {
+      dna,
+      frontDna,
+      backDna,
+      shotOverrides: Object.keys(shotOverrides).length > 0 ? shotOverrides : undefined,
+      features,
+      proportions: {
+        waistRise: proportions.waist_rise || '',
+        inseamLength: proportions.inseam_length || '',
+        hemToFloor: proportions.hem_to_floor || '',
+      },
+    };
+
+    console.log(`[GarmentDNA v2] Analysis complete — ${imageParts.length} images, ${features.length} unique features`);
+    console.log(`[GarmentDNA v2] Silhouette: ${silhouetteFit || 'unknown'} | ${proportionsLine}`);
+    console.log(`[GarmentDNA v2] Front features: ${frontFeatures.map(f => f.name).join(', ')}`);
+    console.log(`[GarmentDNA v2] Back features: ${backFeatures.map(f => f.name).join(', ')}`);
+    console.log(`[GarmentDNA v2] Front DNA length: ${frontDna.length} chars (was ~2700)`);
+    if (shotOverrides['M05']) {
+      console.log(`[GarmentDNA v2] M05 override: ${shotOverrides['M05'].slice(0, 100)}...`);
+    }
+
+    return garmentDNA;
+  } catch (err: any) {
+    console.error('[GarmentDNA] Analysis failed:', err);
+    throw err;
+  }
+}
+
+/**
+ * Legacy lookup — kept for backward compatibility but now just returns null.
+ * All garment analysis goes through analyzeGarmentConstruction().
+ */
+export function getGarmentDNA(_designNumber: string): GarmentDNA | null {
   return null;
 }

@@ -36,8 +36,12 @@ export async function POST(
   const result = await enqueueJob(jobId, jobName);
   console.log(`[RunAll] Enqueued ${jobName}: slot=${result.slot}, position=${result.position}`);
 
-  // Kick the worker (fire-and-forget — don't await the long-running response)
-  fetch(`${getInternalBase()}/api/jobs/process-queue`, { method: 'POST' }).catch(() => {});
+  // v37: Respond immediately, kick worker in background.
+  // The internal fetch creates a new request that keeps the container alive.
+  // Must NOT await — process-queue blocks for minutes during generation.
+  fetch(`${getInternalBase()}/api/jobs/process-queue`, { method: 'POST' })
+    .then(res => console.log(`[RunAll] Worker kick response: ${res.status}`))
+    .catch(err => console.warn(`[RunAll] Worker kick failed (non-blocking):`, err));
 
   return new Response(JSON.stringify({
     ok: true,
