@@ -49,8 +49,10 @@ async function getFocusGarmentImages(wardrobe: JobWardrobe, view: 'front' | 'bac
   const item = await getWardrobeItem(focusSlot[1].itemId) as any;
   if (!item) throw new Error(`Focus garment not found: ${focusSlot[1].itemId}`);
 
+  console.log(`[Generate] Focus item ${focusSlot[1].itemId}: fitModels=${!!item.fitModels}, fitModelUrls=${item.fitModelUrls?.length || 0}`);
   const normalized = normalizeWardrobeItem(item);
   if (!normalized) throw new Error(`Focus garment has no fit model images: ${focusSlot[1].itemId}`);
+  if (!normalized.fitModels?.front) throw new Error(`Normalize returned but fitModels.front missing for ${focusSlot[1].itemId}`);
   const fitModels: FitModelAngles = normalized.fitModels;
 
   // Select 3 angles based on view direction
@@ -110,12 +112,13 @@ export async function generateM03(
 ): Promise<GenerationResult> {
   const { angles, flat } = await getFocusGarmentImages(ctx.wardrobe, 'front');
   const model = await getModel(ctx.modelId) as any;
-  if (!model?.referenceImageUrl) throw new Error('Model reference image not found');
+  const modelRefUrl = model?.referenceImageUrl || model?.cardImageUrl;
+  if (!modelRefUrl) throw new Error(`Model reference image not found for ${ctx.modelId} (keys: ${Object.keys(model || {}).join(',')})`);
 
   const refs: ReferenceImage[] = [];
 
   // Image 1: Model reference
-  refs.push(await loadRef(model.referenceImageUrl, 'MODEL IDENTITY REFERENCE — match this face and hair EXACTLY'));
+  refs.push(await loadRef(modelRefUrl, 'MODEL IDENTITY REFERENCE — match this face and hair EXACTLY'));
 
   // Image 2: Flat front
   refs.push(await loadRef(flat, 'Garment Flat Front Image (Ground truth for proportions)'));
@@ -130,7 +133,7 @@ export async function generateM03(
   refs.push(...styling);
 
   // Inject silhouette and generate
-  const finalPrompt = injectSilhouette(prompt.generationPrompt, ctx.silhouette.front);
+  const finalPrompt = injectSilhouette(prompt.generationPrompt, ctx.silhouette?.front || '');
 
   console.log(`[Generate] M03: ${refs.length} reference images`);
 
@@ -155,12 +158,13 @@ export async function generateM04(
 
   const { angles, flat } = await getFocusGarmentImages(ctx.wardrobe, 'back');
   const model = await getModel(ctx.modelId) as any;
-  if (!model?.referenceImageUrl) throw new Error('Model reference image not found');
+  const modelRefUrl2 = model?.referenceImageUrl || model?.cardImageUrl;
+  if (!modelRefUrl2) throw new Error(`Model reference image not found for ${ctx.modelId}`);
 
   const refs: ReferenceImage[] = [];
 
   // Image 1: Model reference
-  refs.push(await loadRef(model.referenceImageUrl, 'MODEL IDENTITY REFERENCE — match this person\'s hair, skin, build'));
+  refs.push(await loadRef(modelRefUrl2, 'MODEL IDENTITY REFERENCE — match this person\'s hair, skin, build'));
 
   // Image 2: Flat back
   refs.push(await loadRef(flat, 'Garment Flat Back Image (Ground truth for proportions)'));
@@ -178,7 +182,7 @@ export async function generateM04(
   refs.push(await loadRef(ctx.m03AnchorUrl, 'FRONT VIEW of the same garment (match color, wash, and construction)'));
 
   // Inject silhouette and generate
-  const finalPrompt = injectSilhouette(prompt.generationPrompt, ctx.silhouette.back);
+  const finalPrompt = injectSilhouette(prompt.generationPrompt, ctx.silhouette?.back || '');
 
   console.log(`[Generate] M04: ${refs.length} reference images`);
 
@@ -229,7 +233,7 @@ export async function generateM01(
     }
   }
 
-  const finalPrompt = injectSilhouette(prompt.generationPrompt, ctx.silhouette.front);
+  const finalPrompt = injectSilhouette(prompt.generationPrompt, ctx.silhouette?.front || '');
 
   console.log(`[Generate] M01: ${refs.length} reference images`);
 
@@ -280,7 +284,7 @@ export async function generateM02(
     }
   }
 
-  const finalPrompt = injectSilhouette(prompt.generationPrompt, ctx.silhouette.back);
+  const finalPrompt = injectSilhouette(prompt.generationPrompt, ctx.silhouette?.back || '');
 
   console.log(`[Generate] M02: ${refs.length} reference images`);
 
