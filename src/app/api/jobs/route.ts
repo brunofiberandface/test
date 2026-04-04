@@ -13,6 +13,7 @@ import { downloadGarmentImage } from '@/lib/gcs';
 import { analyzeSilhouette } from '@/lib/pipeline/silhouette';
 import { APP_CONFIG } from '@/lib/config';
 import type { ShotType, JobWardrobe, FitModelAngles } from '@/types';
+import { normalizeWardrobeItem } from '@/lib/wardrobe-compat';
 
 function getInternalBase(): string {
   const port = process.env.PORT || '3000';
@@ -109,14 +110,15 @@ export async function POST(req: NextRequest) {
     const focusSlot = Object.entries(w).find(([, v]) => v.isFocus)!;
     const focusItem = await getWardrobeItem(focusSlot[1].itemId) as any;
 
-    if (!focusItem?.fitModels || !focusItem?.flatFrontUrl) {
+    const normalized = normalizeWardrobeItem(focusItem);
+    if (!normalized || !normalized.flatFrontUrl) {
       return NextResponse.json(
         { error: 'Focus garment must have fit model images and at least a flat front image' },
         { status: 400 }
       );
     }
 
-    const fitModels: FitModelAngles = focusItem.fitModels;
+    const fitModels: FitModelAngles = normalized.fitModels;
 
     try {
       console.log(`[Job] Running silhouette analysis for ${focusItem.name}...`);
@@ -133,9 +135,9 @@ export async function POST(req: NextRequest) {
         downloadGarmentImage(fitModels.back.split('?')[0]),
         downloadGarmentImage(fitModels.back45Left.split('?')[0]),
         downloadGarmentImage(fitModels.back45Right.split('?')[0]),
-        downloadGarmentImage(focusItem.flatFrontUrl.split('?')[0]),
-        focusItem.flatBackUrl
-          ? downloadGarmentImage(focusItem.flatBackUrl.split('?')[0])
+        downloadGarmentImage(normalized.flatFrontUrl.split('?')[0]),
+        normalized.flatBackUrl
+          ? downloadGarmentImage(normalized.flatBackUrl.split('?')[0])
           : Promise.resolve(null),
       ]);
 

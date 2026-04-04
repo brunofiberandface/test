@@ -12,6 +12,7 @@ import { prepareForGeneration } from './image-prep';
 import { injectSilhouette, type LoadedPrompt } from './prompt-loader';
 import { APP_CONFIG } from '@/lib/config';
 import type { ShotType, JobWardrobe, FitModelAngles } from '@/types';
+import { normalizeWardrobeItem } from '@/lib/wardrobe-compat';
 
 export interface GenerationContext {
   wardrobe: JobWardrobe;
@@ -48,7 +49,9 @@ async function getFocusGarmentImages(wardrobe: JobWardrobe, view: 'front' | 'bac
   const item = await getWardrobeItem(focusSlot[1].itemId) as any;
   if (!item) throw new Error(`Focus garment not found: ${focusSlot[1].itemId}`);
 
-  const fitModels: FitModelAngles = item.fitModels;
+  const normalized = normalizeWardrobeItem(item);
+  if (!normalized) throw new Error(`Focus garment has no fit model images: ${focusSlot[1].itemId}`);
+  const fitModels: FitModelAngles = normalized.fitModels;
 
   // Select 3 angles based on view direction
   const angles = view === 'front'
@@ -56,9 +59,9 @@ async function getFocusGarmentImages(wardrobe: JobWardrobe, view: 'front' | 'bac
     : [fitModels.back, fitModels.back45Left, fitModels.back45Right];
 
   // Select flat based on view direction
-  const flat = view === 'back' && item.flatBackUrl
-    ? item.flatBackUrl
-    : item.flatFrontUrl;
+  const flat = view === 'back' && normalized.flatBackUrl
+    ? normalized.flatBackUrl
+    : normalized.flatFrontUrl;
 
   return { angles, flat, item };
 }
@@ -79,16 +82,18 @@ async function getStylingImages(wardrobe: JobWardrobe): Promise<ReferenceImage[]
                   slot === 'top' ? 'Top Reference' :
                   `${slot} Reference`;
 
+    const norm = normalizeWardrobeItem(item);
+
     // Front image (always available)
-    if (item.flatFrontUrl) {
-      refs.push(await loadRef(item.flatFrontUrl, `${label} (${item.name})`));
-    } else if (item.fitModels?.front) {
-      refs.push(await loadRef(item.fitModels.front, `${label} (${item.name})`));
+    if (norm?.flatFrontUrl) {
+      refs.push(await loadRef(norm.flatFrontUrl, `${label} (${item.name})`));
+    } else if (norm?.fitModels?.front) {
+      refs.push(await loadRef(norm.fitModels.front, `${label} (${item.name})`));
     }
 
     // Back image (if available)
-    if (item.flatBackUrl) {
-      refs.push(await loadRef(item.flatBackUrl, `${label} Back (${item.name})`));
+    if (norm?.flatBackUrl) {
+      refs.push(await loadRef(norm.flatBackUrl, `${label} Back (${item.name})`));
     }
   }
 
@@ -215,10 +220,11 @@ export async function generateM01(
   for (const [slot, config] of Object.entries(ctx.wardrobe)) {
     if (slot === 'shoe' && !config.isFocus) {
       const item = await getWardrobeItem(config.itemId) as any;
-      if (item?.flatFrontUrl) {
-        refs.push(await loadRef(item.flatFrontUrl, `Shoes Reference (${item.name})`));
-      } else if (item?.fitModels?.front) {
-        refs.push(await loadRef(item.fitModels.front, `Shoes Reference (${item.name})`));
+      const shoeNorm = item ? normalizeWardrobeItem(item) : null;
+      if (shoeNorm?.flatFrontUrl) {
+        refs.push(await loadRef(shoeNorm.flatFrontUrl, `Shoes Reference (${item.name})`));
+      } else if (shoeNorm?.fitModels?.front) {
+        refs.push(await loadRef(shoeNorm.fitModels.front, `Shoes Reference (${item.name})`));
       }
     }
   }
@@ -265,10 +271,11 @@ export async function generateM02(
   for (const [slot, config] of Object.entries(ctx.wardrobe)) {
     if (slot === 'shoe' && !config.isFocus) {
       const item = await getWardrobeItem(config.itemId) as any;
-      if (item?.flatFrontUrl) {
-        refs.push(await loadRef(item.flatFrontUrl, `Shoes Reference (${item.name})`));
-      } else if (item?.fitModels?.front) {
-        refs.push(await loadRef(item.fitModels.front, `Shoes Reference (${item.name})`));
+      const shoeNorm = item ? normalizeWardrobeItem(item) : null;
+      if (shoeNorm?.flatFrontUrl) {
+        refs.push(await loadRef(shoeNorm.flatFrontUrl, `Shoes Reference (${item.name})`));
+      } else if (shoeNorm?.fitModels?.front) {
+        refs.push(await loadRef(shoeNorm.fitModels.front, `Shoes Reference (${item.name})`));
       }
     }
   }
