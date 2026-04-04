@@ -11,7 +11,8 @@ interface Model {
   name: string;
   description: string;
   gender: 'male' | 'female';
-  referenceImageUrl: string;
+  referenceImageUrl?: string;
+  cardImageUrl?: string;
   active: boolean;
 }
 
@@ -153,9 +154,9 @@ export default function ModelsPage() {
                     >
                       <Link href={`/models/${mid}`}>
                         <div className="aspect-[3/4] bg-neutral-100 relative overflow-hidden cursor-pointer">
-                          {model.referenceImageUrl ? (
+                          {(model.referenceImageUrl || model.cardImageUrl) ? (
                             <img
-                              src={model.referenceImageUrl}
+                              src={(model.referenceImageUrl || model.cardImageUrl)!}
                               alt={`${model.modelId} — ${model.name}`}
                               className="w-full h-full object-cover object-top"
                             />

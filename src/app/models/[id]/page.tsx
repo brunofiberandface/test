@@ -12,7 +12,8 @@ interface ModelData {
   name: string;
   description: string;
   gender: 'male' | 'female';
-  referenceImageUrl: string;
+  referenceImageUrl?: string;
+  cardImageUrl?: string;
   active: boolean;
   createdAt?: string;
 }
@@ -149,7 +150,7 @@ export default function ModelDetailPage() {
           name: cloneName,
           description: cloneDescription,
           gender: cloneGender,
-          referenceImageUrl: model.referenceImageUrl,
+          referenceImageUrl: model.referenceImageUrl || model.cardImageUrl,
           createdBy: user.email,
         }),
       });
@@ -234,9 +235,9 @@ export default function ModelDetailPage() {
               setZoomMode(modes[(idx + 1) % modes.length]);
             }}
           >
-            {model.referenceImageUrl ? (
+            {(model.referenceImageUrl || model.cardImageUrl) ? (
               <img
-                src={model.referenceImageUrl}
+                src={(model.referenceImageUrl || model.cardImageUrl)!}
                 alt={`${model.modelId} — ${model.name}`}
                 className="w-full h-full transition-transform duration-500 ease-out"
                 style={zoomStyles[zoomMode]}

@@ -25,7 +25,8 @@ interface ModelItem {
   modelId: string;
   name: string;
   gender: string;
-  referenceImageUrl: string;
+  referenceImageUrl?: string;
+  cardImageUrl?: string;
   active: boolean;
 }
 
@@ -329,8 +330,8 @@ function NewJobContent() {
                               className={`border text-left transition-all ${isSel ? 'border-neutral-900 ring-1 ring-neutral-900 bg-neutral-50' : 'border-neutral-200 hover:border-neutral-400'}`}
                             >
                               <div className="aspect-[3/4] bg-neutral-100 relative overflow-hidden">
-                                {m.referenceImageUrl ? (
-                                  <img src={m.referenceImageUrl} alt={m.name} className="w-full h-full object-cover object-top" />
+                                {(m.referenceImageUrl || m.cardImageUrl) ? (
+                                  <img src={(m.referenceImageUrl || m.cardImageUrl)!} alt={m.name} className="w-full h-full object-cover object-top" />
                                 ) : (
                                   <div className="w-full h-full flex items-center justify-center text-neutral-300 text-xs">{m.modelId}</div>
                                 )}
