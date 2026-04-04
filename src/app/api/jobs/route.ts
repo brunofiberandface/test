@@ -1,48 +1,44 @@
+/**
+ * Jobs API — v2 Pro pipeline.
+ *
+ * GET: List jobs
+ * POST: Create job with 3 wardrobe items + focus + model selection
+ */
 import { NextRequest, NextResponse } from 'next/server';
-import { createJob, listJobs, getJob, createShot, updateJobStatus, jobsCol, wardrobeCol, createWardrobeItem, enqueueJob } from '@/lib/firestore';
-import { buildGenerationPrompt } from '@/lib/prompts';
-import { SHOT_DESCRIPTIONS } from '@/lib/config';
-import { uploadGarmentImage } from '@/lib/gcs';
+import {
+  createJob, listJobs, createShot, updateJobStatus, updateJob,
+  enqueueJob, getActivePrompt, getWardrobeItem,
+} from '@/lib/firestore';
+import { downloadGarmentImage } from '@/lib/gcs';
+import { analyzeSilhouette } from '@/lib/pipeline/silhouette';
+import { APP_CONFIG } from '@/lib/config';
+import type { ShotType, JobWardrobe, FitModelAngles } from '@/types';
 
 function getInternalBase(): string {
   const port = process.env.PORT || '3000';
   return `http://localhost:${port}`;
 }
 
-// Maps garment category → wardrobe category (for auto-save)
-const GARMENT_TO_WARDROBE: Record<string, string> = {
-  pants: 'pants',
-  jackets: 'jacket',
-  tops: 'shirt',
-  knitwear: 'shirt',
-};
-
-// GET /api/jobs — list jobs (filtered by creator for non-admins)
+// GET /api/jobs
 export async function GET(req: NextRequest) {
   try {
     const { searchParams } = new URL(req.url);
     const includeArchived = searchParams.get('includeArchived') === 'true';
 
     const allJobs = await listJobs();
-    // Filter out archived jobs unless explicitly requested
     const jobs = includeArchived ? allJobs : allJobs.filter((j: any) => !j.archived);
 
-    // ── Auto-fix any jobs stuck on 'generating'/'uploading' ──
-    // Check shots for stuck jobs and update status. Run in parallel, non-blocking.
-    const stuckJobs = jobs.filter((j: any) => j.status === 'generating' || j.status === 'uploading');
+    // Auto-fix stuck jobs
+    const stuckJobs = jobs.filter((j: any) => j.status === 'generating');
     if (stuckJobs.length > 0) {
-      const { listShots, updateJobStatus } = await import('@/lib/firestore');
+      const { listShots } = await import('@/lib/firestore');
       await Promise.all(stuckJobs.map(async (job: any) => {
         try {
           const jobId = job.jobId || job.id;
           const shots = await listShots(jobId);
           if (shots.length === 0) return;
-          const allApproved = shots.every((s: any) => s.status === 'approved');
-          const allTerminal = shots.every((s: any) => s.status === 'done' || s.status === 'approved');
-          if (allApproved) {
-            await updateJobStatus(jobId, 'complete');
-            job.status = 'complete';
-          } else if (allTerminal) {
+          const allDone = shots.every((s: any) => s.status === 'done' || s.status === 'approved');
+          if (allDone) {
             await updateJobStatus(jobId, 'review');
             job.status = 'review';
           }
@@ -62,174 +58,143 @@ export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
     const {
-      designNumber,
       jobName,
       creatorEmail,
-      garmentCategory,
-      description,
-      metadata,
-      modelIds,
-      modelDescriptions,
-      // NEW: garment images as base64
-      flatImageBase64,      // base64 encoded flat product image
-      flatImageMimeType,    // e.g. "image/jpeg"
-      images360Base64,      // array of base64 encoded 360° images (optional, send best few)
-      wardrobeItemIds,      // { shoes?: id, shirt?: id, jacket?: id, pants?: id }
-      // Passthrough: pre-existing GCS URLs (e.g. from wardrobe picker — skip re-upload)
-      flatFrontUrl: flatFrontUrlPassthrough,
-      flatBackUrl: flatBackUrlPassthrough,
-      flatImageUrl: flatImageUrlPassthrough, // legacy compat
+      modelId,
+      wardrobe,  // { shoe: { itemId, isFocus }, top: { itemId, isFocus }, bottom: { itemId, isFocus } }
     } = body;
 
-    // v40: modelIds no longer required — generation uses generic body, not specific models
-    if (!designNumber || !garmentCategory || !description) {
-      return NextResponse.json({ error: 'Missing required fields' }, { status: 400 });
+    if (!creatorEmail || !modelId || !wardrobe) {
+      return NextResponse.json({ error: 'Missing required fields: creatorEmail, modelId, wardrobe' }, { status: 400 });
     }
-    // Default to a placeholder model ID if none provided (v40: no model selection)
-    const effectiveModelIds = modelIds?.length ? modelIds : ['generic'];
 
-    // Upload flat front image to GCS if provided, or use passthrough GCS URL directly
-    let flatFrontUrl = flatFrontUrlPassthrough || flatImageUrlPassthrough || '';
-    if (!flatFrontUrl && flatImageBase64) {
-      const flatBuffer = Buffer.from(flatImageBase64, 'base64');
-      const mime = flatImageMimeType || 'image/jpeg';
-      const ext = mime.includes('png') ? 'png' : 'jpg';
-      flatFrontUrl = await uploadGarmentImage(
-        designNumber, 'flat', `flat_front.${ext}`, flatBuffer, mime
-      );
-      console.log(`[Job] Flat front image uploaded: ${flatFrontUrl}`);
+    // Validate wardrobe structure
+    const w = wardrobe as JobWardrobe;
+    if (!w.shoe?.itemId || !w.top?.itemId || !w.bottom?.itemId) {
+      return NextResponse.json({ error: 'Wardrobe must include shoe, top, and bottom items' }, { status: 400 });
     }
-    let flatBackUrl = flatBackUrlPassthrough || '';
 
-    // Create job with garment image URLs
+    // Ensure exactly one focus
+    const focusCount = [w.shoe, w.top, w.bottom].filter(x => x.isFocus).length;
+    if (focusCount !== 1) {
+      return NextResponse.json({ error: 'Exactly one wardrobe item must be marked as focus' }, { status: 400 });
+    }
+
+    // Get active prompt revisions
+    const promptRevisions: Record<string, number> = {};
+    for (const st of APP_CONFIG.shotTypes) {
+      const active = await getActivePrompt(st);
+      if (!active) {
+        return NextResponse.json(
+          { error: `No active prompt found for ${st}. Upload prompts to the vault first.` },
+          { status: 400 }
+        );
+      }
+      promptRevisions[st] = active.revision;
+    }
+
+    // Create job
     const jobId = await createJob({
-      designNumber,
-      jobName: jobName || designNumber,
+      jobName: jobName || `Job ${new Date().toISOString().slice(0, 10)}`,
       creatorEmail,
-      garmentCategory,
-      description,
-      metadata: metadata || {},
-      modelIds: effectiveModelIds,
+      modelId,
+      wardrobe: w,
+      promptRevisions,
     });
 
-    // Store garment image URLs and wardrobe selections on the job document
-    const jobUpdate: Record<string, any> = {};
-    if (flatFrontUrl) jobUpdate.flatFrontUrl = flatFrontUrl;
-    if (flatBackUrl) jobUpdate.flatBackUrl = flatBackUrl;
-    if (wardrobeItemIds && Object.keys(wardrobeItemIds).length > 0) {
-      jobUpdate.wardrobeItemIds = wardrobeItemIds;
-    }
-    if (Object.keys(jobUpdate).length > 0) {
-      await jobsCol.doc(jobId).update(jobUpdate);
-    }
+    console.log(`[Job] Created job ${jobId}`);
 
-    // ── Auto-save garment as wardrobe item ──
-    // When images are uploaded, automatically create/update a wardrobe item
-    // so the garment can be reused across future jobs without re-uploading.
-    const wardrobeCategory = GARMENT_TO_WARDROBE[garmentCategory];
-    if (wardrobeCategory && flatFrontUrl) {
-      try {
-        // Check if a wardrobe item for this design number already exists
-        const existing = await wardrobeCol
-          .where('name', '==', designNumber)
-          .limit(1)
-          .get();
+    // ── Run silhouette analysis ──
+    // Find the focus garment and download its images
+    const focusSlot = Object.entries(w).find(([, v]) => v.isFocus)!;
+    const focusItem = await getWardrobeItem(focusSlot[1].itemId) as any;
 
-        if (existing.empty) {
-          // Create new wardrobe item using the already-uploaded GCS URLs (no re-upload)
-          const garmentWardrobeId = await createWardrobeItem({
-            name: designNumber,
-            category: wardrobeCategory,
-            description: description.slice(0, 400),
-            fitModelUrls: [],
-            flatFrontUrl: flatFrontUrl || undefined,
-            flatBackUrl: flatBackUrl || undefined,
-            thumbnailUrl: flatFrontUrl || '',
-          });
-          await jobsCol.doc(jobId).update({ garmentWardrobeId });
-          console.log(`[Job] Auto-created wardrobe item ${garmentWardrobeId} for ${designNumber}`);
-        } else {
-          // Update existing item with fresh images if we have them
-          const existingId = existing.docs[0].id;
-          const wardrobeUpdate: Record<string, any> = { updatedAt: new Date() };
-          if (flatFrontUrl) {
-            wardrobeUpdate.flatFrontUrl = flatFrontUrl;
-            wardrobeUpdate.thumbnailUrl = flatFrontUrl;
-          }
-          if (flatBackUrl) wardrobeUpdate.flatBackUrl = flatBackUrl;
-          await wardrobeCol.doc(existingId).update(wardrobeUpdate);
-          await jobsCol.doc(jobId).update({ garmentWardrobeId: existingId });
-          console.log(`[Job] Updated wardrobe item ${existingId} for ${designNumber}`);
-        }
-      } catch (wardrobeErr) {
-        // Non-blocking — wardrobe failure must not break job creation
-        console.error('[Job] Auto-wardrobe save failed (non-blocking):', wardrobeErr);
-      }
+    if (!focusItem?.fitModels || !focusItem?.flatFrontUrl) {
+      return NextResponse.json(
+        { error: 'Focus garment must have fit model images and at least a flat front image' },
+        { status: 400 }
+      );
     }
 
-    // Create shot records for each model × shot type
-    // v40: Only M03 is queued — all others are held until user activates them
+    const fitModels: FitModelAngles = focusItem.fitModels;
+
+    try {
+      console.log(`[Job] Running silhouette analysis for ${focusItem.name}...`);
+
+      // Download all 6 fit model images + flats
+      const [
+        frontBuf, front45LBuf, front45RBuf,
+        backBuf, back45LBuf, back45RBuf,
+        flatFrontBuf, flatBackBuf,
+      ] = await Promise.all([
+        downloadGarmentImage(fitModels.front.split('?')[0]),
+        downloadGarmentImage(fitModels.front45Left.split('?')[0]),
+        downloadGarmentImage(fitModels.front45Right.split('?')[0]),
+        downloadGarmentImage(fitModels.back.split('?')[0]),
+        downloadGarmentImage(fitModels.back45Left.split('?')[0]),
+        downloadGarmentImage(fitModels.back45Right.split('?')[0]),
+        downloadGarmentImage(focusItem.flatFrontUrl.split('?')[0]),
+        focusItem.flatBackUrl
+          ? downloadGarmentImage(focusItem.flatBackUrl.split('?')[0])
+          : Promise.resolve(null),
+      ]);
+
+      const silhouette = await analyzeSilhouette({
+        flatFront: flatFrontBuf,
+        flatBack: flatBackBuf,
+        frontAngles: [frontBuf, front45LBuf, front45RBuf],
+        backAngles: [backBuf, back45LBuf, back45RBuf],
+      });
+
+      // Store silhouette results on the job
+      await updateJob(jobId, { silhouetteAnalysis: silhouette });
+      console.log(`[Job] Silhouette analysis complete`);
+    } catch (silErr) {
+      console.error(`[Job] Silhouette analysis failed:`, silErr);
+      // Continue without silhouette — generation will work but less accurate
+      await updateJob(jobId, {
+        silhouetteAnalysis: { front: '', back: '' },
+        silhouetteError: String(silErr),
+      });
+    }
+
+    // ── Create shot records ──
+    // All 5 shots created as 'pending'. The worker processes them in dependency order.
     const shotIds: string[] = [];
-    for (const modelId of effectiveModelIds) {
-      const modelDesc = modelDescriptions?.[modelId] || '';
-
-      for (const [shotKey, shotDescription] of Object.entries(SHOT_DESCRIPTIONS)) {
-        const shotType = shotKey.replace('-A', '').replace('-B', '');
-        const variant = shotKey.includes('-B') ? 'B' : 'A';
-
-        const prompt = buildGenerationPrompt({
-          modelDescription: modelDesc,
-          garmentDescription: description,
-          shotDescription,
-          garmentCategory,
-          metadata: metadata || {},
-          shotType,
-        });
-
-        // v40: ONLY M03 generates immediately — everything else waits for user activation
-        const initialStatus = shotType === 'M03' ? 'queued' : 'held';
-
-        const shotId = await createShot({
-          jobId,
-          modelId,
-          shotType,
-          variant,
-          prompt,
-          status: initialStatus,
-        });
-        shotIds.push(shotId);
-      }
+    for (const shotType of APP_CONFIG.shotTypes) {
+      const shotId = await createShot({
+        jobId,
+        modelId,
+        shotType,
+        prompt: '', // prompt loaded from vault at generation time
+        promptRevision: promptRevisions[shotType],
+        status: 'pending',
+      });
+      shotIds.push(shotId);
     }
 
-    // Update job status to generating
+    // Update job status and enqueue
     await updateJobStatus(jobId, 'generating');
+    const enqueueResult = await enqueueJob(jobId, jobName || jobId);
+    console.log(`[Job] Enqueued: slot=${enqueueResult.slot}, position=${enqueueResult.position}`);
 
-    // Enqueue the job in the worker queue and kick the worker
-    const jName = (jobName || designNumber) as string;
-    const enqueueResult = await enqueueJob(jobId, jName);
-    console.log(`[Job] Enqueued job ${jobId} ("${jName}"): slot=${enqueueResult.slot}, position=${enqueueResult.position}`);
-
-    console.log(`[Job] Created ${shotIds.length} shots for job ${jobId}. Kicking worker...`);
-
-    // v37: Respond to client FIRST, then kick worker.
-    // The worker kick is a separate internal request that keeps the Cloud Run container alive.
-    // We must NOT await it here — process-queue blocks until generation completes (minutes).
-    // Using fetch().catch() is safe here because the RESPONSE has already been sent,
-    // and the internal fetch creates a new request that keeps the container running.
+    // ── Respond then fire worker ──
     const response = NextResponse.json({
       success: true,
       jobId,
       shotsCreated: shotIds.length,
+      slot: enqueueResult.slot,
+      position: enqueueResult.position,
     });
 
-    // Fire the worker kick AFTER building the response — don't await it
+    // Fire worker kick AFTER building response — DO NOT AWAIT
     fetch(`${getInternalBase()}/api/jobs/process-queue`, { method: 'POST' })
-      .then(res => console.log(`[Job] Worker kick response: ${res.status}`))
+      .then(res => console.log(`[Job] Worker kick: ${res.status}`))
       .catch(err => console.warn(`[Job] Worker kick failed (non-blocking):`, err));
 
     return response;
   } catch (error) {
     console.error('Error creating job:', error);
-    return NextResponse.json({ error: 'Failed to create job' }, { status: 500 });
+    return NextResponse.json({ error: 'Failed to create job', details: String(error) }, { status: 500 });
   }
 }

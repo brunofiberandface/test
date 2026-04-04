@@ -1,9 +1,11 @@
+/**
+ * POST /api/jobs/[id]/clone — clone a job (v2 Pro pipeline).
+ * Copies wardrobe selections, model, and prompt revisions from the original.
+ */
 import { NextRequest, NextResponse } from 'next/server';
-import { getJob, listJobs, jobsCol, createShot, updateJobStatus } from '@/lib/firestore';
-import { buildGenerationPrompt } from '@/lib/prompts';
-import { SHOT_DESCRIPTIONS } from '@/lib/config';
+import { getJob, listJobs, jobsCol, createShot, updateJobStatus, getActivePrompt } from '@/lib/firestore';
+import { APP_CONFIG } from '@/lib/config';
 
-// POST /api/jobs/[id]/clone — clone a job with auto-incremented name
 export async function POST(
   req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
@@ -13,61 +15,55 @@ export async function POST(
     const original = await getJob(id) as any;
     if (!original) return NextResponse.json({ error: 'Job not found' }, { status: 404 });
 
-    const baseName = original.designNumber || 'Job';
-
-    // Strip existing " Clone N" suffix to get the true base name
+    const baseName = original.jobName || 'Job';
     const cleanBase = baseName.replace(/ Clone \d+$/, '');
 
-    // Find the highest existing clone number for this base name
+    // Find highest clone number
     const allJobs = await listJobs();
     const clonePattern = new RegExp(`^${cleanBase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} Clone (\\d+)$`);
     let maxClone = 0;
     for (const j of allJobs as any[]) {
-      const match = (j.designNumber || '').match(clonePattern);
+      const match = (j.jobName || '').match(clonePattern);
       if (match) maxClone = Math.max(maxClone, parseInt(match[1], 10));
     }
     const cloneName = `${cleanBase} Clone ${maxClone + 1}`;
 
-    // Create the cloned job document
+    // Get current active prompt revisions
+    const promptRevisions: Record<string, number> = {};
+    for (const st of APP_CONFIG.shotTypes) {
+      const active = await getActivePrompt(st);
+      promptRevisions[st] = active?.revision || 1;
+    }
+
+    // Create cloned job
     const ref = jobsCol.doc();
     const newJobId = ref.id;
     await ref.set({
       jobId: newJobId,
-      designNumber: cloneName,
+      jobName: cloneName,
       creatorEmail: original.creatorEmail || '',
-      garmentCategory: original.garmentCategory || 'pants',
-      description: original.description || '',
-      metadata: original.metadata || {},
-      modelIds: original.modelIds || [],
-      flatImageUrl: original.flatImageUrl || '',
-      image360Urls: original.image360Urls || [],
-      wardrobeItemIds: original.wardrobeItemIds || {},
-      status: 'generating',
+      modelId: original.modelId || '',
+      wardrobe: original.wardrobe || {},
+      promptRevisions,
+      status: 'pending',
       clonedFrom: id,
       createdAt: new Date(),
       updatedAt: new Date(),
     });
 
-    // Create shot records for each model × shot type (same as original job creation)
-    const modelDescriptions: Record<string, string> = original.modelDescriptions || {};
-    for (const modelId of (original.modelIds || [])) {
-      const modelDesc = modelDescriptions[modelId] || '';
-      for (const [shotKey, shotDescription] of Object.entries(SHOT_DESCRIPTIONS)) {
-        const shotType = shotKey.replace('-A', '').replace('-B', '');
-        const variant = shotKey.includes('-B') ? 'B' : 'A';
-        const prompt = buildGenerationPrompt({
-          modelDescription: modelDesc,
-          garmentDescription: original.description || '',
-          shotDescription: shotDescription as string,
-          garmentCategory: original.garmentCategory || 'pants',
-          metadata: original.metadata || {},
-          shotType,
-        });
-        await createShot({ jobId: newJobId, modelId, shotType, variant, prompt });
-      }
+    // Create shot records
+    for (const shotType of APP_CONFIG.shotTypes) {
+      await createShot({
+        jobId: newJobId,
+        modelId: original.modelId || '',
+        shotType,
+        prompt: '',
+        promptRevision: promptRevisions[shotType],
+        status: 'pending',
+      });
     }
 
-    return NextResponse.json({ success: true, jobId: newJobId, designNumber: cloneName });
+    return NextResponse.json({ success: true, jobId: newJobId, jobName: cloneName });
   } catch (error) {
     console.error('Clone error:', error);
     return NextResponse.json({ error: 'Clone failed' }, { status: 500 });

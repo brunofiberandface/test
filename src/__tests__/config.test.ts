@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { APP_CONFIG, SHOT_DESCRIPTIONS } from '@/lib/config';
+import { APP_CONFIG } from '@/lib/config';
 
 describe('APP_CONFIG', () => {
   it('shotTypes has exactly 5 entries', () => {
@@ -14,69 +14,31 @@ describe('APP_CONFIG', () => {
     expect(APP_CONFIG.shotTypes).toContain('M05');
   });
 
-  it('m03Variants has A', () => {
-    expect(APP_CONFIG.m03Variants).toContain('A');
+  it('generationModel is defined', () => {
+    expect(APP_CONFIG.generationModel).toBeDefined();
+    expect(APP_CONFIG.generationModel).toBe('gemini-3-pro-image-preview');
   });
 
-  it('geminiModel is defined and non-empty', () => {
-    expect(APP_CONFIG.geminiModel).toBeDefined();
-    expect(typeof APP_CONFIG.geminiModel).toBe('string');
-    expect(APP_CONFIG.geminiModel.length).toBeGreaterThan(0);
+  it('analysisModel is defined', () => {
+    expect(APP_CONFIG.analysisModel).toBeDefined();
+    expect(APP_CONFIG.analysisModel).toBe('gemini-2.5-flash-lite');
   });
 
-  it('imageWidth is positive', () => {
-    expect(APP_CONFIG.imageWidth).toBeGreaterThan(0);
+  it('imageSize is 4K', () => {
+    expect(APP_CONFIG.imageSize).toBe('4K');
   });
 
-  it('imageHeight is positive', () => {
-    expect(APP_CONFIG.imageHeight).toBeGreaterThan(0);
+  it('shotOrder defines dependency chain starting with M03', () => {
+    expect(APP_CONFIG.shotOrder[0]).toBe('M03');
+    expect(APP_CONFIG.shotOrder).toHaveLength(5);
   });
 
-  it('imageWidth and imageHeight are reasonable (typical 2K dimensions)', () => {
-    expect(APP_CONFIG.imageWidth).toBeGreaterThanOrEqual(1024);
-    expect(APP_CONFIG.imageHeight).toBeGreaterThanOrEqual(1024);
-  });
-
-  it('imageAspectRatio is set', () => {
-    expect(APP_CONFIG.imageAspectRatio).toBeDefined();
-    expect(APP_CONFIG.imageAspectRatio).toBe('3:4');
-  });
-});
-
-describe('SHOT_DESCRIPTIONS', () => {
-  it('M01 is defined', () => {
-    expect(SHOT_DESCRIPTIONS.M01).toBeDefined();
-  });
-
-  it('M02 is defined', () => {
-    expect(SHOT_DESCRIPTIONS.M02).toBeDefined();
-  });
-
-  it('M03 is defined', () => {
-    expect(SHOT_DESCRIPTIONS.M03).toBeDefined();
-  });
-
-  it('M04 is defined', () => {
-    expect(SHOT_DESCRIPTIONS.M04).toBeDefined();
-  });
-
-  it('M05 is defined', () => {
-    expect(SHOT_DESCRIPTIONS.M05).toBeDefined();
-  });
-
-  it('M05 description mentions DETAIL SHOT', () => {
-    expect(SHOT_DESCRIPTIONS.M05).toMatch(/DETAIL SHOT|CLOSE-UP|back pocket/i);
-  });
-
-  it('M03 description mentions FRONT-FACING', () => {
-    expect(SHOT_DESCRIPTIONS.M03).toMatch(/FRONT-FACING|front-facing/i);
-  });
-
-  it('all shot descriptions are non-empty strings', () => {
-    Object.entries(SHOT_DESCRIPTIONS).forEach(([key, description]) => {
-      expect(description).toBeDefined();
-      expect(typeof description).toBe('string');
-      expect(description.length).toBeGreaterThan(0);
-    });
+  it('shot metadata defines dependencies correctly', () => {
+    expect(APP_CONFIG.shots.M03.dependsOn).toHaveLength(0);
+    expect(APP_CONFIG.shots.M04.dependsOn).toContain('M03');
+    expect(APP_CONFIG.shots.M01.dependsOn).toContain('M03');
+    expect(APP_CONFIG.shots.M02.dependsOn).toContain('M04');
+    expect(APP_CONFIG.shots.M05.dependsOn).toContain('M03');
+    expect(APP_CONFIG.shots.M05.dependsOn).toContain('M04');
   });
 });

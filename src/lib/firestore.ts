@@ -1,10 +1,9 @@
 import { Firestore, FieldValue } from '@google-cloud/firestore';
 import crypto from 'crypto';
 
-// Initialize Firestore — uses Application Default Credentials on Cloud Run
-// For local dev, set GOOGLE_APPLICATION_CREDENTIALS env var
+// Initialize Firestore
 export const db = new Firestore({
-  projectId: process.env.FIRESTORE_PROJECT_ID || process.env.GCP_PROJECT_ID,
+  projectId: process.env.GCP_PROJECT || 'gstar-ai-studio',
 });
 
 // ── Collections ──
@@ -13,10 +12,10 @@ export const modelsCol = db.collection('models');
 export const jobsCol = db.collection('jobs');
 export const shotsCol = db.collection('shots');
 export const modificationsCol = db.collection('modifications');
-export const promptAdjustmentsCol = db.collection('promptAdjustments');
 export const otpCol = db.collection('otpCodes');
 export const wardrobeCol = db.collection('wardrobe');
 export const commentsCol = db.collection('comments');
+export const promptVaultCol = db.collection('promptVault');
 
 // ── User operations ──
 export async function getUser(email: string) {
@@ -100,7 +99,7 @@ export async function storeOTP(email: string, code: string) {
   await otpCol.doc(email).set({
     code,
     createdAt: new Date(),
-    expiresAt: new Date(Date.now() + 5 * 60 * 1000), // 5 minutes
+    expiresAt: new Date(Date.now() + 5 * 60 * 1000),
   });
 }
 
@@ -110,18 +109,16 @@ export async function verifyOTP(email: string, code: string): Promise<boolean> {
   const data = doc.data()!;
   if (data.code !== code) return false;
   if (new Date() > data.expiresAt.toDate()) return false;
-  // Delete after successful verification
   await otpCol.doc(email).delete();
   return true;
 }
 
-// ── Model operations ──
+// ── Model operations (v2: single reference image) ──
 export async function listModels(activeOnly = true) {
   const snap = activeOnly
     ? await modelsCol.where('active', '==', true).get()
     : await modelsCol.get();
   const models = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-  // Sort by modelId in memory to avoid composite index requirement
   return models.sort((a: any, b: any) => (a.modelId || a.id).localeCompare(b.modelId || b.id));
 }
 
@@ -133,7 +130,7 @@ export async function getModel(modelId: string) {
 export async function createModel(modelId: string, data: {
   name: string;
   description: string;
-  cardImageUrl: string;
+  referenceImageUrl: string;
   gender: 'male' | 'female';
   createdBy: string;
 }) {
@@ -145,21 +142,32 @@ export async function createModel(modelId: string, data: {
   });
 }
 
-// ── Job operations ──
-export async function createJob(data: {
-  designNumber: string;
-  jobName?: string;
-  creatorEmail: string;
-  garmentCategory: string;
+export async function updateModel(modelId: string, data: Partial<{
+  name: string;
   description: string;
-  metadata: Record<string, string>;
-  modelIds: string[];
+  referenceImageUrl: string;
+  active: boolean;
+}>) {
+  await modelsCol.doc(modelId).update({ ...data, updatedAt: new Date() });
+}
+
+// ── Job operations (v2: structured wardrobe + prompt revisions) ──
+export async function createJob(data: {
+  jobName: string;
+  creatorEmail: string;
+  modelId: string;
+  wardrobe: {
+    shoe: { itemId: string; isFocus: boolean };
+    top: { itemId: string; isFocus: boolean };
+    bottom: { itemId: string; isFocus: boolean };
+  };
+  promptRevisions: Record<string, number>;
 }) {
   const ref = jobsCol.doc();
   await ref.set({
     jobId: ref.id,
     ...data,
-    status: 'uploading',
+    status: 'pending',
     createdAt: new Date(),
     updatedAt: new Date(),
   });
@@ -187,7 +195,6 @@ export async function listJobs(creatorEmail?: string) {
     return {
       id: d.id,
       ...data,
-      // Convert Firestore Timestamps to ISO strings for JSON serialization
       createdAt: data.createdAt?.toDate?.() ? data.createdAt.toDate().toISOString() : data.createdAt,
       updatedAt: data.updatedAt?.toDate?.() ? data.updatedAt.toDate().toISOString() : data.updatedAt,
     };
@@ -196,6 +203,10 @@ export async function listJobs(creatorEmail?: string) {
 
 export async function updateJobStatus(jobId: string, status: string) {
   await jobsCol.doc(jobId).update({ status, updatedAt: new Date() });
+}
+
+export async function updateJob(jobId: string, data: Record<string, any>) {
+  await jobsCol.doc(jobId).update({ ...data, updatedAt: new Date() });
 }
 
 export async function archiveJob(jobId: string, archived: boolean = true) {
@@ -207,20 +218,16 @@ export async function archiveJob(jobId: string, archived: boolean = true) {
 }
 
 export async function deleteJob(jobId: string) {
-  // Delete all shots for this job
   const shotsSnap = await shotsCol.where('jobId', '==', jobId).get();
   const batch = db.batch();
   shotsSnap.docs.forEach(doc => batch.delete(doc.ref));
-  // Delete all modifications for shots in this job
   const modsSnap = await modificationsCol.where('jobId', '==', jobId).get();
   modsSnap.docs.forEach(doc => batch.delete(doc.ref));
-  // Delete the job itself
   batch.delete(jobsCol.doc(jobId));
   await batch.commit();
 }
 
 export async function deleteJobs(jobIds: string[]) {
-  // Firestore batch limit is 500 — chunk if needed
   const allDeletes: Array<{ ref: FirebaseFirestore.DocumentReference }> = [];
   for (const jobId of jobIds) {
     allDeletes.push({ ref: jobsCol.doc(jobId) });
@@ -229,7 +236,6 @@ export async function deleteJobs(jobIds: string[]) {
     const modsSnap = await modificationsCol.where('jobId', '==', jobId).get();
     modsSnap.docs.forEach(doc => allDeletes.push({ ref: doc.ref }));
   }
-  // Execute in chunks of 500
   for (let i = 0; i < allDeletes.length; i += 500) {
     const chunk = allDeletes.slice(i, i + 500);
     const batch = db.batch();
@@ -241,8 +247,8 @@ export async function deleteJobs(jobIds: string[]) {
 // ── Comment operations ──
 export async function createComment(data: {
   jobId: string;
-  shotId?: string;       // optional — null = job-level comment
-  shotType?: string;     // e.g. 'M01', for display
+  shotId?: string;
+  shotType?: string;
   authorEmail: string;
   authorName: string;
   text: string;
@@ -280,8 +286,8 @@ export async function createShot(data: {
   jobId: string;
   modelId: string;
   shotType: string;
-  variant: string;
   prompt: string;
+  promptRevision: number;
   status?: string;
 }) {
   const ref = shotsCol.doc();
@@ -290,7 +296,7 @@ export async function createShot(data: {
     shotId: ref.id,
     ...rest,
     version: 1,
-    status: initialStatus || 'queued',
+    status: initialStatus || 'pending',
     createdAt: new Date(),
   });
   return ref.id;
@@ -312,10 +318,10 @@ export async function listShots(jobId: string) {
 export async function updateShot(shotId: string, data: Partial<{
   status: string;
   imageUrl: string;
-  driveFileId: string;
   version: number;
   progressStep: string;
   progressPct: number;
+  prompt: string;
 }>) {
   await shotsCol.doc(shotId).update({ ...data, updatedAt: new Date() });
 }
@@ -339,33 +345,25 @@ export async function logModification(data: {
 }
 
 // ── Wardrobe operations ──
-export async function createWardrobeItem(data: {
+// Accepts both v1 (fitModelUrls array) and v2 (fitModels labeled angles) formats.
+// v2 format will be enforced once wardrobe UI is rebuilt.
+export async function createWardrobeItem(data: Record<string, any> & {
   name: string;
   category: string;
-  gender?: 'male' | 'female' | 'unisex';
   description: string;
-  fitModelUrls: string[];
-  flatFrontUrl?: string;
-  flatBackUrl?: string;
-  thumbnailUrl: string;
-  isPrimary?: boolean;
-  openShoes?: boolean;
-  hasHeels?: boolean;
 }) {
   const ref = wardrobeCol.doc();
-  // Default: shoes = styling item (false), everything else = focus garment (true)
-  const isPrimary = data.isPrimary !== undefined ? data.isPrimary : data.category !== 'shoes';
-  // Default gender: shoes = unisex, others = unisex if not specified
-  const gender = data.gender || 'unisex';
   await ref.set({
     wardrobeId: ref.id,
     ...data,
-    gender,
-    isPrimary,
     createdAt: new Date(),
     updatedAt: new Date(),
   });
   return ref.id;
+}
+
+export async function updateWardrobeItem(wardrobeId: string, data: Record<string, any>) {
+  await wardrobeCol.doc(wardrobeId).update({ ...data, updatedAt: new Date() });
 }
 
 export async function listWardrobeItems(category?: string) {
@@ -399,80 +397,140 @@ export async function deleteWardrobeItem(wardrobeId: string) {
   await wardrobeCol.doc(wardrobeId).delete();
 }
 
-// ── Dressed Base operations ──
-// A "dressed base" is a pre-rendered model card showing the model wearing a specific wardrobe combo.
-// Doc ID = `${modelId}_${wardrobeHash}_${view}` — deterministic, no composite index needed.
-// Supports 4 views: front (0°), right (90°), back (180°), left (270°)
-export type DressedView = 'front' | 'right' | 'back' | 'left';
-export const dressedBasesCol = db.collection('dressedBases');
+// ── Prompt Vault operations ──
 
-export async function createDressedBase(data: {
-  modelId: string;
-  wardrobeItemIds: Record<string, string>;
-  wardrobeHash: string;
-  view: DressedView;
-  imageUrl: string;
-  wardrobeItemNames: Record<string, string>;
-  qcScore?: number;
-  qcPass?: boolean;
-}) {
-  const docId = `${data.modelId}_${data.wardrobeHash}_${data.view}`;
-  await dressedBasesCol.doc(docId).set({
-    ...data,
-    createdAt: new Date(),
-    updatedAt: new Date(),
+/**
+ * Upload a new prompt file revision.
+ * Auto-increments revision number. Old revisions become inactive.
+ */
+export async function uploadPromptFile(data: {
+  filename: string;
+  shotType: string;
+  category?: string;
+  content: string;
+  gcsUrl: string;
+  uploadedBy: string;
+  silhouettePrompt?: string;
+  generationPrompt?: string;
+}): Promise<{ id: string; revision: number }> {
+  // Find the latest revision for this shot type (and optional category)
+  let query: FirebaseFirestore.Query = promptVaultCol
+    .where('shotType', '==', data.shotType)
+    .orderBy('revision', 'desc')
+    .limit(1);
+  if (data.category) {
+    query = promptVaultCol
+      .where('shotType', '==', data.shotType)
+      .where('category', '==', data.category)
+      .orderBy('revision', 'desc')
+      .limit(1);
+  }
+
+  const snap = await query.get();
+  const latestRevision = snap.empty ? 0 : (snap.docs[0].data().revision || 0);
+  const newRevision = latestRevision + 1;
+
+  // Deactivate all previous active revisions for this shot type
+  const activeSnap = await promptVaultCol
+    .where('shotType', '==', data.shotType)
+    .where('isActive', '==', true)
+    .get();
+  const batch = db.batch();
+  activeSnap.docs.forEach(doc => {
+    // Only deactivate matching category (or all if no category)
+    const docData = doc.data();
+    if (!data.category || docData.category === data.category) {
+      batch.update(doc.ref, { isActive: false });
+    }
   });
-  return docId;
+
+  // Create new revision
+  const ref = promptVaultCol.doc();
+  batch.set(ref, {
+    id: ref.id,
+    ...data,
+    revision: newRevision,
+    isActive: true,
+    uploadedAt: new Date(),
+  });
+
+  await batch.commit();
+  return { id: ref.id, revision: newRevision };
 }
 
-export async function findDressedBase(modelId: string, wardrobeHash: string, view: DressedView = 'front') {
-  const docId = `${modelId}_${wardrobeHash}_${view}`;
-  const doc = await dressedBasesCol.doc(docId).get();
+/**
+ * Get the active prompt file for a shot type.
+ */
+export async function getActivePrompt(shotType: string, category?: string): Promise<any | null> {
+  let query: FirebaseFirestore.Query = promptVaultCol
+    .where('shotType', '==', shotType)
+    .where('isActive', '==', true);
+  if (category) {
+    query = query.where('category', '==', category);
+  }
+  const snap = await query.limit(1).get();
+  if (snap.empty) return null;
+  const data = snap.docs[0].data();
+  return { id: snap.docs[0].id, ...data };
+}
+
+/**
+ * List all prompt files (optionally filtered by shot type).
+ */
+export async function listPromptFiles(shotType?: string) {
+  let query: FirebaseFirestore.Query = promptVaultCol.orderBy('uploadedAt', 'desc');
+  if (shotType) {
+    query = promptVaultCol
+      .where('shotType', '==', shotType)
+      .orderBy('uploadedAt', 'desc');
+  }
+  const snap = await query.get();
+  return snap.docs.map(d => {
+    const data = d.data();
+    return {
+      id: d.id,
+      ...data,
+      uploadedAt: data.uploadedAt?.toDate?.() ? data.uploadedAt.toDate().toISOString() : data.uploadedAt,
+    };
+  });
+}
+
+/**
+ * Get a specific prompt file by ID.
+ */
+export async function getPromptFile(id: string) {
+  const doc = await promptVaultCol.doc(id).get();
   if (!doc.exists) return null;
   const data = doc.data()!;
-  return {
-    id: doc.id,
-    ...data,
-    createdAt: data.createdAt?.toDate?.() ? data.createdAt.toDate().toISOString() : data.createdAt,
-  };
+  return { id: doc.id, ...data };
 }
 
-/** Returns all 4 view docs for a given model + wardrobeHash combo */
-export async function getDressedBaseViews(modelId: string, wardrobeHash: string) {
-  const snap = await dressedBasesCol
-    .where('modelId', '==', modelId)
-    .where('wardrobeHash', '==', wardrobeHash)
+/**
+ * Set a specific revision as active (revert).
+ */
+export async function setActivePromptRevision(id: string): Promise<void> {
+  const doc = await promptVaultCol.doc(id).get();
+  if (!doc.exists) throw new Error('Prompt file not found');
+  const data = doc.data()!;
+
+  // Deactivate current active for this shot type + category
+  const activeSnap = await promptVaultCol
+    .where('shotType', '==', data.shotType)
+    .where('isActive', '==', true)
     .get();
-  return snap.docs.map(d => {
-    const data = d.data();
-    return {
-      id: d.id,
-      ...data,
-      createdAt: data.createdAt?.toDate?.() ? data.createdAt.toDate().toISOString() : data.createdAt,
-    };
+  const batch = db.batch();
+  activeSnap.docs.forEach(d => {
+    if (!data.category || d.data().category === data.category) {
+      batch.update(d.ref, { isActive: false });
+    }
   });
-}
 
-export async function listDressedBases(modelId: string) {
-  const snap = await dressedBasesCol.where('modelId', '==', modelId).get();
-  return snap.docs.map(d => {
-    const data = d.data();
-    return {
-      id: d.id,
-      ...data,
-      createdAt: data.createdAt?.toDate?.() ? data.createdAt.toDate().toISOString() : data.createdAt,
-    };
-  }).sort((a: any, b: any) => (b.createdAt || '').localeCompare(a.createdAt || ''));
-}
-
-export async function deleteDressedBase(docId: string) {
-  await dressedBasesCol.doc(docId).delete();
+  // Activate the target revision
+  batch.update(doc.ref, { isActive: true });
+  await batch.commit();
 }
 
 // ── Generation Queue v2 ──
-// Server-side worker with 2 parallel slots.
-// No SSE streams, no browser dependency. Worker runs server-side and
-// processes jobs to completion. Cloud Scheduler pings every 3 min as safety net.
 
 const QUEUE_DOC = db.collection('system').doc('generationQueue');
 const MAX_SLOTS = 2;
@@ -487,19 +545,18 @@ export interface SlotState {
   jobId: string;
   jobName: string;
   startedAt: string;
-  currentShot: string | null;  // e.g. "M03_A" — what's generating right now
-  retryPass: number;           // 0 = first pass, 1 = retry pass 1, 2 = retry pass 2
+  currentShot: string | null;
+  retryPass: number;
 }
 
 export interface QueueStateV2 {
-  slots: (SlotState | null)[];  // always length 2
+  slots: (SlotState | null)[];
   queue: QueueEntry[];
   workerHeartbeat: string | null;
   workerActive: boolean;
   updatedAt: string;
 }
 
-// Back-compat: keep old interface name for any remaining imports
 export type QueueState = QueueStateV2;
 
 function emptyState(): QueueStateV2 {
@@ -512,9 +569,6 @@ function emptyState(): QueueStateV2 {
   };
 }
 
-/** Strip legacy single-slot fields from a raw Firestore document before writing back.
- *  The old schema had: activeJobId, activeJobName, activeStartedAt, activeHeartbeat.
- *  These ghost fields cause the dashboard to show a stuck job even when v2 slots are empty. */
 function cleanV2State(raw: any): QueueStateV2 {
   return {
     slots: raw.slots || [null, null],
@@ -525,48 +579,27 @@ function cleanV2State(raw: any): QueueStateV2 {
   };
 }
 
-/** Get current queue state */
 export async function getQueueState(): Promise<QueueStateV2> {
   const doc = await QUEUE_DOC.get();
   if (!doc.exists) return emptyState();
   const data = doc.data() as QueueStateV2;
-  // Migration: if old single-slot schema, convert AND persist to clear legacy fields
   if (!data.slots) {
-    const old = data as any;
     const migrated = emptyState();
-    if (old.activeJobId) {
-      migrated.slots[0] = {
-        jobId: old.activeJobId,
-        jobName: old.activeJobName || '',
-        startedAt: old.activeStartedAt || new Date().toISOString(),
-        currentShot: null,
-        retryPass: 0,
-      };
-    }
-    migrated.queue = old.queue || [];
-    migrated.updatedAt = old.updatedAt || new Date().toISOString();
-    // v35: Persist migration — overwrites entire doc, clearing legacy fields
-    // (activeJobId, activeJobName, activeStartedAt, activeHeartbeat)
     try {
       await QUEUE_DOC.set(migrated);
-      console.log('[Queue] Migrated single-slot schema to v2 and persisted');
     } catch (e) {
-      console.warn('[Queue] Migration persist failed (non-blocking):', e);
+      console.warn('[Queue] Migration persist failed:', e);
     }
     return migrated;
   }
-  // Ensure slots array is always length 2
   while (data.slots.length < MAX_SLOTS) data.slots.push(null);
   return data;
 }
 
-/** Hard-reset the queue document to a clean empty state. Clears all legacy fields. */
 export async function resetQueueState(): Promise<void> {
   await QUEUE_DOC.set(emptyState());
-  console.log('[Queue] Queue state hard-reset to empty');
 }
 
-/** Update worker heartbeat — called by the worker loop after each shot */
 export async function updateWorkerHeartbeat(): Promise<void> {
   try {
     await QUEUE_DOC.update({
@@ -578,28 +611,21 @@ export async function updateWorkerHeartbeat(): Promise<void> {
   }
 }
 
-/** Claim worker role. Returns true if this caller should run the worker loop. */
 export async function claimWorker(): Promise<boolean> {
   return db.runTransaction(async (tx) => {
     const doc = await tx.get(QUEUE_DOC);
     const state: QueueStateV2 = doc.exists ? (doc.data() as QueueStateV2) : emptyState();
-
-    // Migration guard
     if (!state.slots) Object.assign(state, emptyState());
 
     const now = Date.now();
-    const STALE_MS = 5 * 60 * 1000; // 5 min — worker is dead if no heartbeat
+    const STALE_MS = 5 * 60 * 1000;
 
-    // If worker is active and heartbeat is fresh, another worker is running
     if (state.workerActive && state.workerHeartbeat) {
       const age = now - new Date(state.workerHeartbeat).getTime();
-      if (age < STALE_MS) {
-        return false; // Another worker is alive
-      }
-      console.log(`[Queue] Stale worker detected (heartbeat ${Math.round(age / 60000)}min old) — claiming`);
+      if (age < STALE_MS) return false;
+      console.log(`[Queue] Stale worker detected (${Math.round(age / 60000)}min) — claiming`);
     }
 
-    // Claim worker role
     state.workerActive = true;
     state.workerHeartbeat = new Date().toISOString();
     state.updatedAt = new Date().toISOString();
@@ -608,7 +634,6 @@ export async function claimWorker(): Promise<boolean> {
   });
 }
 
-/** Release worker role (called when worker loop exits) */
 export async function releaseWorker(): Promise<void> {
   try {
     await QUEUE_DOC.update({
@@ -621,25 +646,18 @@ export async function releaseWorker(): Promise<void> {
   }
 }
 
-/**
- * Add a job to the queue. If a slot is free, assigns directly.
- * Returns the slot index (0 or 1) if assigned, or queue position if queued.
- */
 export async function enqueueJob(jobId: string, jobName: string): Promise<{ slot: number | null; position: number }> {
   return db.runTransaction(async (tx) => {
     const doc = await tx.get(QUEUE_DOC);
-    const state: QueueStateV2 = doc.exists ? cleanV2State(doc.data()) : emptyState(); // v35: strip legacy fields
+    const state: QueueStateV2 = doc.exists ? cleanV2State(doc.data()) : emptyState();
     while (state.slots.length < MAX_SLOTS) state.slots.push(null);
 
-    // Already in a slot?
     const existingSlot = state.slots.findIndex(s => s && s.jobId === jobId);
     if (existingSlot !== -1) return { slot: existingSlot, position: 0 };
 
-    // Already in queue?
     const existingQueue = state.queue.findIndex(e => e.jobId === jobId);
     if (existingQueue !== -1) return { slot: null, position: existingQueue + 1 };
 
-    // Free slot available?
     const freeSlot = state.slots.findIndex(s => s === null);
     if (freeSlot !== -1) {
       state.slots[freeSlot] = {
@@ -654,7 +672,6 @@ export async function enqueueJob(jobId: string, jobName: string): Promise<{ slot
       return { slot: freeSlot, position: 0 };
     }
 
-    // No free slot — add to queue
     state.queue.push({ jobId, jobName, queuedAt: new Date().toISOString() });
     state.updatedAt = new Date().toISOString();
     tx.set(QUEUE_DOC, state);
@@ -662,20 +679,16 @@ export async function enqueueJob(jobId: string, jobName: string): Promise<{ slot
   });
 }
 
-/**
- * Release a slot and fill it from the queue. Called when a job finishes.
- */
 export async function releaseSlot(jobId: string): Promise<QueueEntry | null> {
   return db.runTransaction(async (tx) => {
     const doc = await tx.get(QUEUE_DOC);
     if (!doc.exists) return null;
-    const state = cleanV2State(doc.data()); // v35: strip legacy fields
+    const state = cleanV2State(doc.data());
     if (!state.slots) return null;
 
     const slotIdx = state.slots.findIndex(s => s && s.jobId === jobId);
     if (slotIdx === -1) return null;
 
-    // Pop next from queue
     const next = state.queue.shift() || null;
     if (next) {
       state.slots[slotIdx] = {
@@ -694,7 +707,6 @@ export async function releaseSlot(jobId: string): Promise<QueueEntry | null> {
   });
 }
 
-/** Update the current shot label for a slot (for UI display) */
 export async function updateSlotProgress(jobId: string, currentShot: string): Promise<void> {
   try {
     const doc = await QUEUE_DOC.get();
@@ -709,7 +721,6 @@ export async function updateSlotProgress(jobId: string, currentShot: string): Pr
   } catch { /* non-blocking */ }
 }
 
-/** Increment retry pass for a slot */
 export async function incrementRetryPass(jobId: string): Promise<number> {
   return db.runTransaction(async (tx) => {
     const doc = await tx.get(QUEUE_DOC);
@@ -726,15 +737,13 @@ export async function incrementRetryPass(jobId: string): Promise<number> {
   });
 }
 
-/** Remove a job from queue or slot (e.g. cancelled/deleted) */
 export async function removeFromQueue(jobId: string): Promise<void> {
   return db.runTransaction(async (tx) => {
     const doc = await tx.get(QUEUE_DOC);
     if (!doc.exists) return;
-    const state = cleanV2State(doc.data()); // v35: strip legacy fields
+    const state = cleanV2State(doc.data());
     if (!state.slots) return;
 
-    // Remove from slot
     const slotIdx = state.slots.findIndex(s => s && s.jobId === jobId);
     if (slotIdx !== -1) {
       const next = state.queue.shift() || null;
@@ -751,23 +760,21 @@ export async function removeFromQueue(jobId: string): Promise<void> {
       }
     }
 
-    // Remove from queue
     state.queue = state.queue.filter(e => e.jobId !== jobId);
     state.updatedAt = new Date().toISOString();
     tx.set(QUEUE_DOC, state);
   });
 }
 
-// Legacy exports for gradual migration — these are no-ops or adapters
-export async function acquireGenerationLock(jobId: string, jobName: string): Promise<{ acquired: boolean; position: number }> {
+// Legacy exports (backwards compat)
+export async function acquireGenerationLock(jobId: string, jobName: string) {
   const result = await enqueueJob(jobId, jobName);
   return { acquired: result.slot !== null, position: result.position };
 }
-export async function releaseGenerationLock(jobId: string): Promise<QueueEntry | null> {
+export async function releaseGenerationLock(jobId: string) {
   return releaseSlot(jobId);
 }
-export async function forceReleaseGenerationLock(): Promise<{ released: string | null; next: QueueEntry | null }> {
-  // Release first occupied slot
+export async function forceReleaseGenerationLock() {
   const state = await getQueueState();
   for (const slot of state.slots) {
     if (slot) {
@@ -777,7 +784,7 @@ export async function forceReleaseGenerationLock(): Promise<{ released: string |
   }
   return { released: null, next: null };
 }
-export async function updateQueueHeartbeat(jobId: string): Promise<void> {
+export async function updateQueueHeartbeat() {
   await updateWorkerHeartbeat();
 }
 

@@ -1,4 +1,4 @@
-# Cloud Build config for deploying to Cloud Run
+# Cloud Build config — v2 Pro pipeline
 steps:
   # Build Docker image
   - name: 'gcr.io/cloud-builders/docker'
@@ -14,17 +14,18 @@ steps:
     args:
       - 'run'
       - 'deploy'
-      - 'gstar-studio'
+      - 'gstar-ai-studio'
       - '--image=gcr.io/$PROJECT_ID/gstar-studio'
-      - '--region=us-central1'
+      - '--region=europe-west1'
       - '--platform=managed'
       - '--allow-unauthenticated'
-      - '--memory=1Gi'
-      - '--cpu=1'
+      - '--memory=2Gi'
+      - '--cpu=2'
+      - '--timeout=600'
       - '--min-instances=0'
       - '--max-instances=5'
-      - '--set-env-vars'
-      - 'GCP_PROJECT_ID=$PROJECT_ID,NEXTAUTH_URL=https://gstar-studio-${_HASH}-uc.a.run.app,NEXTAUTH_SECRET=${_NEXTAUTH_SECRET}'
+      - '--update-env-vars'
+      - 'GCP_PROJECT=gstar-ai-studio,NEXTAUTH_URL=https://gstar-ai-studio-674145888056.europe-west1.run.app,NEXTAUTH_SECRET=${_NEXTAUTH_SECRET}'
 
 images:
   - 'gcr.io/$PROJECT_ID/gstar-studio'

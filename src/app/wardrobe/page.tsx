@@ -4,34 +4,45 @@ import { useEffect, useState, useCallback } from 'react';
 import { useSession } from 'next-auth/react';
 import Shell from '@/components/Shell';
 
-type WardrobeCategory = 'shoes' | 'shirt' | 'jacket' | 'pants';
+type WardrobeCategory = 'shoes' | 'top' | 'bottom';
 
 type WardrobeGender = 'male' | 'female' | 'unisex';
+
+/** 6 labeled fit model camera angles */
+const FIT_MODEL_SLOTS = [
+  { key: 'front', label: 'Front', row: 'front' },
+  { key: 'front45Left', label: '45° Left', row: 'front' },
+  { key: 'front45Right', label: '45° Right', row: 'front' },
+  { key: 'back', label: 'Back', row: 'back' },
+  { key: 'back45Left', label: 'Back 45° Left', row: 'back' },
+  { key: 'back45Right', label: 'Back 45° Right', row: 'back' },
+] as const;
+
+type FitModelKey = typeof FIT_MODEL_SLOTS[number]['key'];
+
+interface FitModels {
+  front: string;
+  front45Left: string;
+  front45Right: string;
+  back: string;
+  back45Left: string;
+  back45Right: string;
+}
 
 interface WardrobeItem {
   id: string;
   wardrobeId: string;
   name: string;
-  category: WardrobeCategory;
+  category: WardrobeCategory | string; // string for legacy categories
   gender?: WardrobeGender;
   description: string;
-  fitModelUrls: string[];       // Fit model images (up to 8, front-first rotating right)
-  flatFrontUrl?: string;        // Flat product photo — front
-  flatBackUrl?: string;         // Flat product photo — back
+  fitModels?: Partial<FitModels>;   // v2: labeled angles
+  fitModelUrls?: string[];           // v1 legacy: flat array
+  flatFrontUrl?: string;
+  flatBackUrl?: string;
   thumbnailUrl: string;
-  isPrimary?: boolean;  // true = focus garment (step 1), false = styling item (step 3)
-  openShoes?: boolean;  // true = open-toe shoes (sandals, slides) — triggers foot resize
-  hasHeels?: boolean;   // true = heeled shoes — adjusts M01/M02 crop position higher
-}
-
-// Derive isPrimary default from category (shoes = styling, rest = focus)
-function defaultIsPrimary(cat: WardrobeCategory): boolean {
-  return cat !== 'shoes';
-}
-
-// Derive gender default from category (shoes = unisex, rest = unisex unless specified)
-function defaultGender(cat: WardrobeCategory): WardrobeGender {
-  return cat === 'shoes' ? 'unisex' : 'unisex';
+  openShoes?: boolean;
+  hasHeels?: boolean;
 }
 
 const GENDER_OPTIONS: { value: WardrobeGender; label: string }[] = [
@@ -42,9 +53,8 @@ const GENDER_OPTIONS: { value: WardrobeGender; label: string }[] = [
 
 const CATEGORIES: { value: WardrobeCategory; label: string }[] = [
   { value: 'shoes', label: 'Shoes' },
-  { value: 'shirt', label: 'Shirts' },
-  { value: 'jacket', label: 'Jackets' },
-  { value: 'pants', label: 'Pants' },
+  { value: 'top', label: 'Tops' },
+  { value: 'bottom', label: 'Bottoms' },
 ];
 
 export default function WardrobePage() {
@@ -62,12 +72,10 @@ export default function WardrobePage() {
   const [editDescription, setEditDescription] = useState('');
   const [editCategory, setEditCategory] = useState<WardrobeCategory>('shoes');
   const [editGender, setEditGender] = useState<WardrobeGender>('unisex');
-  const [editIsPrimary, setEditIsPrimary] = useState<boolean>(false);
   const [editOpenShoes, setEditOpenShoes] = useState<boolean>(false);
   const [editHasHeels, setEditHasHeels] = useState<boolean>(false);
   const [saving, setSaving] = useState(false);
   const [deleteConfirm, setDeleteConfirm] = useState(false);
-  const [imageActionLoading, setImageActionLoading] = useState<string | null>(null); // URL being acted on
   const [editFlatFrontFile, setEditFlatFrontFile] = useState<File | null>(null);
   const [editFlatFrontPreview, setEditFlatFrontPreview] = useState<string | null>(null);
   const [editFlatBackFile, setEditFlatBackFile] = useState<File | null>(null);
@@ -75,13 +83,12 @@ export default function WardrobePage() {
 
   // Add form state
   const [name, setName] = useState('');
-  const [category, setCategory] = useState<WardrobeCategory>('shoes');
+  const [category, setCategory] = useState<WardrobeCategory>('top');
   const [genderCreate, setGenderCreate] = useState<WardrobeGender>('unisex');
-  const [isPrimaryCreate, setIsPrimaryCreate] = useState<boolean>(false); // shoes default = false
   const [openShoesCreate, setOpenShoesCreate] = useState<boolean>(false);
   const [hasHeelsCreate, setHasHeelsCreate] = useState<boolean>(false);
   const [description, setDescription] = useState('');
-  const [filesFitModel, setFilesFitModel] = useState<File[]>([]);
+  const [fitModelFiles, setFitModelFiles] = useState<Partial<Record<FitModelKey, File>>>({});
   const [fileFlatFront, setFileFlatFront] = useState<File | null>(null);
   const [fileFlatBack, setFileFlatBack] = useState<File | null>(null);
   const [uploading, setUploading] = useState(false);
@@ -107,10 +114,10 @@ export default function WardrobePage() {
       if (data.translated) {
         setPreview(data.translated);
       } else {
-        setPreview(`⚠ Translation failed: ${data.error || 'unknown error'}`);
+        setPreview(`Warning: Translation failed: ${data.error || 'unknown error'}`);
       }
     } catch (e) {
-      setPreview(`⚠ Translation failed: ${String(e)}`);
+      setPreview(`Warning: Translation failed: ${String(e)}`);
     } finally {
       setTranslating(false);
     }
@@ -134,14 +141,21 @@ export default function WardrobePage() {
     ? items
     : items.filter(i => (i.gender || 'unisex') === filterGender || (i.gender || 'unisex') === 'unisex');
 
+  // Count how many fit model images an item has
+  function countFitImages(item: WardrobeItem): number {
+    if (item.fitModels) {
+      return Object.values(item.fitModels).filter(Boolean).length;
+    }
+    return item.fitModelUrls?.length || 0;
+  }
+
   // Open detail panel
   function openItem(item: WardrobeItem) {
     setSelectedItem(item);
     setEditName(item.name);
     setEditDescription(item.description);
-    setEditCategory(item.category);
-    setEditGender(item.gender || defaultGender(item.category));
-    setEditIsPrimary(item.isPrimary !== undefined ? item.isPrimary : defaultIsPrimary(item.category));
+    setEditCategory(item.category as WardrobeCategory);
+    setEditGender(item.gender || 'unisex');
     setEditOpenShoes(item.openShoes || false);
     setEditHasHeels((item as any).hasHeels || false);
     setEditFlatFrontFile(null);
@@ -161,7 +175,6 @@ export default function WardrobePage() {
     if (!selectedItem) return;
     setSaving(true);
     try {
-      // Convert flat images to base64 if new ones were selected
       let flatFrontBase64: string | undefined;
       let flatBackBase64: string | undefined;
       if (editFlatFrontFile) flatFrontBase64 = await fileToBase64(editFlatFrontFile);
@@ -169,7 +182,7 @@ export default function WardrobePage() {
 
       const patchBody: Record<string, any> = {
         name: editName, description: editDescription, category: editCategory,
-        isPrimary: editIsPrimary, gender: editGender, openShoes: editOpenShoes, hasHeels: editHasHeels,
+        gender: editGender, openShoes: editOpenShoes, hasHeels: editHasHeels,
       };
       if (flatFrontBase64) patchBody.flatFrontBase64 = flatFrontBase64;
       if (flatBackBase64) patchBody.flatBackBase64 = flatBackBase64;
@@ -181,16 +194,14 @@ export default function WardrobePage() {
       });
       if (res.ok) {
         const data = await res.json();
-        // Update local state — include new flat URLs if returned
         const updated = {
           ...selectedItem, name: editName, description: editDescription, category: editCategory,
-          isPrimary: editIsPrimary, gender: editGender, openShoes: editOpenShoes, hasHeels: editHasHeels,
+          gender: editGender, openShoes: editOpenShoes, hasHeels: editHasHeels,
           ...(data.flatFrontUrl ? { flatFrontUrl: data.flatFrontUrl } : {}),
           ...(data.flatBackUrl ? { flatBackUrl: data.flatBackUrl } : {}),
         } as any;
         setSelectedItem(updated);
         setItems(prev => prev.map(i => (i.id === selectedItem.id ? updated : i)));
-        // Clear flat file state after successful upload
         if (editFlatFrontFile) { setEditFlatFrontFile(null); setEditFlatFrontPreview(null); }
         if (editFlatBackFile) { setEditFlatBackFile(null); setEditFlatBackPreview(null); }
       }
@@ -205,36 +216,6 @@ export default function WardrobePage() {
     if (res.ok) {
       setItems(prev => prev.filter(i => i.id !== selectedItem.id));
       closePanel();
-    }
-  }
-
-  async function handleImageAction(action: 'rotate' | 'rotate-left' | 'delete', url: string, imageType: 'fitModel' | 'flatFront' | 'flatBack') {
-    if (!selectedItem || imageActionLoading) return;
-    if (action === 'delete' && !confirm('Delete this image?')) return;
-    setImageActionLoading(url);
-    try {
-      const res = await fetch(`/api/wardrobe/${selectedItem.wardrobeId || selectedItem.id}/image-action`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action, url, imageType }),
-      });
-      if (res.ok) {
-        // Refresh item data
-        const itemRes = await fetch(`/api/wardrobe/${selectedItem.wardrobeId || selectedItem.id}`);
-        if (itemRes.ok) {
-          const { item: updatedItem } = await itemRes.json();
-          setSelectedItem(updatedItem);
-          // Update in the main list too
-          setItems(prev => prev.map(i => i.id === updatedItem.id ? updatedItem : i));
-        }
-      } else {
-        const err = await res.json();
-        alert(`Action failed: ${err.error}`);
-      }
-    } catch (err: any) {
-      alert(`Action failed: ${err.message}`);
-    } finally {
-      setImageActionLoading(null);
     }
   }
 
@@ -261,22 +242,36 @@ export default function WardrobePage() {
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
-    if (!name || !description || filesFitModel.length === 0) return;
+    const filledSlots = Object.values(fitModelFiles).filter(Boolean).length;
+    if (!name || !description || filledSlots === 0) return;
     setUploading(true);
     try {
-      const fitModelBase64 = await Promise.all(filesFitModel.map(f => fileToBase64(f)));
+      // Convert fit model files to base64 keyed by slot name
+      const fitModelBase64: Record<string, string> = {};
+      for (const [key, file] of Object.entries(fitModelFiles)) {
+        if (file) fitModelBase64[key] = await fileToBase64(file);
+      }
+
       let flatFrontBase64: string | undefined;
       let flatBackBase64: string | undefined;
       if (fileFlatFront) flatFrontBase64 = await fileToBase64(fileFlatFront);
       if (fileFlatBack) flatBackBase64 = await fileToBase64(fileFlatBack);
+
       const res = await fetch('/api/wardrobe', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, category, description, fitModelBase64, flatFrontBase64, flatBackBase64, isPrimary: isPrimaryCreate, gender: genderCreate, openShoes: openShoesCreate, hasHeels: hasHeelsCreate }),
+        body: JSON.stringify({
+          name, category, description,
+          fitModelBase64: Object.values(fitModelBase64), // Array for backward compat with API
+          fitModelSlots: fitModelBase64, // Keyed by slot name for v2
+          flatFrontBase64, flatBackBase64,
+          gender: genderCreate,
+          openShoes: openShoesCreate,
+          hasHeels: hasHeelsCreate,
+        }),
       });
       if (res.ok) {
-        setName(''); setDescription(''); setFilesFitModel([]); setFileFlatFront(null); setFileFlatBack(null); setShowForm(false);
-        setIsPrimaryCreate(false);
+        setName(''); setDescription(''); setFitModelFiles({}); setFileFlatFront(null); setFileFlatBack(null); setShowForm(false);
         setGenderCreate('unisex');
         fetchItems();
       } else {
@@ -290,11 +285,16 @@ export default function WardrobePage() {
     }
   }
 
-  // All images for selected item (fit model + flat front/back)
-  const fitModelImages = selectedItem?.fitModelUrls || [];
-  const allImages = selectedItem
-    ? [...fitModelImages]
-    : [];
+  // Get fit model images for the selected item (supports both v1 and v2)
+  function getFitModelImages(item: WardrobeItem): { key: string; label: string; url: string }[] {
+    if (item.fitModels) {
+      return FIT_MODEL_SLOTS
+        .filter(slot => item.fitModels?.[slot.key])
+        .map(slot => ({ key: slot.key, label: slot.label, url: item.fitModels![slot.key]! }));
+    }
+    // Legacy v1: flat array
+    return (item.fitModelUrls || []).map((url, i) => ({ key: `legacy-${i}`, label: `Photo ${i + 1}`, url }));
+  }
 
   return (
     <Shell user={user ? { email: user.email, name: user.name || '', role: user.role || 'creator' } : undefined}>
@@ -302,7 +302,7 @@ export default function WardrobePage() {
         <div>
           <h1 className="text-2xl font-bold text-neutral-900">Wardrobe</h1>
           <p className="text-sm text-neutral-500 mt-1">
-            Stock items for dressing AI models. Click any item to view and edit.
+            Stock items with 6 labeled fit model angles for AI generation.
           </p>
         </div>
         <button
@@ -329,11 +329,7 @@ export default function WardrobePage() {
               <label className="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-1">Category</label>
               <div className="flex gap-2">
                 {CATEGORIES.map(c => (
-                  <button key={c.value} type="button" onClick={() => {
-                    setCategory(c.value);
-                    setIsPrimaryCreate(defaultIsPrimary(c.value));
-                    setGenderCreate(defaultGender(c.value));
-                  }}
+                  <button key={c.value} type="button" onClick={() => setCategory(c.value)}
                     className={`px-3 py-2 text-sm border transition-colors ${category === c.value ? 'bg-neutral-900 text-white border-neutral-900' : 'bg-white text-neutral-600 border-neutral-300 hover:border-neutral-400'}`}>
                     {c.label}
                   </button>
@@ -349,30 +345,17 @@ export default function WardrobePage() {
                   </button>
                 ))}
               </div>
-              {/* Role toggle — auto-set from category, overridable */}
-              <div className="flex items-center gap-2 mt-2">
-                <span className="text-xs text-neutral-500">Used as:</span>
-                <button type="button" onClick={() => setIsPrimaryCreate(true)}
-                  className={`px-2.5 py-1 text-xs border transition-colors ${isPrimaryCreate ? 'bg-neutral-900 text-white border-neutral-900' : 'bg-white text-neutral-500 border-neutral-300 hover:border-neutral-500'}`}>
-                  Focus garment
-                </button>
-                <button type="button" onClick={() => setIsPrimaryCreate(false)}
-                  className={`px-2.5 py-1 text-xs border transition-colors ${!isPrimaryCreate ? 'bg-neutral-900 text-white border-neutral-900' : 'bg-white text-neutral-500 border-neutral-300 hover:border-neutral-500'}`}>
-                  Styling item
-                </button>
-                <span className="text-xs text-neutral-400">
-                  {isPrimaryCreate ? '→ selectable in step 1' : '→ selectable in outfit step'}
-                </span>
-              </div>
             </div>
           </div>
+
+          {/* Description */}
           <div>
             <div className="flex items-center justify-between mb-1">
               <label className="block text-xs font-medium text-neutral-500 uppercase tracking-wider">Description (for AI prompt) — <span className="text-red-500">English only</span></label>
               {description.trim() && !translatedCreate && (
                 <button type="button" onClick={() => translateText(description, setTranslatingCreate, setTranslatedCreate)}
                   disabled={translatingCreate} className="text-xs text-neutral-500 hover:text-neutral-900 underline disabled:opacity-40">
-                  {translatingCreate ? 'Translating…' : 'Translate to English'}
+                  {translatingCreate ? 'Translating...' : 'Translate to English'}
                 </button>
               )}
             </div>
@@ -393,11 +376,130 @@ export default function WardrobePage() {
               </div>
             )}
           </div>
+
+          {/* Shoe-specific toggles */}
+          {category === 'shoes' && (
+            <div className="flex items-center gap-4">
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-neutral-500">Open shoes:</span>
+                <button type="button" onClick={() => setOpenShoesCreate(!openShoesCreate)}
+                  className={`px-2.5 py-1 text-xs border transition-colors ${openShoesCreate ? 'bg-orange-600 text-white border-orange-600' : 'bg-white text-neutral-500 border-neutral-300 hover:border-neutral-500'}`}>
+                  {openShoesCreate ? 'Open toe' : 'Closed'}
+                </button>
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-neutral-500">Heels:</span>
+                <button type="button" onClick={() => setHasHeelsCreate(!hasHeelsCreate)}
+                  className={`px-2.5 py-1 text-xs border transition-colors ${hasHeelsCreate ? 'bg-purple-600 text-white border-purple-600' : 'bg-white text-neutral-500 border-neutral-300 hover:border-neutral-500'}`}>
+                  {hasHeelsCreate ? 'Heels' : 'Flat'}
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* 6 Labeled Fit Model Angle Slots */}
           <div>
-            <label className="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-1">Fit Model Photos (up to 8 — front first, rotating right)</label>
-            <input type="file" multiple accept="image/*" onChange={(e) => setFilesFitModel(Array.from(e.target.files || []).slice(0, 8))} className="w-full text-sm" />
-            {filesFitModel.length > 0 && <p className="text-xs text-neutral-400 mt-1">{filesFitModel.length} photos selected</p>}
+            <label className="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-2">
+              Fit Model Photos — 6 Labeled Angles
+            </label>
+            <p className="text-xs text-neutral-400 mb-3">
+              Upload photos of the garment on a fit model from each camera angle. Front row and back row of 3 positions each.
+            </p>
+
+            {/* Visual guide diagram */}
+            <div className="bg-neutral-50 border border-neutral-200 p-4 mb-4">
+              <p className="text-[10px] text-neutral-500 uppercase tracking-wider mb-2">Camera positions (top-down view)</p>
+              <div className="flex justify-center gap-8">
+                <div className="text-center">
+                  <p className="text-[10px] text-neutral-400 mb-1">FRONT ROW</p>
+                  <div className="flex gap-3">
+                    <div className="text-center">
+                      <div className="w-8 h-8 border border-neutral-300 rounded-full flex items-center justify-center text-[9px] text-neutral-500">45°L</div>
+                      <p className="text-[9px] text-neutral-400 mt-0.5">Left</p>
+                    </div>
+                    <div className="text-center">
+                      <div className="w-8 h-8 border-2 border-neutral-900 rounded-full flex items-center justify-center text-[9px] font-bold">F</div>
+                      <p className="text-[9px] text-neutral-600 mt-0.5 font-medium">Front</p>
+                    </div>
+                    <div className="text-center">
+                      <div className="w-8 h-8 border border-neutral-300 rounded-full flex items-center justify-center text-[9px] text-neutral-500">45°R</div>
+                      <p className="text-[9px] text-neutral-400 mt-0.5">Right</p>
+                    </div>
+                  </div>
+                </div>
+                <div className="w-px bg-neutral-200" />
+                <div className="text-center">
+                  <p className="text-[10px] text-neutral-400 mb-1">BACK ROW</p>
+                  <div className="flex gap-3">
+                    <div className="text-center">
+                      <div className="w-8 h-8 border border-neutral-300 rounded-full flex items-center justify-center text-[9px] text-neutral-500">45°L</div>
+                      <p className="text-[9px] text-neutral-400 mt-0.5">Left</p>
+                    </div>
+                    <div className="text-center">
+                      <div className="w-8 h-8 border-2 border-neutral-900 rounded-full flex items-center justify-center text-[9px] font-bold">B</div>
+                      <p className="text-[9px] text-neutral-600 mt-0.5 font-medium">Back</p>
+                    </div>
+                    <div className="text-center">
+                      <div className="w-8 h-8 border border-neutral-300 rounded-full flex items-center justify-center text-[9px] text-neutral-500">45°R</div>
+                      <p className="text-[9px] text-neutral-400 mt-0.5">Right</p>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Upload slots — 2 rows of 3 */}
+            <div className="space-y-3">
+              {(['front', 'back'] as const).map(row => (
+                <div key={row}>
+                  <p className="text-[10px] text-neutral-500 uppercase tracking-wider mb-1.5">{row === 'front' ? 'Front angles' : 'Back angles'}</p>
+                  <div className="grid grid-cols-3 gap-2">
+                    {FIT_MODEL_SLOTS.filter(s => s.row === row).map(slot => {
+                      const file = fitModelFiles[slot.key];
+                      return (
+                        <div key={slot.key} className="relative">
+                          <label className="block cursor-pointer">
+                            <div className={`aspect-[3/4] border-2 border-dashed flex flex-col items-center justify-center transition-colors ${
+                              file ? 'border-green-500 bg-green-50' : 'border-neutral-300 bg-neutral-50 hover:border-neutral-400'
+                            }`}>
+                              {file ? (
+                                <img src={URL.createObjectURL(file)} alt={slot.label} className="w-full h-full object-cover" />
+                              ) : (
+                                <>
+                                  <svg className="w-5 h-5 text-neutral-300 mb-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M12 4v16m8-8H4" />
+                                  </svg>
+                                  <span className="text-[10px] text-neutral-400">{slot.label}</span>
+                                </>
+                              )}
+                            </div>
+                            <input type="file" accept="image/*" className="hidden" onChange={(e) => {
+                              const f = e.target.files?.[0];
+                              if (f) setFitModelFiles(prev => ({ ...prev, [slot.key]: f }));
+                              e.target.value = '';
+                            }} />
+                          </label>
+                          {file && (
+                            <button type="button"
+                              onClick={() => setFitModelFiles(prev => { const n = { ...prev }; delete n[slot.key]; return n; })}
+                              className="absolute top-1 right-1 w-5 h-5 bg-red-600 text-white text-[10px] flex items-center justify-center hover:bg-red-700">
+                              x
+                            </button>
+                          )}
+                          <p className="text-[10px] text-neutral-500 mt-1 text-center">{slot.label}</p>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              ))}
+            </div>
+            <p className="text-xs text-neutral-400 mt-2">
+              {Object.values(fitModelFiles).filter(Boolean).length}/6 angles uploaded
+            </p>
           </div>
+
+          {/* Flat images */}
           <div className="grid grid-cols-2 gap-4">
             <div>
               <label className="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-1">Flat Front</label>
@@ -408,7 +510,8 @@ export default function WardrobePage() {
               <input type="file" accept="image/*" onChange={(e) => setFileFlatBack(e.target.files?.[0] || null)} className="w-full text-sm" />
             </div>
           </div>
-          <button type="submit" disabled={uploading || !name || !description || filesFitModel.length === 0}
+
+          <button type="submit" disabled={uploading || !name || !description || Object.values(fitModelFiles).filter(Boolean).length === 0}
             className="px-6 py-2 bg-neutral-900 text-white text-sm hover:bg-neutral-800 disabled:opacity-40 transition-colors">
             {uploading ? 'Uploading...' : 'Save to Wardrobe'}
           </button>
@@ -442,7 +545,7 @@ export default function WardrobePage() {
       ) : filteredItems.length === 0 ? (
         <div className="text-center py-20 text-neutral-400">
           <p className="text-lg mb-2">No items yet</p>
-          <p className="text-sm">Add stock items to dress your AI models with matching shoes, shirts, jackets, and pants.</p>
+          <p className="text-sm">Add stock items with labeled fit model angles for AI-generated product shots.</p>
         </div>
       ) : (
         <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-4">
@@ -455,24 +558,14 @@ export default function WardrobePage() {
                 ) : (
                   <div className="w-full h-full flex items-center justify-center text-neutral-300 text-sm">No image</div>
                 )}
-                {/* Category badge — only show when viewing "All" */}
                 {filterCategory === 'all' && (
                   <span className="absolute top-2 left-2 px-2 py-0.5 bg-neutral-900 text-white text-xs uppercase">
                     {item.category}
                   </span>
                 )}
-                <span className={`absolute top-2 right-2 px-1.5 py-0.5 text-[9px] uppercase font-medium ${
-                  (item.isPrimary !== undefined ? item.isPrimary : defaultIsPrimary(item.category))
-                    ? 'bg-emerald-600 text-white'
-                    : 'bg-neutral-500 text-white'
-                }`}>
-                  {(item.isPrimary !== undefined ? item.isPrimary : defaultIsPrimary(item.category)) ? 'focus' : 'styling'}
-                  {item.openShoes && <span className="ml-1 text-[9px] text-orange-500">open</span>}
-                                  {(item as any).hasHeels && <span className="ml-1 text-[9px] text-purple-500">heels</span>}
-                </span>
-                {item.fitModelUrls?.length > 1 && (
+                {countFitImages(item) > 1 && (
                   <span className="absolute bottom-2 right-2 px-2 py-0.5 bg-black/60 text-white text-xs">
-                    {item.fitModelUrls.length} imgs
+                    {countFitImages(item)} angles
                   </span>
                 )}
               </div>
@@ -488,68 +581,38 @@ export default function WardrobePage() {
       {/* Detail panel (slide-in from right) */}
       {selectedItem && (
         <div className="fixed inset-0 z-50 flex">
-          {/* Backdrop */}
           <div className="flex-1 bg-black/40" onClick={closePanel} />
 
-          {/* Panel */}
           <div className="w-full max-w-xl bg-white shadow-2xl flex flex-col overflow-hidden">
-            {/* Header */}
             <div className="flex items-center justify-between px-6 py-4 border-b border-neutral-200 flex-shrink-0">
               <span className="px-2 py-0.5 bg-neutral-900 text-white text-xs uppercase">{selectedItem.category}</span>
-              <button onClick={closePanel} className="text-neutral-400 hover:text-neutral-900 text-xl leading-none">✕</button>
+              <button onClick={closePanel} className="text-neutral-400 hover:text-neutral-900 text-xl leading-none">x</button>
             </div>
 
-            {/* Scrollable content */}
             <div className="flex-1 overflow-y-auto p-6 space-y-6">
 
-              {/* Fit model images (primary garment reference) */}
+              {/* Fit model images — labeled grid */}
               <div>
                 <p className="text-xs font-medium text-neutral-500 uppercase tracking-wider mb-3">
-                  Fit Model Photos ({fitModelImages.length}/8) — front first, rotating right
+                  Fit Model Angles ({countFitImages(selectedItem)}/6)
                 </p>
-                {fitModelImages.length > 0 ? (
-                  <div className="grid grid-cols-4 gap-2">
-                    {fitModelImages.map((url, i) => {
-                      const isLoading = imageActionLoading?.split('?')[0] === url.split('?')[0];
-                      return (
-                        <div key={`fit-${i}-${url}`}
-                          className="aspect-square bg-neutral-100 overflow-hidden cursor-pointer hover:ring-2 hover:ring-emerald-500 transition-all relative group">
-                          <img src={url} alt={`Fit ${i + 1}`} onClick={() => setLightboxUrl(url)}
-                            className={`w-full h-full object-cover group-hover:scale-105 transition-transform duration-200 ${isLoading ? 'opacity-40' : ''}`} />
-                          <span className="absolute top-1 left-1 px-1.5 py-0.5 bg-emerald-600 text-white text-[9px] uppercase">fit</span>
-                          {/* Rotate + Delete overlay */}
-                          <div className="absolute top-1 right-1 flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                            <button
-                              onClick={(e) => { e.stopPropagation(); handleImageAction('rotate-left', url, 'fitModel'); }}
-                              disabled={!!imageActionLoading}
-                              className="w-6 h-6 bg-black/70 text-white text-xs flex items-center justify-center hover:bg-black/90 disabled:opacity-40"
-                              title="Rotate 90° left"
-                            >↺</button>
-                            <button
-                              onClick={(e) => { e.stopPropagation(); handleImageAction('rotate', url, 'fitModel'); }}
-                              disabled={!!imageActionLoading}
-                              className="w-6 h-6 bg-black/70 text-white text-xs flex items-center justify-center hover:bg-black/90 disabled:opacity-40"
-                              title="Rotate 90° right"
-                            >↻</button>
-                            <button
-                              onClick={(e) => { e.stopPropagation(); handleImageAction('delete', url, 'fitModel'); }}
-                              disabled={!!imageActionLoading}
-                              className="w-6 h-6 bg-red-600/80 text-white text-xs flex items-center justify-center hover:bg-red-700 disabled:opacity-40"
-                              title="Delete image"
-                            >✕</button>
+                {(() => {
+                  const images = getFitModelImages(selectedItem);
+                  if (images.length === 0) return <p className="text-xs text-neutral-400 italic">No fit model photos uploaded yet.</p>;
+                  return (
+                    <div className="grid grid-cols-3 gap-2">
+                      {images.map(img => (
+                        <div key={img.key} className="relative group">
+                          <div className="aspect-[3/4] bg-neutral-100 overflow-hidden cursor-pointer hover:ring-2 hover:ring-neutral-500 transition-all">
+                            <img src={img.url} alt={img.label} onClick={() => setLightboxUrl(img.url)}
+                              className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-200" />
                           </div>
-                          {isLoading && (
-                            <div className="absolute inset-0 flex items-center justify-center bg-black/30">
-                              <span className="text-white text-xs animate-pulse">...</span>
-                            </div>
-                          )}
+                          <p className="text-[10px] text-neutral-500 mt-1 text-center">{img.label}</p>
                         </div>
-                      );
-                    })}
-                  </div>
-                ) : (
-                  <p className="text-xs text-neutral-400 italic">No fit model photos uploaded yet.</p>
-                )}
+                      ))}
+                    </div>
+                  );
+                })()}
               </div>
 
               {/* Editable fields */}
@@ -572,7 +635,6 @@ export default function WardrobePage() {
                       </button>
                     ))}
                   </div>
-                  {/* Gender selector */}
                   <div className="flex items-center gap-2 mt-2">
                     <span className="text-xs text-neutral-500">Gender:</span>
                     {GENDER_OPTIONS.map(g => (
@@ -582,38 +644,21 @@ export default function WardrobePage() {
                       </button>
                     ))}
                   </div>
-                  {/* Role toggle */}
-                  <div className="flex items-center gap-2 mt-2">
-                    <span className="text-xs text-neutral-500">Used as:</span>
-                    <button type="button" onClick={() => setEditIsPrimary(true)}
-                      className={`px-2.5 py-1 text-xs border transition-colors ${editIsPrimary ? 'bg-neutral-900 text-white border-neutral-900' : 'bg-white text-neutral-500 border-neutral-300 hover:border-neutral-500'}`}>
-                      Focus garment
-                    </button>
-                    <button type="button" onClick={() => setEditIsPrimary(false)}
-                      className={`px-2.5 py-1 text-xs border transition-colors ${!editIsPrimary ? 'bg-neutral-900 text-white border-neutral-900' : 'bg-white text-neutral-500 border-neutral-300 hover:border-neutral-500'}`}>
-                      Styling item
-                    </button>
-                    <span className="text-xs text-neutral-400">
-                      {editIsPrimary ? '→ step 1' : '→ outfit step'}
-                    </span>
-                  </div>
                   {editCategory === 'shoes' && (<>
-                  <div className="flex items-center gap-2 mt-2">
-                    <span className="text-xs text-neutral-500">Open shoes:</span>
-                    <button type="button" onClick={() => setEditOpenShoes(!editOpenShoes)}
-                      className={`px-2.5 py-1 text-xs border transition-colors ${editOpenShoes ? 'bg-orange-600 text-white border-orange-600' : 'bg-white text-neutral-500 border-neutral-300 hover:border-neutral-500'}`}>
-                      {editOpenShoes ? 'Open toe ✓' : 'Closed shoe'}
-                    </button>
-                    <span className="text-[10px] text-neutral-400">{editOpenShoes ? '→ foot resize active' : '→ no foot resize'}</span>
-                  </div>
-                  <div className="flex items-center gap-2 mt-2">
-                    <span className="text-xs text-neutral-500">Heels:</span>
-                    <button type="button" onClick={() => setEditHasHeels(!editHasHeels)}
-                      className={`px-2.5 py-1 text-xs border transition-colors ${editHasHeels ? 'bg-purple-600 text-white border-purple-600' : 'bg-white text-neutral-500 border-neutral-300 hover:border-neutral-500'}`}>
-                      {editHasHeels ? 'Heels ✓' : 'Flat shoe'}
-                    </button>
-                    <span className="text-[10px] text-neutral-400">{editHasHeels ? '→ crop adjusts higher' : '→ standard crop'}</span>
-                  </div>
+                    <div className="flex items-center gap-2 mt-2">
+                      <span className="text-xs text-neutral-500">Open shoes:</span>
+                      <button type="button" onClick={() => setEditOpenShoes(!editOpenShoes)}
+                        className={`px-2.5 py-1 text-xs border transition-colors ${editOpenShoes ? 'bg-orange-600 text-white border-orange-600' : 'bg-white text-neutral-500 border-neutral-300 hover:border-neutral-500'}`}>
+                        {editOpenShoes ? 'Open toe' : 'Closed shoe'}
+                      </button>
+                    </div>
+                    <div className="flex items-center gap-2 mt-2">
+                      <span className="text-xs text-neutral-500">Heels:</span>
+                      <button type="button" onClick={() => setEditHasHeels(!editHasHeels)}
+                        className={`px-2.5 py-1 text-xs border transition-colors ${editHasHeels ? 'bg-purple-600 text-white border-purple-600' : 'bg-white text-neutral-500 border-neutral-300 hover:border-neutral-500'}`}>
+                        {editHasHeels ? 'Heels' : 'Flat shoe'}
+                      </button>
+                    </div>
                   </>)}
                 </div>
 
@@ -623,7 +668,7 @@ export default function WardrobePage() {
                     {editDescription.trim() && !translatedEdit && (
                       <button type="button" onClick={() => translateText(editDescription, setTranslatingEdit, setTranslatedEdit)}
                         disabled={translatingEdit} className="text-xs text-neutral-500 hover:text-neutral-900 underline disabled:opacity-40">
-                        {translatingEdit ? 'Translating…' : 'Translate to English'}
+                        {translatingEdit ? 'Translating...' : 'Translate to English'}
                       </button>
                     )}
                   </div>
@@ -647,13 +692,12 @@ export default function WardrobePage() {
                   )}
                 </div>
 
-                {/* Flat images (product-on-white — front + back) */}
+                {/* Flat images */}
                 <div>
                   <label className="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-2">
                     Flat Images <span className="text-neutral-400 normal-case">(product-on-white — front &amp; back)</span>
                   </label>
                   <div className="grid grid-cols-2 gap-4">
-                    {/* Flat Front */}
                     <div>
                       <p className="text-xs text-neutral-500 mb-1">Front</p>
                       {(selectedItem?.flatFrontUrl || editFlatFrontPreview) && (
@@ -670,9 +714,7 @@ export default function WardrobePage() {
                           const f = e.target.files?.[0]; if (f) { setEditFlatFrontFile(f); setEditFlatFrontPreview(URL.createObjectURL(f)); } e.target.value = '';
                         }} />
                       </label>
-                      {editFlatFrontFile && <span className="block text-xs text-green-600 mt-1">{editFlatFrontFile.name}</span>}
                     </div>
-                    {/* Flat Back */}
                     <div>
                       <p className="text-xs text-neutral-500 mb-1">Back</p>
                       {(selectedItem?.flatBackUrl || editFlatBackPreview) && (
@@ -689,7 +731,6 @@ export default function WardrobePage() {
                           const f = e.target.files?.[0]; if (f) { setEditFlatBackFile(f); setEditFlatBackPreview(URL.createObjectURL(f)); } e.target.value = '';
                         }} />
                       </label>
-                      {editFlatBackFile && <span className="block text-xs text-green-600 mt-1">{editFlatBackFile.name}</span>}
                     </div>
                   </div>
                 </div>
@@ -698,7 +739,6 @@ export default function WardrobePage() {
 
             {/* Footer actions */}
             <div className="flex items-center justify-between px-6 py-4 border-t border-neutral-200 flex-shrink-0 bg-white">
-              {/* Delete */}
               {!deleteConfirm ? (
                 <button onClick={() => setDeleteConfirm(true)}
                   className="px-4 py-2 text-sm text-red-600 border border-red-200 hover:bg-red-50 transition-colors">
@@ -712,7 +752,6 @@ export default function WardrobePage() {
                 </div>
               )}
 
-              {/* Save */}
               <button onClick={saveEdit} disabled={saving}
                 className="px-6 py-2 bg-neutral-900 text-white text-sm hover:bg-neutral-800 disabled:opacity-40 transition-colors">
                 {saving ? 'Saving...' : 'Save changes'}
@@ -722,11 +761,11 @@ export default function WardrobePage() {
         </div>
       )}
 
-      {/* Lightbox for full image view */}
+      {/* Lightbox */}
       {lightboxUrl && (
-        <div className="fixed inset-0 z-60 bg-black/90 flex items-center justify-center"
+        <div className="fixed inset-0 z-[60] bg-black/90 flex items-center justify-center"
           onClick={() => setLightboxUrl(null)}>
-          <button className="absolute top-4 right-4 text-white text-2xl hover:text-neutral-300" onClick={() => setLightboxUrl(null)}>✕</button>
+          <button className="absolute top-4 right-4 text-white text-2xl hover:text-neutral-300" onClick={() => setLightboxUrl(null)}>x</button>
           <img src={lightboxUrl} alt="Full view"
             className="max-w-[90vw] max-h-[90vh] object-contain"
             onClick={(e) => e.stopPropagation()}

@@ -1,67 +1,70 @@
 /**
- * Vertex AI Gemini image generation client.
- * Uses Vertex AI global endpoint (aiplatform.googleapis.com) with OAuth — 3-4x faster than the free Developer API.
+ * Vertex AI Gemini client — v2 Pro pipeline.
  *
- * Supports multiple reference images:
- * - Garment flat image (primary visual reference)
- * - 360° garment angles (secondary references)
- * - Model card (identity reference)
+ * Two models:
+ * - gemini-3-pro-image-preview: Image generation (4K native)
+ * - gemini-2.5-flash-lite: Silhouette analysis (text-only, fast)
+ *
+ * Uses Vertex AI global endpoint with OAuth.
+ * Project: gstar-ai-studio (same project for auth + API).
  */
 
-interface ReferenceImage {
+export interface ReferenceImage {
   buffer: Buffer;
   mimeType: string;
   label: string;
 }
 
-interface GenerateImageParams {
+export interface GenerateImageParams {
   prompt: string;
-  referenceImages?: ReferenceImage[];  // Multiple reference images with labels
-  referenceImage?: Buffer;              // Legacy: single model card image
-  aspectRatio?: string;
-  imageSize?: string;
-  model?: string;                       // Optional model override (default: gemini-3.1-flash-image-preview)
-  seed?: number;                        // Fixed seed for cross-view consistency (1-2147483647)
+  referenceImages?: ReferenceImage[];
+  aspectRatio?: string;   // '9:16' for full-body, '3:4' for detail/crops
+  imageSize?: string;     // '4K' for Pro native upscaler
+  model?: string;
+  seed?: number;
 }
 
-interface GenerateImageResult {
+export interface GenerateImageResult {
   imageData: Buffer;
   mimeType: string;
 }
 
-// Retry config for 429 rate limits — generous backoff to survive Gemini throttling
+export interface AnalyzeParams {
+  prompt: string;
+  images: { buffer: Buffer; mimeType: string }[];
+  model?: string;
+  temperature?: number;
+}
+
+// Retry config
 const MAX_RETRIES = 3;
 const RETRY_DELAYS = [45000, 60000, 90000];
 const NETWORK_RETRY_DELAYS = [10000, 20000, 30000];
 
-// GCP project for Vertex AI — the project linked to the service account
-// v40-build-7: Force runtime evaluation — prevent Next.js build-time inlining
+// GCP project — consistent across auth + API URL
 function getGcpProject(): string {
-  const p = process.env['GCP_PROJECT'] || 'gstar-ai-studio';
-  console.log(`[Vertex] BUILD v40-7 | GCP_PROJECT=${p}`);
-  return p;
+  return process.env['GCP_PROJECT'] || 'gstar-ai-studio';
 }
-const GCP_PROJECT = getGcpProject();
 
-// Token cache — reuse OAuth tokens (metadata server returns expires_in)
+function getVertexUrl(model: string): string {
+  const project = getGcpProject();
+  return `https://aiplatform.googleapis.com/v1/projects/${project}/locations/global/publishers/google/models/${model}:generateContent`;
+}
+
+// Token cache
 let cachedToken: { token: string; expiresAt: number } | null = null;
-// Mutex: prevent concurrent token refreshes (metadata server can throttle/stale)
 let refreshPromise: Promise<string> | null = null;
 
 async function getCachedAccessToken(): Promise<string> {
   const now = Date.now();
-  // Refresh 5 minutes before expiry
   if (cachedToken && cachedToken.expiresAt > now + 300_000) {
     return cachedToken.token;
   }
-  // Mutex — if another request is already refreshing, wait for it
-  if (refreshPromise) {
-    return refreshPromise;
-  }
+  if (refreshPromise) return refreshPromise;
+
   refreshPromise = (async () => {
     try {
       const { token, expiresIn } = await getAccessToken();
-      // Use actual expires_in from metadata server (default 3600s if missing)
       const ttlMs = (expiresIn || 3600) * 1000;
       cachedToken = { token, expiresAt: now + ttlMs };
       console.log(`[Vertex] Token refreshed, expires in ${Math.round(ttlMs / 60000)}m`);
@@ -73,21 +76,23 @@ async function getCachedAccessToken(): Promise<string> {
   return refreshPromise;
 }
 
+/**
+ * Generate an image using Gemini Pro.
+ * Default: 4K resolution, 9:16 aspect ratio.
+ */
 export async function generateImage(params: GenerateImageParams): Promise<GenerateImageResult> {
   const {
     prompt,
     referenceImages,
-    referenceImage,
-    aspectRatio = '3:4',
-    imageSize = '2K',
-    model = 'gemini-3.1-flash-image-preview',
+    aspectRatio = '9:16',
+    imageSize = '4K',
+    model = 'gemini-3-pro-image-preview',
     seed,
   } = params;
 
-  // Build request parts — images first, then prompt text
   const parts: Array<Record<string, unknown>> = [];
 
-  // Multiple reference images with labels
+  // Images first, then prompt — per Gemini best practice
   if (referenceImages?.length) {
     for (const ref of referenceImages) {
       parts.push({
@@ -96,51 +101,33 @@ export async function generateImage(params: GenerateImageParams): Promise<Genera
           data: ref.buffer.toString('base64'),
         },
       });
-      parts.push({
-        text: ref.label + '\n\n',
-      });
+      if (ref.label) {
+        parts.push({ text: ref.label + '\n\n' });
+      }
     }
   }
-  // Legacy fallback: single reference image
-  else if (referenceImage) {
-    parts.push({
-      inlineData: {
-        mimeType: 'image/png',
-        data: referenceImage.toString('base64'),
-      },
-    });
-    parts.push({
-      text: 'This is the model identity reference photo. The person in the generated image MUST be this exact same person — same face, same features, same body type.\n\n',
-    });
-  }
 
-  // Add the main prompt
   parts.push({ text: prompt });
 
-  // Vertex AI global endpoint — HARDCODED to avoid Next.js build-time inlining issues
-  const url = 'https://aiplatform.googleapis.com/v1/projects/gstar-ai-studio/locations/global/publishers/google/models/' + model + ':generateContent';
-  console.log('[Vertex] v40-8 URL: ' + url);
-
-  // Get OAuth token (cached, auto-refreshes)
+  const url = getVertexUrl(model);
   const accessToken = await getCachedAccessToken();
 
-  // Retry loop for rate limits
+  console.log(`[Vertex] Generating: model=${model}, images=${referenceImages?.length || 0}, aspect=${aspectRatio}, size=${imageSize}`);
+
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     try {
-      // Vertex AI is much faster (~30-50s vs 120-180s on free API).
-      // With color anchors we now send up to 20 reference images — can take 200-250s.
-      const timeoutMs = 300_000;
       const response = await fetch(url, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${accessToken}`,
         },
-        signal: AbortSignal.timeout(timeoutMs),
+        signal: AbortSignal.timeout(300_000),
         body: JSON.stringify({
-          contents: [{ role: "user", parts }],
+          contents: [{ role: 'user', parts }],
           generationConfig: {
             responseModalities: ['IMAGE'],
+            temperature: 1.0,
             ...(seed != null ? { seed } : {}),
             imageConfig: {
               aspectRatio,
@@ -161,14 +148,10 @@ export async function generateImage(params: GenerateImageParams): Promise<Genera
       }
 
       if (response.status === 401 || response.status === 403) {
-        // Token might have expired — refresh and retry once
         console.warn(`[Vertex] Auth error ${response.status}, refreshing token...`);
         cachedToken = null;
-        const newToken = await getCachedAccessToken();
-        if (attempt < MAX_RETRIES) {
-          // Retry with fresh token on next loop iteration
-          continue;
-        }
+        await getCachedAccessToken();
+        if (attempt < MAX_RETRIES) continue;
         const error = await response.text();
         throw new Error(`Vertex AI auth error ${response.status}: ${error.substring(0, 200)}`);
       }
@@ -179,8 +162,6 @@ export async function generateImage(params: GenerateImageParams): Promise<Genera
       }
 
       const result = await response.json();
-
-      // Extract image from response
       const candidate = result.candidates?.[0];
       if (!candidate?.content?.parts) {
         if (attempt < MAX_RETRIES) {
@@ -207,25 +188,18 @@ export async function generateImage(params: GenerateImageParams): Promise<Genera
       const errName = (error as Error).name || '';
       const isRateLimit = msg.includes('429');
       const isTimeout = errName === 'TimeoutError' || msg.includes('abort') || msg.includes('timed out');
-      // With heavy payloads (20 ref images), timeouts can happen — allow 1 retry.
       const isNetworkError =
-        msg.includes('ECONNRESET') ||
-        msg.includes('ETIMEDOUT') ||
-        msg.includes('ENOTFOUND') ||
-        msg.includes('fetch failed');
-      if (isTimeout) {
-        if (attempt < 1) {
-          console.warn(`[Vertex] Timeout after 300s — retrying once (attempt ${attempt + 1}/${MAX_RETRIES}): ${msg.substring(0, 120)}`);
-          await new Promise(r => setTimeout(r, 5_000));
-          continue;
-        }
-        console.error(`[Vertex] Timeout after 300s — giving up (attempt ${attempt + 1}/${MAX_RETRIES}): ${msg.substring(0, 120)}`);
-        throw error;
+        msg.includes('ECONNRESET') || msg.includes('ETIMEDOUT') ||
+        msg.includes('ENOTFOUND') || msg.includes('fetch failed');
+
+      if (isTimeout && attempt < 1) {
+        console.warn(`[Vertex] Timeout — retrying once`);
+        await new Promise(r => setTimeout(r, 5_000));
+        continue;
       }
       if (attempt < MAX_RETRIES && (isRateLimit || isNetworkError)) {
         const delay = isRateLimit ? RETRY_DELAYS[attempt] : NETWORK_RETRY_DELAYS[attempt];
-        const reason = isRateLimit ? 'Rate limit' : 'Network error';
-        console.warn(`[Vertex] ${reason}, retrying in ${delay / 1000}s (attempt ${attempt + 1}/${MAX_RETRIES}): ${msg.substring(0, 120)}`);
+        console.warn(`[Vertex] ${isRateLimit ? 'Rate limit' : 'Network error'}, retrying in ${delay / 1000}s`);
         await new Promise(r => setTimeout(r, delay));
         continue;
       }
@@ -237,78 +211,71 @@ export async function generateImage(params: GenerateImageParams): Promise<Genera
 }
 
 /**
- * Generate a model card image — the model is shown wearing VERY SHORT compression shorts (boxer-brief length).
- * This avoids Gemini RAI content filter issues while keeping legs bare for denim generation.
+ * Run text analysis via Flash Lite (silhouette analysis, etc.)
+ * Returns plain text response.
  */
-export async function generateModelCard(description: string, gender: 'male' | 'female'): Promise<string | null> {
-  const cleanDescription = description.replace(/^["']/, '').trim();
+export async function analyzeWithFlashLite(params: AnalyzeParams): Promise<string> {
+  const {
+    prompt,
+    images,
+    model = 'gemini-2.5-flash-lite',
+    temperature = 0.3,
+  } = params;
 
-  // VERY short compression shorts — boxer-brief length, max 15cm inseam.
-  // Must be shorter than cycling shorts to prevent legging bleed into denim generation.
-  const baseLayerDesc = gender === 'male'
-    ? `MANDATORY OUTFIT — EXACT SPECIFICATION:
-- BOTTOM: Black compression BOXER BRIEFS — these are VERY SHORT underwear-style shorts. Maximum 15cm inseam. They end at UPPER THIGH, well above the knee. The KNEES, SHINS, and CALVES are completely BARE SKIN. Think men's boxer briefs or running shorts — NOT cycling shorts, NOT mid-thigh, NOT knee-length, NOT leggings.
-- TOP: Plain white fitted crew-neck t-shirt with G-Star small logo on chest. No other branding.
-- FEET: Barefoot on white studio floor.
-CRITICAL: If the shorts extend past upper-thigh or reach the knee, you have FAILED. The legs below upper-thigh must be bare skin.`
-    : `MANDATORY OUTFIT — EXACT SPECIFICATION:
-- BOTTOM: Black compression BOXER BRIEFS — these are VERY SHORT underwear-style shorts. Maximum 15cm inseam. They end at UPPER THIGH, well above the knee. The KNEES, SHINS, and CALVES are completely BARE SKIN. Think boy-short underwear — NOT cycling shorts, NOT mid-thigh, NOT knee-length, NOT leggings.
-- TOP: Plain white fitted tank top with thin shoulder straps and G-Star small logo. No other branding.
-- FEET: Barefoot on white studio floor.
-CRITICAL: If the shorts extend past upper-thigh or reach the knee, you have FAILED. The legs below upper-thigh must be bare skin.`;
+  const parts: Array<Record<string, unknown>> = [];
 
-  // Gender-aware ECOM posing
-  const ecomPose = gender === 'female'
-    ? 'Slight hip tilt, soft knee bend, weight on one leg — feminine and confident. One hand lightly at hip. NOT stiff military stance.'
-    : 'Relaxed stance, slight weight shift. Arms relaxed at sides. NOT rigid or stiff.';
-
-  // Random variation token ensures each regeneration produces a different result
-  const variationSeed = Math.random().toString(36).substring(2, 8);
-
-  const prompt = `Full-body fashion model reference photograph — ${variationSeed}
-
-Subject: ${cleanDescription}
-
-${baseLayerDesc}
-
-PROPORTIONS — standard full-body fashion proportion. Complete body visible crown to heel. Head is one-eighth of total body height. Waistband sits at mid-body. Knees at three-quarter height. DO NOT render any text, numbers, labels, annotations, or percentage markers in the image — clean photograph only.
-
-EXPRESSION (G-STAR ECOM STANDARD — MANDATORY): MOUTH CLOSED. Lips pressed TOGETHER. NO TEETH VISIBLE. NO SMILE. NO GRIN. Cool, self-assured composure — confident and approachable through the EYES, not through a smile. Chin slightly up. Eyes on camera. Think "I know I look good" — NOT "say cheese". If teeth are visible, the image is WRONG.
-
-FRAME — complete full body:
-  Top: small white margin above crown
-  Head and face fully visible
-  Full torso visible
-  Full legs visible — BARE from upper thigh down
-  Feet flat on white studio floor
-  Bottom: white floor surface visible below feet
-
-Camera: 85mm, 5 meters from subject. Complete body crown-to-heel in frame. NOT a portrait crop.
-Studio: White seamless backdrop, white floor visible. LIGHTING: Warm directional studio light with subtle shadow contrast — NOT flat/clinical. Warmer skin tones.
-Pose: ${ecomPose}
-Photorealistic.`;
-
-  try {
-    const result = await generateImage({
-      prompt,
-      aspectRatio: '3:4',  // 3:4 prevents head cutoff — 9:16 was too narrow, forcing zoom-in
-      imageSize: '2K',
+  for (const img of images) {
+    parts.push({
+      inlineData: {
+        mimeType: img.mimeType,
+        data: img.buffer.toString('base64'),
+      },
     });
-
-    return result.imageData.toString('base64');
-  } catch (error) {
-    console.error('Error generating model card:', error);
-    return null;
   }
+  parts.push({ text: prompt });
+
+  const url = getVertexUrl(model);
+  const accessToken = await getCachedAccessToken();
+
+  console.log(`[Vertex] Analyzing: model=${model}, images=${images.length}`);
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${accessToken}`,
+    },
+    signal: AbortSignal.timeout(30_000),
+    body: JSON.stringify({
+      contents: [{ role: 'user', parts }],
+      generationConfig: {
+        temperature,
+        responseMimeType: 'text/plain',
+      },
+    }),
+  });
+
+  if (!response.ok) {
+    const error = await response.text();
+    throw new Error(`Flash Lite analysis error ${response.status}: ${error.substring(0, 300)}`);
+  }
+
+  const result = await response.json();
+  const candidate = result.candidates?.[0];
+  if (!candidate?.content?.parts) {
+    throw new Error('Empty analysis response');
+  }
+
+  const textParts = candidate.content.parts.filter((p: any) => p.text);
+  return textParts.map((p: any) => p.text).join('');
 }
 
 /**
- * Get access token for Vertex AI API.
- * On Cloud Run: uses metadata server (fast, no credentials needed).
- * Locally: uses service account key (GOOGLE_APPLICATION_CREDENTIALS).
+ * Get OAuth access token for Vertex AI.
+ * Cloud Run: metadata server. Local: service account key.
  */
 async function getAccessToken(): Promise<{ token: string; expiresIn: number }> {
-  // Try Cloud Run metadata server first
+  // Cloud Run metadata server (fast path)
   try {
     const resp = await fetch(
       'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token',
@@ -319,10 +286,10 @@ async function getAccessToken(): Promise<{ token: string; expiresIn: number }> {
       return { token: data.access_token, expiresIn: data.expires_in || 3600 };
     }
   } catch {
-    // Not on Cloud Run — fall through to service account
+    // Not on Cloud Run
   }
 
-  // Fall back to service account key (local development)
+  // Service account key (local dev)
   const keyPath = process.env.GOOGLE_APPLICATION_CREDENTIALS;
   if (!keyPath) {
     throw new Error('No GOOGLE_APPLICATION_CREDENTIALS set for local development');
@@ -332,7 +299,6 @@ async function getAccessToken(): Promise<{ token: string; expiresIn: number }> {
   const crypto = await import('crypto');
   const key = JSON.parse(fs.readFileSync(keyPath, 'utf8'));
 
-  // Create JWT
   const now = Math.floor(Date.now() / 1000);
   const header = { alg: 'RS256', typ: 'JWT' };
   const payload = {
@@ -349,10 +315,8 @@ async function getAccessToken(): Promise<{ token: string; expiresIn: number }> {
   const sign = crypto.createSign('RSA-SHA256');
   sign.update(unsigned);
   const signature = sign.sign(key.private_key, 'base64url');
-
   const jwt = `${unsigned}.${signature}`;
 
-  // Exchange JWT for access token
   const tokenResp = await fetch('https://oauth2.googleapis.com/token', {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },

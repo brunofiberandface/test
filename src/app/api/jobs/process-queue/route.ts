@@ -1,3 +1,12 @@
+/**
+ * POST /api/jobs/process-queue — v2 Pro pipeline worker.
+ *
+ * Processes generation queue with shot dependency chain:
+ * M03 → M04 → M01 + M02 (parallel) → M05
+ *
+ * Each job's shots are generated sequentially within a slot,
+ * respecting dependencies. Only one worker runs at a time.
+ */
 import { NextRequest } from 'next/server';
 import {
   getQueueState,
@@ -7,452 +16,236 @@ import {
   updateSlotProgress,
   incrementRetryPass,
   releaseSlot,
-  enqueueJob,
   listShots,
   getJob,
-  jobsCol,
+  updateJobStatus,
   shotsCol,
 } from '@/lib/firestore';
-
-/**
- * POST /api/jobs/process-queue
- *
- * Server-side worker that processes the generation queue.
- * Runs as a long-lived request — generates shots across 2 parallel slots
- * until the queue is empty, then exits.
- *
- * Each slot processes ONE job at a time. Each job's shots are generated
- * sequentially within that slot — no parallel shot generation within a job.
- * This avoids race conditions between shots in the same job.
- *
- * Triggered by:
- *   1. Cloud Scheduler (every 3 min — safety net)
- *   2. Frontend "Start Generation" button
- *   3. Enqueueing a new job
- *
- * Only one worker runs at a time (Firestore-based claim with heartbeat).
- * If the worker dies (container recycle), the next scheduler ping restarts it.
- */
+import { APP_CONFIG } from '@/lib/config';
 
 function getInternalBase(): string {
   const port = process.env.PORT || '3000';
   return `http://localhost:${port}`;
 }
 
-const MAX_RETRY_PASSES = 2;       // up to 2 retry passes for failed shots
-const SHOT_TIMEOUT_MS = 540_000;  // 9 min per shot
-const SHOT_COOLDOWN_MS = 10_000;  // 10s cooldown between shots to reduce 429s
-const STALE_THRESHOLD_MS = 720_000; // 12 min — must be > SHOT_TIMEOUT_MS to avoid resetting active shots
-const IDLE_CHECK_MS = 10_000;     // Check for new work every 10s when idle
-const MAX_IDLE_CYCLES = 30;       // Exit after 5 min of no work (30 × 10s)
+const MAX_RETRY_PASSES = 2;
+const SHOT_TIMEOUT_MS = 540_000;  // 9 min per shot (Pro takes 80-130s but with retries)
+const SHOT_COOLDOWN_MS = 10_000;  // 10s between shots to reduce 429s
+const STALE_THRESHOLD_MS = 720_000;
+const IDLE_CHECK_MS = 10_000;
+const MAX_IDLE_CYCLES = 30;       // Exit after 5 min idle
 
-const shotOrder = ['M03', 'M01', 'M02', 'M04', 'M05'];
-
-interface ShotResult {
-  shotLabel: string;
-  ok: boolean;
-  elapsed: number;
-  error?: string;
-}
+// Shot dependency order — M03 first, then M04, then M01+M02, then M05
+const SHOT_ORDER = APP_CONFIG.shotOrder; // ['M03', 'M04', 'M01', 'M02', 'M05']
 
 /**
- * Generate a single shot by calling /api/generate internally.
- * Returns success/failure — does NOT throw.
+ * Get the next shot to generate for a job, respecting dependency chain.
+ * Returns null if all shots are done or if dependencies aren't met.
  */
-async function generateOneShot(
-  jobId: string,
-  jobData: Record<string, unknown>,
-  shotData: Record<string, unknown>,
-  slotIdx: number,
-): Promise<ShotResult> {
-  const shotLabel = `${shotData.shotType}_${shotData.variant || 'A'}`;
-  const shotId = (shotData.shotId || shotData.id) as string;
-  const startTime = Date.now();
+async function getNextShot(jobId: string): Promise<{ shotId: string; shotType: string } | null> {
+  const shots = await listShots(jobId);
+  if (shots.length === 0) return null;
 
-  console.log(`[Worker][Slot${slotIdx}] Generating ${shotLabel} (${shotId}) for job ${jobData.jobName || jobId}`);
+  // Build a map of shot status by type
+  const shotsByType: Record<string, any> = {};
+  for (const s of shots) {
+    const st = (s as any).shotType;
+    shotsByType[st] = s;
+  }
 
-  // Update slot progress in queue state (for UI)
-  await updateSlotProgress(jobId, shotLabel);
+  // Walk through shot order, find the first pending/failed shot whose dependencies are met
+  for (const shotType of SHOT_ORDER) {
+    const shot = shotsByType[shotType];
+    if (!shot) continue;
 
-  // Claim the shot atomically — mark it as generating with our slot ID
-  // This prevents the other slot from touching it
-  try {
-    await shotsCol.doc(shotId).update({
-      status: 'generating',
-      claimedBySlot: slotIdx,
-      updatedAt: new Date(),
+    const status = (shot as any).status;
+    if (status === 'done' || status === 'approved' || status === 'generating') continue;
+
+    // Check if status is pending or failed (eligible for generation)
+    if (status !== 'pending' && status !== 'failed' && status !== 'queued') continue;
+
+    // Check dependencies
+    const deps = APP_CONFIG.shots[shotType as keyof typeof APP_CONFIG.shots]?.dependsOn || [];
+    const depsMet = deps.every((dep: string) => {
+      const depShot = shotsByType[dep];
+      return depShot && ((depShot as any).status === 'done' || (depShot as any).status === 'approved');
     });
-  } catch {
-    console.warn(`[Worker][Slot${slotIdx}] Could not claim shot ${shotLabel} — skipping`);
-    return { shotLabel, ok: false, elapsed: 0, error: 'Could not claim shot' };
-  }
 
-  const internalBase = getInternalBase();
-
-  // Attempt generation with 1 immediate retry on 5xx
-  for (let attempt = 0; attempt <= 1; attempt++) {
-    if (attempt > 0) {
-      console.log(`[Worker][Slot${slotIdx}] Retrying ${shotLabel} (attempt ${attempt + 1})...`);
-      await new Promise(r => setTimeout(r, 30_000));
-    }
-
-    try {
-      const abortCtrl = new AbortController();
-      const timeoutId = setTimeout(() => abortCtrl.abort(), SHOT_TIMEOUT_MS);
-
-      const res = await fetch(`${internalBase}/api/generate`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        signal: abortCtrl.signal,
-        body: JSON.stringify({
-          shotId,
-          jobId,
-          designNumber: jobData.designNumber,
-          modelId: shotData.modelId,
-          shotType: shotData.shotType,
-          variant: shotData.variant || 'A',
-          prompt: shotData.prompt || '',
-          flatFrontUrl: jobData.flatFrontUrl || jobData.flatImageUrl || '',
-          flatBackUrl: jobData.flatBackUrl || '',
-          image360Urls: jobData.image360Urls || [],
-          garmentCategory: jobData.garmentCategory,
-          version: shotData.version || 1,
-        }),
-      });
-      clearTimeout(timeoutId);
-
-      const elapsed = Math.round((Date.now() - startTime) / 1000);
-
-      if (res.ok) {
-        console.log(`[Worker][Slot${slotIdx}] ✓ ${shotLabel} done (${elapsed}s)`);
-        // Clear slot claim on success
-        try { await shotsCol.doc(shotId).update({ claimedBySlot: null }); } catch { /* */ }
-        return { shotLabel, ok: true, elapsed };
-      }
-
-      let errMsg = `HTTP ${res.status}`;
-      try {
-        const errData = await res.json();
-        errMsg = errData.error || errMsg;
-      } catch { /* */ }
-
-      // Don't retry 4xx — it's a client error (bad prompt, missing refs, etc.)
-      if (res.status >= 400 && res.status < 500) {
-        console.error(`[Worker][Slot${slotIdx}] ✗ ${shotLabel} failed (${elapsed}s, 4xx): ${errMsg}`);
-        try { await shotsCol.doc(shotId).update({ claimedBySlot: null }); } catch { /* */ }
-        return { shotLabel, ok: false, elapsed, error: errMsg };
-      }
-
-      // 5xx — retry once
-      if (attempt === 1) {
-        console.error(`[Worker][Slot${slotIdx}] ✗ ${shotLabel} failed after retry (${elapsed}s): ${errMsg}`);
-        try { await shotsCol.doc(shotId).update({ claimedBySlot: null }); } catch { /* */ }
-        return { shotLabel, ok: false, elapsed, error: errMsg };
-      }
-    } catch (e) {
-      const elapsed = Math.round((Date.now() - startTime) / 1000);
-      if (attempt === 1) {
-        console.error(`[Worker][Slot${slotIdx}] ✗ ${shotLabel} exception after retry (${elapsed}s): ${e}`);
-        try { await shotsCol.doc(shotId).update({ claimedBySlot: null }); } catch { /* */ }
-        return { shotLabel, ok: false, elapsed, error: String(e) };
-      }
-      // Will retry
+    if (depsMet) {
+      return { shotId: (shot as any).shotId || (shot as any).id, shotType };
     }
   }
 
-  // Should not reach here, but safety net
-  try { await shotsCol.doc((shotData.shotId || shotData.id) as string).update({ claimedBySlot: null }); } catch { /* */ }
-  return { shotLabel, ok: false, elapsed: Math.round((Date.now() - startTime) / 1000), error: 'Unknown error' };
+  return null;
 }
 
 /**
- * Main worker loop: fills slots, generates shots, loops until queue is empty.
+ * Check if all shots for a job are terminal (done/approved/failed).
  */
-async function workerLoop(): Promise<string[]> {
-  const actions: string[] = [];
-  let idleCycles = 0;
-
-  // ── ORPHAN RECOVERY: find "generating" jobs not in any slot and re-enqueue them ──
-  try {
-    const initState = await getQueueState();
-    const slottedJobIds = new Set(initState.slots.filter(s => s !== null).map(s => s!.jobId));
-    const queuedJobIds = new Set(initState.queue.map(e => e.jobId));
-    const orphanSnap = await jobsCol.where('status', '==', 'generating').limit(10).get();
-    for (const doc of orphanSnap.docs) {
-      if (!slottedJobIds.has(doc.id) && !queuedJobIds.has(doc.id)) {
-        const jData = doc.data();
-        const jName = (jData.jobName || jData.designNumber || doc.id) as string;
-        console.log(`[Worker] Orphan detected: "${jName}" (${doc.id}) — re-enqueueing`);
-        await enqueueJob(doc.id, jName);
-        actions.push(`Recovered orphan job "${jName}"`);
-      }
-    }
-  } catch (e) {
-    console.warn('[Worker] Orphan recovery failed:', e);
-  }
-
-  while (idleCycles < MAX_IDLE_CYCLES) {
-    let state = await getQueueState();
-
-    // ── FILL EMPTY SLOTS from queue before processing ──
-    for (let i = 0; i < state.slots.length; i++) {
-      if (state.slots[i] === null && state.queue.length > 0) {
-        const next = state.queue[0];
-        const result = await enqueueJob(next.jobId, next.jobName);
-        if (result.slot !== null) {
-          console.log(`[Worker] Filled slot ${result.slot} with "${next.jobName}"`);
-          actions.push(`Filled slot ${result.slot} with "${next.jobName}"`);
-        }
-        // Re-read state after mutation
-        state = await getQueueState();
-      }
-    }
-
-    let didWork = false;
-
-    // Process occupied slots — PARALLEL when different jobs, sequential same-job safety
-    const slotTasks: Array<{ slotIdx: number; slot: NonNullable<typeof state.slots[0]> }> = [];
-    for (let i = 0; i < state.slots.length; i++) {
-      const slot = state.slots[i];
-      if (slot) slotTasks.push({ slotIdx: i, slot });
-    }
-
-    const processSlot = async (slotIdx: number, slot: NonNullable<typeof state.slots[0]>) => {
-      // Guard: check if job still exists (user may have deleted it)
-      const jobDoc = await getJob(slot.jobId);
-      if (!jobDoc) {
-        console.log(`[Worker] Job "${slot.jobName}" (${slot.jobId}) deleted — releasing slot ${slotIdx}`);
-        actions.push(`Released slot ${slotIdx} — job "${slot.jobName}" was deleted`);
-        await releaseSlot(slot.jobId);
-        return true;
-      }
-
-      // Check if this job still needs work
-      const shots = await listShots(slot.jobId);
-      const needsWork = shots.some((s: Record<string, unknown>) =>
-        s.status === 'queued' || s.status === 'failed'
-      );
-
-      if (!needsWork) {
-        // Check if any shots are still generating (being processed right now)
-        const stillGenerating = shots.some((s: Record<string, unknown>) => s.status === 'generating');
-        if (stillGenerating) {
-          return true; // still working
-        }
-
-        // Job is done — set status and release slot
-        try {
-          await jobsCol.doc(slot.jobId).update({
-            status: 'review',
-            updatedAt: new Date(),
-            completedAt: new Date(),
-          });
-        } catch (e) {
-          console.warn(`[Worker] Could not update job ${slot.jobId} status (may be deleted):`, e);
-        }
-        actions.push(`Job "${slot.jobName}" completed (slot ${slotIdx})`);
-        await releaseSlot(slot.jobId);
-        console.log(`[Worker] Released slot ${slotIdx} — ${slot.jobName} done`);
-        return true;
-      }
-
-      // Job needs work — generate next shot
-      await processOneSlot(slot.jobId, slot, slotIdx, actions);
-      return true;
-    };
-
-    if (slotTasks.length > 0) {
-      didWork = true;
-      // Run slots in parallel — each slot has a different job, so no race conditions
-      await Promise.all(slotTasks.map(({ slotIdx, slot }) => processSlot(slotIdx, slot)));
-    }
-
-    await updateWorkerHeartbeat();
-
-    // Check if ANY slots are occupied or queue has items
-    const freshState = await getQueueState();
-    const anyWork = freshState.slots.some(s => s !== null) || freshState.queue.length > 0;
-
-    if (!anyWork && !didWork) {
-      idleCycles++;
-      if (idleCycles >= MAX_IDLE_CYCLES) break;
-      await new Promise(r => setTimeout(r, IDLE_CHECK_MS));
-    } else {
-      idleCycles = 0;
-    }
-  }
-
-  return actions;
+async function isJobComplete(jobId: string): Promise<boolean> {
+  const shots = await listShots(jobId);
+  return shots.length > 0 && shots.every(
+    (s: any) => s.status === 'done' || s.status === 'approved' || s.status === 'failed'
+  );
 }
 
 /**
- * Process one shot from a slot's job. Called sequentially per slot.
- * Each call generates exactly one shot, then returns.
+ * Process a single slot — generates shots for the assigned job sequentially.
  */
-async function processOneSlot(
-  jobId: string,
-  slot: { jobId: string; jobName: string; retryPass: number },
-  slotIdx: number,
-  actions: string[],
-): Promise<void> {
-  const job = await getJob(jobId);
+async function processSlot(jobId: string): Promise<void> {
+  const job = await getJob(jobId) as any;
   if (!job) {
-    actions.push(`Job ${jobId} not found — releasing slot ${slotIdx}`);
+    console.warn(`[Worker] Job ${jobId} not found — releasing slot`);
     await releaseSlot(jobId);
     return;
   }
 
-  const jobData = job as Record<string, unknown>;
-  const jobName = (jobData.jobName || jobData.designNumber || jobId) as string;
+  console.log(`[Worker] Processing job ${jobId} (${job.jobName || jobId})`);
 
-  // Update job status
-  try {
-    await jobsCol.doc(jobId).update({ status: 'generating', updatedAt: new Date() });
-  } catch { /* */ }
-
-  // Reset shots stuck in "generating" from a DEAD worker (>12 min old)
-  // Threshold is intentionally > SHOT_TIMEOUT_MS (9 min) to avoid resetting active shots
+  // Reset any stale 'generating' shots (stuck from previous worker crash)
   const shots = await listShots(jobId);
   for (const shot of shots) {
-    const s = shot as Record<string, unknown>;
+    const s = shot as any;
     if (s.status === 'generating') {
-      const updatedAt = s.updatedAt ? new Date(s.updatedAt as string).getTime() : 0;
-      if (Date.now() - updatedAt > STALE_THRESHOLD_MS) {
-        console.log(`[Worker][Slot${slotIdx}] Resetting stale shot ${s.shotType}_${s.variant || 'A'} (>${STALE_THRESHOLD_MS / 60000}min old)`);
-        await shotsCol.doc(s.id as string).update({
-          status: 'queued',
-          updatedAt: new Date(),
-          error: null,
-          claimedBySlot: null,
-        });
+      const age = Date.now() - new Date(s.updatedAt || s.createdAt).getTime();
+      if (age > STALE_THRESHOLD_MS) {
+        console.log(`[Worker] Resetting stale shot ${s.shotType} (${Math.round(age / 60000)}min old)`);
+        await shotsCol.doc(s.shotId || s.id).update({ status: 'pending', updatedAt: new Date() });
       }
     }
   }
 
-  // Find all queued shots (not claimed by another slot)
-  const queuedShots = shots
-    .filter((s: Record<string, unknown>) =>
-      s.status === 'queued' && (s.claimedBySlot === null || s.claimedBySlot === undefined)
-    )
-    .sort((a: Record<string, unknown>, b: Record<string, unknown>) => {
-      const aIdx = shotOrder.indexOf(a.shotType as string);
-      const bIdx = shotOrder.indexOf(b.shotType as string);
-      return (aIdx === -1 ? 99 : aIdx) - (bIdx === -1 ? 99 : bIdx);
-    }) as Record<string, unknown>[];
+  // Process shots in dependency order
+  let consecutiveFailures = 0;
+  while (true) {
+    const next = await getNextShot(jobId);
+    if (!next) {
+      // No more shots to generate — check if job is complete
+      if (await isJobComplete(jobId)) {
+        const allShots = await listShots(jobId);
+        const allDone = allShots.every((s: any) => s.status === 'done' || s.status === 'approved');
+        await updateJobStatus(jobId, allDone ? 'review' : 'failed');
+        console.log(`[Worker] Job ${jobId} complete — status: ${allDone ? 'review' : 'failed'}`);
+      }
+      break;
+    }
 
-  if (queuedShots.length > 0) {
-    // STRICT SEQUENTIAL: Generate exactly 1 shot at a time within a job.
-    // M03 is the front garment anchor reused by later shots — it MUST complete
-    // before M01/M02/M04/M05 start. Parallelism is only safe between jobs, not within.
-    const shot = queuedShots[0];
-    const result = await generateOneShot(jobId, jobData, shot, slotIdx);
-    actions.push(`${result.ok ? '✓' : '✗'} ${result.shotLabel} (${result.elapsed}s) — ${jobName}`);
-    // Cooldown between shots to reduce Vertex AI 429 rate-limit hits
-    await new Promise(r => setTimeout(r, SHOT_COOLDOWN_MS));
-    return;
-  }
+    console.log(`[Worker] Generating ${next.shotType} for job ${jobId}`);
+    await updateSlotProgress(jobId, next.shotType);
 
-  // No queued shots — check if there are failed shots to retry
-  const failedShots = shots.filter((s: Record<string, unknown>) => s.status === 'failed');
+    try {
+      // Call the generate endpoint internally
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), SHOT_TIMEOUT_MS);
 
-  if (failedShots.length > 0 && slot.retryPass < MAX_RETRY_PASSES) {
-    // Start retry pass
-    const newPass = await incrementRetryPass(jobId);
-    console.log(`[Worker][Slot${slotIdx}] Job "${jobName}" — retry pass ${newPass} for ${failedShots.length} failed shots`);
-
-    // Reset failed shots to queued
-    for (const shot of failedShots) {
-      const s = shot as Record<string, unknown>;
-      await shotsCol.doc(s.id as string).update({
-        status: 'queued',
-        updatedAt: new Date(),
-        error: null,
-        claimedBySlot: null,
+      const res = await fetch(`${getInternalBase()}/api/generate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          shotId: next.shotId,
+          jobId,
+          shotType: next.shotType,
+        }),
+        signal: controller.signal,
       });
+
+      clearTimeout(timeout);
+
+      if (!res.ok) {
+        const errorText = await res.text().catch(() => 'Unknown error');
+        console.error(`[Worker] ${next.shotType} failed: ${res.status} — ${errorText.substring(0, 200)}`);
+        consecutiveFailures++;
+
+        // Retry once on 5xx
+        if (res.status >= 500 && consecutiveFailures <= 1) {
+          console.log(`[Worker] Retrying ${next.shotType} after 5xx...`);
+          await shotsCol.doc(next.shotId).update({ status: 'pending', updatedAt: new Date() });
+          await new Promise(r => setTimeout(r, SHOT_COOLDOWN_MS));
+          continue;
+        }
+      } else {
+        consecutiveFailures = 0;
+        console.log(`[Worker] ${next.shotType} completed successfully`);
+      }
+    } catch (err) {
+      const msg = (err as Error).message || '';
+      console.error(`[Worker] ${next.shotType} error: ${msg.substring(0, 200)}`);
+      consecutiveFailures++;
+
+      if (msg.includes('abort')) {
+        console.error(`[Worker] ${next.shotType} timed out after ${SHOT_TIMEOUT_MS / 1000}s`);
+      }
     }
 
-    // Wait 30s before retry to let rate limits cool
-    await new Promise(r => setTimeout(r, 30_000));
+    await updateWorkerHeartbeat();
 
-    // Pick first retry shot
-    const freshShots = await listShots(jobId);
-    const retryShot = freshShots
-      .filter((s: Record<string, unknown>) => s.status === 'queued')
-      .sort((a: Record<string, unknown>, b: Record<string, unknown>) => {
-        const aIdx = shotOrder.indexOf(a.shotType as string);
-        const bIdx = shotOrder.indexOf(b.shotType as string);
-        return (aIdx === -1 ? 99 : aIdx) - (bIdx === -1 ? 99 : bIdx);
-      })[0] as Record<string, unknown> | undefined;
-
-    if (retryShot) {
-      const result = await generateOneShot(jobId, jobData, retryShot, slotIdx);
-      actions.push(`${result.ok ? '✓' : '✗'} ${result.shotLabel} retry (${result.elapsed}s) — ${jobName}`);
-      await new Promise(r => setTimeout(r, SHOT_COOLDOWN_MS));
-    }
-    return;
+    // Cooldown between shots
+    await new Promise(r => setTimeout(r, SHOT_COOLDOWN_MS));
   }
 
-  // No more work for this job — it will be picked up as "done" in the next loop iteration
+  // Release slot, pull next job from queue
+  const next = await releaseSlot(jobId);
+  if (next) {
+    console.log(`[Worker] Next job from queue: ${next.jobId}`);
+  }
 }
-
-// ── HTTP Handlers ──
 
 export async function POST(req: NextRequest) {
+  // Claim worker role
+  const claimed = await claimWorker();
+  if (!claimed) {
+    return new Response(JSON.stringify({ message: 'Another worker is active' }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+
+  console.log('[Worker] Claimed worker role — starting loop');
+
   try {
-    // Try to claim worker role
-    const claimed = await claimWorker();
+    let idleCycles = 0;
 
-    if (!claimed) {
-      // Another worker is already running
-      return new Response(JSON.stringify({
-        ok: true,
-        status: 'already_running',
-        message: 'Worker is already active',
-      }), { headers: { 'Content-Type': 'application/json' } });
+    while (idleCycles < MAX_IDLE_CYCLES) {
+      const state = await getQueueState();
+      const activeSlots = state.slots.filter(s => s !== null);
+
+      if (activeSlots.length === 0) {
+        idleCycles++;
+        if (idleCycles >= MAX_IDLE_CYCLES) {
+          console.log('[Worker] Idle timeout — exiting');
+          break;
+        }
+        await new Promise(r => setTimeout(r, IDLE_CHECK_MS));
+        continue;
+      }
+
+      idleCycles = 0;
+
+      // Process active slots sequentially (one at a time to avoid race conditions)
+      for (const slot of activeSlots) {
+        if (slot) {
+          await processSlot(slot.jobId);
+          await updateWorkerHeartbeat();
+        }
+      }
+
+      // Brief pause before checking for more work
+      await new Promise(r => setTimeout(r, 2000));
     }
-
-    console.log('[Worker] Claimed worker role — starting loop');
-
-    // Run the worker loop (long-lived — may run for many minutes)
-    let actions: string[];
-    try {
-      actions = await workerLoop();
-    } finally {
-      await releaseWorker();
-      console.log('[Worker] Released worker role — loop exited');
-    }
-
-    return new Response(JSON.stringify({
-      ok: true,
-      status: 'completed',
-      actions,
-    }), { headers: { 'Content-Type': 'application/json' } });
   } catch (err) {
     console.error('[Worker] Fatal error:', err);
+  } finally {
     await releaseWorker();
-    return new Response(JSON.stringify({
-      ok: false,
-      error: String(err),
-    }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+    console.log('[Worker] Released worker role');
   }
+
+  return new Response(JSON.stringify({ message: 'Worker finished' }), {
+    status: 200,
+    headers: { 'Content-Type': 'application/json' },
+  });
 }
 
-// GET handler for Cloud Scheduler (which sends GET by default)
+// GET handler for Cloud Scheduler pings
 export async function GET(req: NextRequest) {
-  // Check if there's any work to do before claiming
-  const state = await getQueueState();
-  const hasWork = state.slots.some(s => s !== null) || state.queue.length > 0;
-
-  if (!hasWork) {
-    return new Response(JSON.stringify({
-      ok: true,
-      status: 'idle',
-      message: 'No jobs in queue',
-      slots: state.slots,
-      queueLength: state.queue.length,
-    }), { headers: { 'Content-Type': 'application/json' } });
-  }
-
-  // There's work — delegate to POST handler
   return POST(req);
 }

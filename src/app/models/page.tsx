@@ -11,7 +11,7 @@ interface Model {
   name: string;
   description: string;
   gender: 'male' | 'female';
-  cardImageUrl: string;
+  referenceImageUrl: string;
   active: boolean;
 }
 
@@ -82,7 +82,6 @@ export default function ModelsPage() {
         body: JSON.stringify({ [editField]: editValue.trim() }),
       });
       if (res.ok) {
-        // Update local state
         setModels(prev => prev.map(m => {
           const mid = (m.modelId || m.id).trim();
           if (mid === editingId) {
@@ -134,7 +133,6 @@ export default function ModelsPage() {
         </div>
       ) : (
         <>
-          {/* Gender sections */}
           {[
             { label: 'Women', data: women },
             { label: 'Men', data: men },
@@ -153,19 +151,13 @@ export default function ModelsPage() {
                       key={mid}
                       className="group border border-neutral-200 bg-white hover:border-neutral-400 transition-colors"
                     >
-                      {/* Thumbnail — always links to detail page */}
                       <Link href={`/models/${mid}`}>
                         <div className="aspect-[3/4] bg-neutral-100 relative overflow-hidden cursor-pointer">
-                          {model.cardImageUrl ? (
+                          {model.referenceImageUrl ? (
                             <img
-                              src={model.cardImageUrl}
+                              src={model.referenceImageUrl}
                               alt={`${model.modelId} — ${model.name}`}
-                              className="w-full h-full object-cover"
-                              style={{
-                                objectPosition: 'top center',
-                                transform: 'scale(1.8)',
-                                transformOrigin: 'top center',
-                              }}
+                              className="w-full h-full object-cover object-top"
                             />
                           ) : (
                             <div className="w-full h-full flex items-center justify-center text-neutral-300 text-lg">
@@ -180,10 +172,8 @@ export default function ModelsPage() {
                         </div>
                       </Link>
 
-                      {/* Model info — editable for admins */}
                       <div className="p-3">
                         <div className="flex items-center justify-between gap-1">
-                          {/* Model ID */}
                           {isEditingThis && editField === 'modelId' ? (
                             <input
                               ref={inputRef}
@@ -204,7 +194,6 @@ export default function ModelsPage() {
                             </span>
                           )}
 
-                          {/* Name */}
                           {isEditingThis && editField === 'name' ? (
                             <input
                               ref={inputRef}
