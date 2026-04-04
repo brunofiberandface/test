@@ -20,12 +20,69 @@ const GUIDES = [
 ];
 
 async function seed() {
-  // Dynamic import to pick up .env.local via dotenv
-  const dotenv = await import('dotenv');
-  dotenv.config({ path: path.resolve(__dirname, '../.env.local') });
+  // Load sa_key.json directly and init Firestore with explicit credentials
+  const projectRoot = path.resolve(__dirname, '..');
+  const saKeyPath = path.join(projectRoot, 'sa_key.json');
 
-  // Import firestore after env is loaded
-  const { uploadPromptFile } = await import('../src/lib/firestore');
+  if (!fs.existsSync(saKeyPath)) {
+    console.error('sa_key.json not found at', saKeyPath);
+    process.exit(1);
+  }
+
+  const { Firestore } = await import('@google-cloud/firestore');
+  const saKey = JSON.parse(fs.readFileSync(saKeyPath, 'utf-8'));
+
+  const db = new Firestore({
+    projectId: saKey.project_id || 'gstar-ai-studio',
+    credentials: {
+      client_email: saKey.client_email,
+      private_key: saKey.private_key,
+    },
+  });
+
+  const promptVaultCol = db.collection('promptVault');
+
+  // Inline uploadPromptFile — avoids needing the full firestore module import
+  async function uploadPromptFile(data: {
+    filename: string;
+    shotType: string;
+    content: string;
+    gcsUrl: string;
+    uploadedBy: string;
+    silhouettePrompt?: string;
+    generationPrompt?: string;
+  }): Promise<{ id: string; revision: number }> {
+    const snap = await promptVaultCol
+      .where('shotType', '==', data.shotType)
+      .orderBy('revision', 'desc')
+      .limit(1)
+      .get();
+    const latestRevision = snap.empty ? 0 : (snap.docs[0].data().revision || 0);
+    const newRevision = latestRevision + 1;
+
+    // Deactivate previous active
+    const activeSnap = await promptVaultCol
+      .where('shotType', '==', data.shotType)
+      .where('isActive', '==', true)
+      .get();
+    const batch = db.batch();
+    activeSnap.docs.forEach(doc => batch.update(doc.ref, { isActive: false }));
+
+    const ref = promptVaultCol.doc();
+    // Strip undefined values — Firestore rejects them
+    const cleanData = Object.fromEntries(
+      Object.entries(data).filter(([, v]) => v !== undefined)
+    );
+    batch.set(ref, {
+      id: ref.id,
+      ...cleanData,
+      revision: newRevision,
+      isActive: true,
+      uploadedAt: new Date(),
+    });
+    await batch.commit();
+    return { id: ref.id, revision: newRevision };
+  }
 
   console.log('Seeding Prompt Vault...\n');
 
