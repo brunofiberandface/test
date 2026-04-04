@@ -1,8 +1,13 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { createJob, listJobs, getJob, createShot, updateJobStatus, jobsCol, wardrobeCol, createWardrobeItem } from '@/lib/firestore';
+import { createJob, listJobs, getJob, createShot, updateJobStatus, jobsCol, wardrobeCol, createWardrobeItem, enqueueJob } from '@/lib/firestore';
 import { buildGenerationPrompt } from '@/lib/prompts';
 import { SHOT_DESCRIPTIONS } from '@/lib/config';
 import { uploadGarmentImage } from '@/lib/gcs';
+
+function getInternalBase(): string {
+  const port = process.env.PORT || '3000';
+  return `http://localhost:${port}`;
+}
 
 // Maps garment category → wardrobe category (for auto-save)
 const GARMENT_TO_WARDROBE: Record<string, string> = {
@@ -76,9 +81,12 @@ export async function POST(req: NextRequest) {
       flatImageUrl: flatImageUrlPassthrough, // legacy compat
     } = body;
 
-    if (!designNumber || !garmentCategory || !description || !modelIds?.length) {
+    // v40: modelIds no longer required — generation uses generic body, not specific models
+    if (!designNumber || !garmentCategory || !description) {
       return NextResponse.json({ error: 'Missing required fields' }, { status: 400 });
     }
+    // Default to a placeholder model ID if none provided (v40: no model selection)
+    const effectiveModelIds = modelIds?.length ? modelIds : ['generic'];
 
     // Upload flat front image to GCS if provided, or use passthrough GCS URL directly
     let flatFrontUrl = flatFrontUrlPassthrough || flatImageUrlPassthrough || '';
@@ -101,7 +109,7 @@ export async function POST(req: NextRequest) {
       garmentCategory,
       description,
       metadata: metadata || {},
-      modelIds,
+      modelIds: effectiveModelIds,
     });
 
     // Store garment image URLs and wardrobe selections on the job document
@@ -160,8 +168,9 @@ export async function POST(req: NextRequest) {
     }
 
     // Create shot records for each model × shot type
+    // v40: Only M03 is queued — all others are held until user activates them
     const shotIds: string[] = [];
-    for (const modelId of modelIds) {
+    for (const modelId of effectiveModelIds) {
       const modelDesc = modelDescriptions?.[modelId] || '';
 
       for (const [shotKey, shotDescription] of Object.entries(SHOT_DESCRIPTIONS)) {
@@ -177,12 +186,16 @@ export async function POST(req: NextRequest) {
           shotType,
         });
 
+        // v40: ONLY M03 generates immediately — everything else waits for user activation
+        const initialStatus = shotType === 'M03' ? 'queued' : 'held';
+
         const shotId = await createShot({
           jobId,
           modelId,
           shotType,
           variant,
           prompt,
+          status: initialStatus,
         });
         shotIds.push(shotId);
       }
@@ -191,16 +204,30 @@ export async function POST(req: NextRequest) {
     // Update job status to generating
     await updateJobStatus(jobId, 'generating');
 
-    // Generation is now triggered by the results page (client-driven orchestration).
-    // The results page polls every 8s and triggers /api/generate for queued shots
-    // one at a time. This avoids the Cloud Run container termination issue with setTimeout.
-    console.log(`[Job] Created ${shotIds.length} shots for job ${jobId}. Generation will be triggered by the results page.`);
+    // Enqueue the job in the worker queue and kick the worker
+    const jName = (jobName || designNumber) as string;
+    const enqueueResult = await enqueueJob(jobId, jName);
+    console.log(`[Job] Enqueued job ${jobId} ("${jName}"): slot=${enqueueResult.slot}, position=${enqueueResult.position}`);
 
-    return NextResponse.json({
+    console.log(`[Job] Created ${shotIds.length} shots for job ${jobId}. Kicking worker...`);
+
+    // v37: Respond to client FIRST, then kick worker.
+    // The worker kick is a separate internal request that keeps the Cloud Run container alive.
+    // We must NOT await it here — process-queue blocks until generation completes (minutes).
+    // Using fetch().catch() is safe here because the RESPONSE has already been sent,
+    // and the internal fetch creates a new request that keeps the container running.
+    const response = NextResponse.json({
       success: true,
       jobId,
       shotsCreated: shotIds.length,
     });
+
+    // Fire the worker kick AFTER building the response — don't await it
+    fetch(`${getInternalBase()}/api/jobs/process-queue`, { method: 'POST' })
+      .then(res => console.log(`[Job] Worker kick response: ${res.status}`))
+      .catch(err => console.warn(`[Job] Worker kick failed (non-blocking):`, err));
+
+    return response;
   } catch (error) {
     console.error('Error creating job:', error);
     return NextResponse.json({ error: 'Failed to create job' }, { status: 500 });
