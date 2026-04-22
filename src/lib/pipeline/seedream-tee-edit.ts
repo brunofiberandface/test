@@ -68,9 +68,13 @@ TOP TO PAINT: ${topDescription}
 CRITICAL LAYERING INSTRUCTION:
 The top covers the entire torso from shoulders to below the waistband. The bottom of the top is hidden UNDER the jeans — the denim waistband sits ON TOP of the shirt fabric. The shirt is completely tucked in with no fabric hanging over or bunching above the waistband. The waistband line is clean and unbroken.
 
+LENGTH OVERRIDE: Regardless of any "cropped", "short", "boxy", "hits at hip", or similar fit descriptor in the TOP TO PAINT text, render the top at full tucked length with the bottom disappearing under the denim waistband. Fit descriptors in that text describe the garment's off-body silhouette, not how it is worn on this model.
+
 VIEW: This is a ${view} view. Paint the top as it would appear from the ${view}.
 
 PRESERVE EVERYTHING ELSE EXACTLY:
+- Same face — features, structure, expression. Do not alter the head in any way.
+- Same hair — color, length, cut, parting, styling
 - Same skin tone, body pose, body proportions
 - Same jeans (color, wash, fit, hem, pockets, stitching)
 - Same shoes
