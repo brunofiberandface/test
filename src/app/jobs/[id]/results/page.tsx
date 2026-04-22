@@ -4,6 +4,7 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import { useParams } from 'next/navigation';
 import { useSession } from 'next-auth/react';
 import Shell from '@/components/Shell';
+import LabelCornerPicker from '@/components/LabelCornerPicker';
 
 interface PreviousVersion {
   imageUrl: string;
@@ -25,6 +26,9 @@ interface ShotData {
   progressStep?: string;
   progressPct?: number;
   updatedAt?: string;
+  alternativePromptLabel?: string;
+  usedDressedBase?: boolean;
+  provider?: 'gemini' | 'seedream';
 }
 
 interface JobData {
@@ -343,8 +347,12 @@ export default function ResultsPage() {
   const [selectedShot, setSelectedShot] = useState<ShotData | null>(null);
   const [modificationText, setModificationText] = useState('');
   const [rerunning, setRerunning] = useState(false);
+  const [rerunningShotId, setRerunningShotId] = useState<string | null>(null);
+  const [alternatives, setAlternatives] = useState<Array<{ id: string; label: string; shotType: string }>>([]);
   const [loading, setLoading] = useState(true);
   const [lightboxUrl, setLightboxUrl] = useState<string | null>(null);
+  const [labelPickerShotId, setLabelPickerShotId] = useState<string | null>(null);
+  const [resettingLabelShotId, setResettingLabelShotId] = useState<string | null>(null);
   const [triggeringShot, setTriggeringShot] = useState<string | null>(null);
   const [queuePosition, setQueuePosition] = useState<number | null>(null);
   const [queueActiveJob, setQueueActiveJob] = useState<string | null>(null);
@@ -390,12 +398,16 @@ export default function ResultsPage() {
         const data = await resp.json();
         setJob(data.job);
         const rawShots = data.shots || [];
-        const mappedShots: ShotData[] = rawShots.map((s: Record<string, unknown>) => ({
+        const mappedShots: ShotData[] = rawShots.map((s: Record<string, unknown>) => {
+          const v = (s.variant as string) || 'A';
+          const shotType = s.shotType as string;
+          const label = SHOT_VARIANT_LABELS[shotType]?.[v] ?? `${SHOT_LABELS[shotType] || shotType}${v !== 'A' ? ` (${v})` : ''}`;
+          return {
           id: s.shotId || s.id,
           shotId: s.shotId || s.id,
           type: s.shotType,
-          variant: s.variant || 'A',
-          label: SHOT_VARIANT_LABELS[s.shotType as string]?.[s.variant as string] ?? `${SHOT_LABELS[s.shotType as string] || s.shotType}${s.variant !== 'A' ? ` (${s.variant})` : ''}`,
+          variant: v,
+          label,
           status: s.status,
           version: s.version || 1,
           modelId: s.modelId as string | undefined,
@@ -404,7 +416,10 @@ export default function ResultsPage() {
           progressStep: s.progressStep as string | undefined,
           progressPct: s.progressPct as number | undefined,
           updatedAt: s.updatedAt as string | undefined,
-        }));
+          alternativePromptLabel: s.alternativePromptLabel as string | undefined,
+          usedDressedBase: s.usedDressedBase as boolean | undefined,
+          provider: s.provider as 'gemini' | 'seedream' | undefined,
+        }; });
         setShots(mappedShots);
 
         // Update selected shot via ref — avoids re-creating fetchData on every click
@@ -466,9 +481,26 @@ export default function ResultsPage() {
     fetchData();
   };
 
-  const rerunShot = async (shot: ShotData) => {
+  // Fetch alternative prompts when a shot is selected — filtered by pipeline
+  useEffect(() => {
+    if (!selectedShot) { setAlternatives([]); return; }
+    const pipeline = selectedShot.provider === 'seedream' ? 'seedream' : 'gemini';
+    fetch(`/api/prompt-vault/alternatives?shotType=${selectedShot.type}&pipeline=${pipeline}`)
+      .then(r => r.json())
+      .then(d => setAlternatives(d.alternatives || []))
+      .catch(() => setAlternatives([]));
+  }, [selectedShot?.type, selectedShot?.provider]);
+
+  const rerunWithAlternative = async (shot: ShotData, promptId: string, promptLabel: string) => {
+    // Alternative prompts (Color Fidelity, Top Enforcement, Fit Wide, ...) rerun ONLY the
+    // target shot. M01/M02 anchor on the existing M03/M04 URLs via ctx.m03AnchorUrl /
+    // m04AnchorUrl, which are already persisted on the job — no need to regenerate the
+    // full-body anchors just to swap a prompt. This keeps iteration fast and cheap and
+    // preserves the alternative prompt (rerunChain() would drop it).
     setRerunning(true);
+    setRerunningShotId(shot.shotId);
     try {
+      const isFullBody = shot.type === 'M03' || shot.type === 'M04';
       await fetch(`/api/generate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -478,21 +510,119 @@ export default function ResultsPage() {
           modelId: shot.modelId || job?.modelIds?.[0],
           shotType: shot.type,
           variant: shot.variant,
-          designNumber: job?.designNumber,
-          garmentCategory: job?.garmentCategory,
-          flatImageUrl: job?.flatImageUrl || '',
-          image360Urls: job?.image360Urls || [],
-          modification: modificationText,
-          originalPrompt: '',
+          alternativePromptId: promptId,
+          alternativePromptLabel: promptLabel,
           version: shot.version + 1,
+          ...(isFullBody ? { useDressedBase: true } : {}),
         }),
       });
+      fetchData();
+    } catch (e) {
+      console.error('Rerun with alternative failed:', e);
+    } finally {
+      setRerunning(false);
+      setRerunningShotId(null);
+    }
+  };
+
+  const rerunWithDressedBase = async (shot: ShotData) => {
+    // Queue-path: reset shot with useDressedBase=true, kick worker. Safe to call
+    // even if another shot is mid-generation — worker will pick this one up after.
+    setRerunningShotId(shot.shotId);
+    try {
+      await fetch(`/api/shots/${shot.shotId}/reset`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          incrementVersion: true,
+          useDressedBase: true,
+        }),
+      });
+      await kickWorker();
+      fetchData();
+    } catch (e) {
+      console.error('Rerun with dressed base failed:', e);
+    } finally {
+      setRerunningShotId(null);
+    }
+  };
+
+  const rerunShot = async (shot: ShotData) => {
+    // M01/M02 (cropped shots): rerun full chain M03→M04→M01→M02 with dressed base
+    // so foot proportions are corrected in the full-body anchors first
+    if (shot.type === 'M01' || shot.type === 'M02') {
+      return rerunChain();
+    }
+    // Queue-path rerun: reset shot to 'queued' and kick the worker. This lets the
+    // worker pick it up even if another shot is mid-generation — no races with
+    // direct /api/generate calls, and the UI doesn't need a global lock.
+    setRerunningShotId(shot.shotId);
+    try {
+      const isFullBody = shot.type === 'M03' || shot.type === 'M04';
+      await fetch(`/api/shots/${shot.shotId}/reset`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          incrementVersion: true,
+          ...(isFullBody ? { useDressedBase: true } : {}),
+        }),
+      });
+      await kickWorker();
       setModificationText('');
       fetchData();
     } catch (e) {
       console.error('Rerun failed:', e);
     } finally {
-      setRerunning(false);
+      setRerunningShotId(null);
+    }
+  };
+
+  const [restoringVersion, setRestoringVersion] = useState<number | null>(null);
+
+  const restoreVersion = async (shotId: string, version: number) => {
+    setRestoringVersion(version);
+    try {
+      const res = await fetch(`/api/shots/${shotId}/restore`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ version }),
+      });
+      if (!res.ok) {
+        const err = await res.json();
+        console.error('Restore failed:', err);
+        return;
+      }
+      fetchData();
+    } catch (e) {
+      console.error('Restore failed:', e);
+    } finally {
+      setRestoringVersion(null);
+    }
+  };
+
+  // Reset a shot to its very first version (before any label composite).
+  // Uses the existing /restore endpoint with version 1.
+  const resetToRaw = async (shot: ShotData) => {
+    if (!shot.previousVersions || shot.previousVersions.length === 0) return;
+    const raw = shot.previousVersions.find(pv => pv.version === 1) || shot.previousVersions[0];
+    if (!confirm(`Reset ${shot.label} to raw (v${raw.version})? Current version will be saved to history.`)) return;
+    setResettingLabelShotId(shot.shotId);
+    try {
+      const res = await fetch(`/api/shots/${shot.shotId}/restore`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ version: raw.version }),
+      });
+      if (!res.ok) {
+        const err = await res.json();
+        console.error('Reset to raw failed:', err);
+        return;
+      }
+      fetchData();
+    } catch (e) {
+      console.error('Reset to raw failed:', e);
+    } finally {
+      setResettingLabelShotId(null);
     }
   };
 
@@ -501,9 +631,16 @@ export default function ResultsPage() {
     if (shotsToRetry.length === 0) return;
     setRerunning(true);
     try {
-      // 1. Reset each shot to 'queued'
+      // 1. Reset each shot to 'queued' — M03/M04 get dressed base for foot correction
       for (const shot of shotsToRetry) {
-        await fetch(`/api/shots/${shot.shotId}/reset`, { method: 'POST' });
+        const isFullBody = shot.type === 'M03' || shot.type === 'M04';
+        await fetch(`/api/shots/${shot.shotId}/reset`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            ...(isFullBody ? { useDressedBase: true } : {}),
+          }),
+        });
       }
       // 2. Kick the worker
       await kickWorker();
@@ -527,12 +664,47 @@ export default function ResultsPage() {
     setRerunning(true);
     try {
       for (const shot of held) {
-        await fetch(`/api/shots/${shot.shotId}/reset`, { method: 'POST' });
+        const isFullBody = shot.type === 'M03' || shot.type === 'M04';
+        await fetch(`/api/shots/${shot.shotId}/reset`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            ...(isFullBody ? { useDressedBase: true } : {}),
+          }),
+        });
       }
       await kickWorker();
       fetchData();
     } catch (e) {
       console.error('Generate remaining failed:', e);
+    } finally {
+      setRerunning(false);
+    }
+  };
+
+  // Rerun the full dependency chain M03→M04→M01→M02 with dressed base, skip M05.
+  // Used when re-running M01/M02 — feet proportions need the full pipeline.
+  const rerunChain = async () => {
+    const chainTypes = ['M03', 'M04', 'M01', 'M02'];
+    const chainShots = shots.filter(s => chainTypes.includes(s.type));
+    if (chainShots.length === 0) return;
+    setRerunning(true);
+    try {
+      for (const shot of chainShots) {
+        const isFullBody = shot.type === 'M03' || shot.type === 'M04';
+        await fetch(`/api/shots/${shot.shotId}/reset`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            incrementVersion: true,
+            ...(isFullBody ? { useDressedBase: true } : {}),
+          }),
+        });
+      }
+      await kickWorker();
+      fetchData();
+    } catch (e) {
+      console.error('Rerun chain failed:', e);
     } finally {
       setRerunning(false);
     }
@@ -544,10 +716,14 @@ export default function ResultsPage() {
     setRerunning(true);
     try {
       for (const shot of shots) {
+        const isFullBody = shot.type === 'M03' || shot.type === 'M04';
         await fetch(`/api/shots/${shot.shotId}/reset`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ incrementVersion: true }),
+          body: JSON.stringify({
+            incrementVersion: true,
+            ...(isFullBody ? { useDressedBase: true } : {}),
+          }),
         });
       }
       await kickWorker();
@@ -612,11 +788,42 @@ export default function ResultsPage() {
             </div>
           )}
         </div>
-        {allApproved && (
-          <button className="bg-green-600 text-white px-6 py-2.5 text-sm font-medium hover:bg-green-700 transition-colors">
-            Complete Job
-          </button>
-        )}
+        <div className="flex items-center gap-2">
+          {/* Rerun with Seedream — one-shot override. Previous versions stay restorable. */}
+          {!generating && shots.length > 0 && (
+            <button
+              onClick={async () => {
+                const ok = window.confirm(
+                  'Rerun all 5 with Seedream. Previous versions stay restorable. Continue?'
+                );
+                if (!ok) return;
+                try {
+                  const resp = await fetch(`/api/jobs/${jobId}/rerun-with-seedream`, {
+                    method: 'POST',
+                  });
+                  if (!resp.ok) {
+                    const txt = await resp.text();
+                    alert(`Rerun failed: ${txt.substring(0, 200)}`);
+                    return;
+                  }
+                  // Refresh the page so the polling picks up the new 'generating' state
+                  window.location.reload();
+                } catch (e) {
+                  alert(`Rerun failed: ${String(e)}`);
+                }
+              }}
+              className="border border-purple-600 text-purple-700 px-4 py-2.5 text-sm font-medium hover:bg-purple-50 transition-colors"
+              title="Rerun all 5 shots with Seedream 4.5. Previous Gemini versions preserved in version history."
+            >
+              Rerun with Seedream
+            </button>
+          )}
+          {allApproved && (
+            <button className="bg-green-600 text-white px-6 py-2.5 text-sm font-medium hover:bg-green-700 transition-colors">
+              Complete Job
+            </button>
+          )}
+        </div>
       </div>
 
       {/* Queue position banner — shows when job is waiting for another to finish */}
@@ -764,7 +971,7 @@ export default function ResultsPage() {
                 <img
                   src={shot.imageUrl}
                   alt={shot.label}
-                  className="w-full h-full object-cover object-top"
+                  className="w-full h-full object-contain"
                   onDoubleClick={(e) => {
                     e.stopPropagation();
                     if (shot.imageUrl) window.open(shot.imageUrl, '_blank');
@@ -838,6 +1045,15 @@ export default function ResultsPage() {
             </div>
             <div className="p-2">
               <p className="text-xs text-neutral-600">{shot.label}</p>
+              {shot.provider === 'seedream' && (
+                <p className="text-[10px] text-purple-600 font-medium mt-0.5">Seedream</p>
+              )}
+              {shot.alternativePromptLabel && (
+                <p className="text-[10px] text-blue-600 font-medium mt-0.5">{shot.alternativePromptLabel}</p>
+              )}
+              {shot.usedDressedBase && (
+                <p className="text-[10px] text-emerald-600 font-medium mt-0.5">Dressed Base</p>
+              )}
             </div>
           </div>
         ))}
@@ -849,13 +1065,13 @@ export default function ResultsPage() {
           <div className="flex gap-6">
             {/* Large preview — click to open 4K in new tab */}
             <div className="w-80 flex-shrink-0">
-              <div className="aspect-[3/4] bg-neutral-100 border border-neutral-200 overflow-hidden relative group">
+              <div className="bg-neutral-100 border border-neutral-200 overflow-hidden relative group" style={{ maxHeight: '600px' }}>
                 {selectedShot.imageUrl ? (
                   <>
                     <img
                       src={selectedShot.imageUrl}
                       alt={selectedShot.label}
-                      className="w-full h-full object-cover cursor-zoom-in"
+                      className="w-full h-auto max-h-[600px] object-contain cursor-zoom-in"
                       onClick={() => selectedShot.imageUrl && window.open(selectedShot.imageUrl, '_blank')}
                     />
                     <div className="absolute bottom-2 right-2 bg-black/60 text-white text-[10px] px-2 py-1 opacity-0 group-hover:opacity-100 transition-opacity">
@@ -878,6 +1094,27 @@ export default function ResultsPage() {
                 <p className="text-sm text-neutral-500">
                   Version {selectedShot.version} — {selectedShot.status}
                 </p>
+                {selectedShot.alternativePromptLabel && (
+                  <div className="mt-1 flex items-center gap-2">
+                    <span className="inline-flex items-center px-2.5 py-1 text-xs font-semibold bg-blue-50 text-blue-700 border border-blue-200 rounded">
+                      Rerun: {selectedShot.alternativePromptLabel}
+                    </span>
+                  </div>
+                )}
+                {selectedShot.usedDressedBase && (
+                  <div className="mt-1 flex items-center gap-2">
+                    <span className="inline-flex items-center px-2.5 py-1 text-xs font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200 rounded">
+                      Dressed Base Pipeline
+                    </span>
+                  </div>
+                )}
+                {selectedShot.version > 1 && !selectedShot.alternativePromptLabel && (
+                  <div className="mt-1">
+                    <span className="inline-flex items-center px-2.5 py-1 text-xs font-medium bg-neutral-100 text-neutral-600 rounded">
+                      Rerun: base prompt
+                    </span>
+                  </div>
+                )}
               </div>
 
               {selectedShot.status === 'failed' && (
@@ -893,12 +1130,35 @@ export default function ResultsPage() {
                 </div>
               )}
 
-              {(selectedShot.status === 'queued' || selectedShot.status === 'generating') && (
+              {selectedShot.status === 'generating' && (
                 <div className="space-y-3">
-                  <p className="text-sm text-amber-600">
-                    {selectedShot.status === 'queued' ? 'Shot is stuck in queue.' : 'Shot appears stuck generating.'}
-                    {' '}You can retry it.
-                  </p>
+                  <div className="flex items-center gap-3">
+                    <div className="w-5 h-5 border-2 border-neutral-300 border-t-neutral-900 rounded-full animate-spin" />
+                    <p className="text-sm text-neutral-600">
+                      {selectedShot.progressStep || 'Generating...'}
+                      {selectedShot.progressPct !== undefined && selectedShot.progressPct > 0 && (
+                        <span className="ml-2 text-neutral-400">({selectedShot.progressPct}%)</span>
+                      )}
+                    </p>
+                  </div>
+                  {selectedShot.progressPct !== undefined && selectedShot.progressPct > 0 && (
+                    <div className="w-full h-1.5 bg-neutral-200 rounded-full overflow-hidden">
+                      <div className="h-full bg-neutral-700 rounded-full transition-all duration-500" style={{ width: `${selectedShot.progressPct}%` }} />
+                    </div>
+                  )}
+                  <button
+                    onClick={() => rerunShot(selectedShot)}
+                    disabled={rerunning}
+                    className="text-xs text-neutral-400 hover:text-neutral-600 transition-colors underline"
+                  >
+                    Not working? Retry
+                  </button>
+                </div>
+              )}
+
+              {selectedShot.status === 'queued' && (
+                <div className="space-y-3">
+                  <p className="text-sm text-neutral-500">Queued — waiting for dependencies or worker.</p>
                   <button
                     onClick={() => rerunShot(selectedShot)}
                     disabled={rerunning}
@@ -919,15 +1179,22 @@ export default function ResultsPage() {
                         {selectedShot.previousVersions.map((pv, i) => (
                           <div
                             key={i}
-                            className="flex-shrink-0 cursor-pointer group"
-                            onClick={() => window.open(pv.imageUrl, '_blank')}
+                            className="flex-shrink-0 group text-center"
                           >
                             <img
                               src={pv.imageUrl}
                               alt={`v${pv.version}`}
-                              className="w-16 h-20 object-cover object-top border border-neutral-200 group-hover:border-neutral-400 transition-colors"
+                              className="w-16 h-20 object-cover object-top border border-neutral-200 group-hover:border-neutral-400 transition-colors cursor-pointer"
+                              onClick={() => window.open(pv.imageUrl, '_blank')}
                             />
-                            <p className="text-[9px] text-neutral-400 text-center mt-0.5">v{pv.version}</p>
+                            <p className="text-[9px] text-neutral-400 mt-0.5">v{pv.version}</p>
+                            <button
+                              onClick={() => restoreVersion(selectedShot.shotId, pv.version)}
+                              disabled={restoringVersion === pv.version}
+                              className="text-[9px] text-blue-600 hover:text-blue-800 font-medium disabled:text-neutral-400 mt-0.5"
+                            >
+                              {restoringVersion === pv.version ? 'Restoring…' : 'Restore'}
+                            </button>
                           </div>
                         ))}
                       </div>
@@ -943,12 +1210,91 @@ export default function ResultsPage() {
                     </button>
                     <button
                       onClick={() => rerunShot(selectedShot)}
-                      disabled={rerunning}
+                      disabled={rerunningShotId === selectedShot.shotId}
                       className="border border-neutral-300 px-6 py-2.5 text-sm font-medium text-neutral-600 hover:bg-neutral-50 transition-colors disabled:opacity-50"
                     >
-                      {rerunning ? 'Re-generating...' : 'Re-run This Shot'}
+                      {rerunningShotId === selectedShot.shotId ? 'Queueing...' : (selectedShot.type === 'M01' || selectedShot.type === 'M02') ? 'Re-run M03→M04→M01→M02' : 'Re-run This Shot'}
                     </button>
                   </div>
+
+                  {/* Info text for M01/M02 chain rerun */}
+                  {(selectedShot.type === 'M01' || selectedShot.type === 'M02') && (
+                    <p className="text-[10px] text-neutral-400 -mt-2">
+                      Re-runs full chain with foot correction. M05 stays untouched.
+                    </p>
+                  )}
+
+                  {/* Alternative prompt rerun buttons */}
+                  {alternatives.length > 0 && (
+                    <div className="border-t border-neutral-200 pt-4">
+                      <label className="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-2">
+                        Re-run with alternative prompt
+                      </label>
+                      <div className="flex flex-wrap gap-2">
+                        {alternatives.map(alt => {
+                          const isThisShotRerunning = rerunningShotId === selectedShot.shotId;
+                          return (
+                            <button
+                              key={alt.id}
+                              onClick={() => rerunWithAlternative(selectedShot, alt.id, alt.label)}
+                              disabled={isThisShotRerunning}
+                              className="border border-blue-300 bg-blue-50 px-4 py-2 text-xs font-medium text-blue-700 hover:bg-blue-100 transition-colors disabled:opacity-30"
+                            >
+                              {alt.label}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Leather label manual mapping — M02/M04 only */}
+                  {(selectedShot.type === 'M02' || selectedShot.type === 'M04') && selectedShot.imageUrl && (
+                    <div className="border-t border-neutral-200 pt-4">
+                      <label className="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-2">
+                        Leather label
+                      </label>
+                      <div className="flex gap-2">
+                        <button
+                          onClick={() => setLabelPickerShotId(selectedShot.shotId)}
+                          className="border border-amber-400 bg-amber-50 px-4 py-2 text-xs font-medium text-amber-800 hover:bg-amber-100 transition-colors"
+                        >
+                          Map label manually
+                        </button>
+                        {selectedShot.previousVersions && selectedShot.previousVersions.length > 0 && (
+                          <button
+                            onClick={() => resetToRaw(selectedShot)}
+                            disabled={resettingLabelShotId === selectedShot.shotId}
+                            className="border border-neutral-300 px-4 py-2 text-xs font-medium text-neutral-600 hover:bg-neutral-50 disabled:opacity-30"
+                          >
+                            {resettingLabelShotId === selectedShot.shotId ? 'Resetting…' : 'Reset to raw'}
+                          </button>
+                        )}
+                      </div>
+                      <p className="text-[10px] text-neutral-400 mt-1.5">
+                        Drag the 4 corners onto the label area. Requires labelConfig on the focus garment.
+                      </p>
+                    </div>
+                  )}
+
+                  {/* Dressed base pipeline toggle — M03/M04 only */}
+                  {(selectedShot.type === 'M03' || selectedShot.type === 'M04') && (
+                    <div className="border-t border-neutral-200 pt-4">
+                      <label className="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-2">
+                        Foot proportion correction
+                      </label>
+                      <button
+                        onClick={() => rerunWithDressedBase(selectedShot)}
+                        disabled={rerunningShotId === selectedShot.shotId}
+                        className="border border-emerald-400 bg-emerald-50 px-4 py-2 text-xs font-medium text-emerald-700 hover:bg-emerald-100 transition-colors disabled:opacity-30"
+                      >
+                        {rerunningShotId === selectedShot.shotId ? 'Generating...' : 'Dressed Base Pipeline'}
+                      </button>
+                      <p className="text-[10px] text-neutral-400 mt-1.5">
+                        5-pass: generates corrected body proportions first, then dresses with garments. ~15s longer.
+                      </p>
+                    </div>
+                  )}
 
                   <div className="border-t border-neutral-200 pt-4">
                     <label className="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-1.5">
@@ -964,10 +1310,10 @@ export default function ResultsPage() {
                     {modificationText && (
                       <button
                         onClick={() => rerunShot(selectedShot)}
-                        disabled={rerunning}
+                        disabled={rerunningShotId === selectedShot.shotId}
                         className="mt-2 border border-neutral-300 px-6 py-2 text-sm font-medium text-neutral-600 hover:bg-neutral-50 transition-colors disabled:opacity-30"
                       >
-                        {rerunning ? 'Re-generating...' : 'Re-run With Instructions'}
+                        {rerunningShotId === selectedShot.shotId ? 'Queueing...' : 'Re-run With Instructions'}
                       </button>
                     )}
                   </div>
@@ -993,6 +1339,26 @@ export default function ResultsPage() {
       {lightboxUrl && (
         <Lightbox imageUrl={lightboxUrl} onClose={() => setLightboxUrl(null)} />
       )}
+
+      {/* Label corner picker modal */}
+      {labelPickerShotId && (() => {
+        const shot = shots.find(s => s.shotId === labelPickerShotId);
+        if (!shot || !shot.imageUrl) return null;
+        if (shot.type !== 'M02' && shot.type !== 'M04') return null;
+        return (
+          <LabelCornerPicker
+            imageUrl={shot.imageUrl}
+            shotId={shot.shotId}
+            shotType={shot.type as 'M02' | 'M04'}
+            onClose={() => setLabelPickerShotId(null)}
+            onApplied={() => {
+              setLabelPickerShotId(null);
+              fetchData();
+            }}
+          />
+        );
+      })()}
+
     </Shell>
   );
 }

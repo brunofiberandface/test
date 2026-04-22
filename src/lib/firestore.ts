@@ -1,9 +1,9 @@
 import { Firestore, FieldValue } from '@google-cloud/firestore';
 import crypto from 'crypto';
 
-// Initialize Firestore
+// Initialize Firestore — always targets gstar-ai-studio (NOT the Gemini billing project)
 export const db = new Firestore({
-  projectId: process.env.GCP_PROJECT || 'gstar-ai-studio',
+  projectId: process.env.FIRESTORE_PROJECT || 'gstar-ai-studio',
 });
 
 // ── Collections ──
@@ -16,6 +16,9 @@ export const otpCol = db.collection('otpCodes');
 export const wardrobeCol = db.collection('wardrobe');
 export const commentsCol = db.collection('comments');
 export const promptVaultCol = db.collection('promptVault');
+export const labelTemplatesCol = db.collection('labelTemplates');
+export const labelStylesCol = db.collection('labelStyles');
+export const labelColorwaysCol = db.collection('labelColorways');
 
 // ── User operations ──
 export async function getUser(email: string) {
@@ -146,6 +149,7 @@ export async function updateModel(modelId: string, data: Partial<{
   name: string;
   description: string;
   referenceImageUrl: string;
+  backReferenceImageUrl: string;
   active: boolean;
 }>) {
   await modelsCol.doc(modelId).update({ ...data, updatedAt: new Date() });
@@ -162,6 +166,8 @@ export async function createJob(data: {
     bottom: { itemId: string; isFocus: boolean };
   };
   promptRevisions: Record<string, number>;
+  stylingNotes?: string;
+  provider?: 'gemini' | 'seedream';
 }) {
   const ref = jobsCol.doc();
   await ref.set({
@@ -322,6 +328,11 @@ export async function updateShot(shotId: string, data: Partial<{
   progressStep: string;
   progressPct: number;
   prompt: string;
+  provider: 'gemini' | 'seedream';
+  alternativePromptId: string;
+  alternativePromptLabel: string;
+  usedDressedBase: boolean;
+  previousVersions: Array<{ imageUrl: string; version: number; createdAt: Date; provider?: 'gemini' | 'seedream' }>;
 }>) {
   await shotsCol.doc(shotId).update({ ...data, updatedAt: new Date() });
 }
@@ -412,6 +423,9 @@ export async function uploadPromptFile(data: {
   uploadedBy: string;
   silhouettePrompt?: string;
   generationPrompt?: string;
+  isAlternative?: boolean;
+  label?: string;
+  pipeline?: 'gemini' | 'seedream';
 }): Promise<{ id: string; revision: number }> {
   // Find the latest revision for this shot type (and optional category)
   let query: FirebaseFirestore.Query = promptVaultCol
@@ -430,27 +444,43 @@ export async function uploadPromptFile(data: {
   const latestRevision = snap.empty ? 0 : (snap.docs[0].data().revision || 0);
   const newRevision = latestRevision + 1;
 
-  // Deactivate all previous active revisions for this shot type
-  const activeSnap = await promptVaultCol
-    .where('shotType', '==', data.shotType)
-    .where('isActive', '==', true)
-    .get();
   const batch = db.batch();
-  activeSnap.docs.forEach(doc => {
-    // Only deactivate matching category (or all if no category)
-    const docData = doc.data();
-    if (!data.category || docData.category === data.category) {
-      batch.update(doc.ref, { isActive: false });
-    }
-  });
 
-  // Create new revision
+  // Only deactivate previous active revisions for BASE prompts (not alternatives)
+  // Scoped by pipeline — Seedream upload only deactivates other Seedream bases.
+  if (!data.isAlternative) {
+    let deactivateQuery: FirebaseFirestore.Query = promptVaultCol
+      .where('shotType', '==', data.shotType)
+      .where('isActive', '==', true);
+    if (data.pipeline) {
+      deactivateQuery = deactivateQuery.where('pipeline', '==', data.pipeline);
+    }
+    const activeSnap = await deactivateQuery.get();
+    activeSnap.docs.forEach(doc => {
+      const docData = doc.data();
+      // Skip alternatives when deactivating
+      if (docData.isAlternative) return;
+      // If no pipeline on the upload, only deactivate docs without pipeline (legacy Gemini)
+      if (!data.pipeline && docData.pipeline) return;
+      if (!data.category || docData.category === data.category) {
+        batch.update(doc.ref, { isActive: false });
+      }
+    });
+  }
+
+  // Create new revision — strip undefined values (Firestore rejects them)
   const ref = promptVaultCol.doc();
+  const cleanData: Record<string, any> = {};
+  for (const [k, v] of Object.entries(data)) {
+    if (v !== undefined) cleanData[k] = v;
+  }
   batch.set(ref, {
     id: ref.id,
-    ...data,
+    ...cleanData,
     revision: newRevision,
-    isActive: true,
+    isActive: !data.isAlternative,
+    isAlternative: data.isAlternative || false,
+    ...(data.label ? { label: data.label } : {}),
     uploadedAt: new Date(),
   });
 
@@ -461,14 +491,35 @@ export async function uploadPromptFile(data: {
 /**
  * Get the active prompt file for a shot type.
  */
-export async function getActivePrompt(shotType: string, category?: string): Promise<any | null> {
+export async function getActivePrompt(shotType: string, category?: string, pipeline?: 'gemini' | 'seedream'): Promise<any | null> {
   let query: FirebaseFirestore.Query = promptVaultCol
     .where('shotType', '==', shotType)
     .where('isActive', '==', true);
   if (category) {
     query = query.where('category', '==', category);
   }
+  if (pipeline) {
+    query = query.where('pipeline', '==', pipeline);
+  }
   const snap = await query.limit(1).get();
+
+  // Fallback: if pipeline-specific prompt not found, try without pipeline filter
+  // (backward compat — existing gemini prompts don't have the pipeline field)
+  if (snap.empty && pipeline) {
+    let fallbackQuery: FirebaseFirestore.Query = promptVaultCol
+      .where('shotType', '==', shotType)
+      .where('isActive', '==', true);
+    if (category) {
+      fallbackQuery = fallbackQuery.where('category', '==', category);
+    }
+    const fallbackSnap = await fallbackQuery.limit(1).get();
+    if (!fallbackSnap.empty) {
+      const data = fallbackSnap.docs[0].data();
+      console.log(`[PromptVault] No ${pipeline} prompt for ${shotType} — falling back to untagged prompt`);
+      return { id: fallbackSnap.docs[0].id, ...data };
+    }
+  }
+
   if (snap.empty) return null;
   const data = snap.docs[0].data();
   return { id: snap.docs[0].id, ...data };
@@ -490,6 +541,31 @@ export async function listPromptFiles(shotType?: string) {
     return {
       id: d.id,
       ...data,
+      uploadedAt: data.uploadedAt?.toDate?.() ? data.uploadedAt.toDate().toISOString() : data.uploadedAt,
+    };
+  });
+}
+
+/**
+ * List alternative prompts for a shot type (rerun-only prompts).
+ * When pipeline is specified, only returns alternatives matching that pipeline.
+ */
+export async function listAlternativePrompts(shotType: string, pipeline?: 'gemini' | 'seedream') {
+  let query: FirebaseFirestore.Query = promptVaultCol
+    .where('shotType', '==', shotType)
+    .where('isAlternative', '==', true);
+  if (pipeline) {
+    query = query.where('pipeline', '==', pipeline);
+  }
+  const snap = await query.get();
+  return snap.docs.map(d => {
+    const data = d.data();
+    return {
+      id: d.id,
+      label: data.label || data.filename,
+      shotType: data.shotType,
+      pipeline: data.pipeline || null,
+      revision: data.revision,
       uploadedAt: data.uploadedAt?.toDate?.() ? data.uploadedAt.toDate().toISOString() : data.uploadedAt,
     };
   });
@@ -786,6 +862,197 @@ export async function forceReleaseGenerationLock() {
 }
 export async function updateQueueHeartbeat() {
   await updateWorkerHeartbeat();
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Leather label — three-tier schema CRUD (ADR-001 Option B, v1)
+// ══════════════════════════════════════════════════════════════════════════
+
+import type {
+  LabelTemplate,
+  LabelStyle,
+  LabelColorway,
+  LabelRenderConfig,
+  Point2D,
+} from '@/types';
+
+// ── Tier 1: labelTemplates ────────────────────────────────────────────────
+
+export async function getLabelTemplate(
+  templateId: string,
+): Promise<LabelTemplate | null> {
+  const doc = await labelTemplatesCol.doc(templateId).get();
+  if (!doc.exists) return null;
+  const data = doc.data()!;
+  return {
+    templateId,
+    name: data.name,
+    artworkUrl: data.artworkUrl,
+    materialTileUrls: data.materialTileUrls || {},
+    aspectRatio: data.aspectRatio,
+    createdAt: (data.createdAt as { toDate?: () => Date })?.toDate?.() || new Date(),
+    updatedAt: (data.updatedAt as { toDate?: () => Date })?.toDate?.() || new Date(),
+  };
+}
+
+export async function upsertLabelTemplate(
+  t: Omit<LabelTemplate, 'createdAt' | 'updatedAt'>,
+): Promise<void> {
+  const ref = labelTemplatesCol.doc(t.templateId);
+  const existing = await ref.get();
+  const now = new Date();
+  if (existing.exists) {
+    await ref.update({
+      name: t.name || null,
+      artworkUrl: t.artworkUrl,
+      materialTileUrls: t.materialTileUrls,
+      aspectRatio: t.aspectRatio,
+      updatedAt: now,
+    });
+  } else {
+    await ref.set({
+      name: t.name || null,
+      artworkUrl: t.artworkUrl,
+      materialTileUrls: t.materialTileUrls,
+      aspectRatio: t.aspectRatio,
+      createdAt: now,
+      updatedAt: now,
+    });
+  }
+}
+
+export async function listLabelTemplates(): Promise<LabelTemplate[]> {
+  const snap = await labelTemplatesCol.orderBy('updatedAt', 'desc').get();
+  return snap.docs.map((d) => {
+    const data = d.data();
+    return {
+      templateId: d.id,
+      name: data.name,
+      artworkUrl: data.artworkUrl,
+      materialTileUrls: data.materialTileUrls || {},
+      aspectRatio: data.aspectRatio,
+      createdAt: (data.createdAt as { toDate?: () => Date })?.toDate?.() || new Date(),
+      updatedAt: (data.updatedAt as { toDate?: () => Date })?.toDate?.() || new Date(),
+    };
+  });
+}
+
+// ── Tier 2: labelStyles ────────────────────────────────────────────────────
+
+export async function getLabelStyle(
+  styleCode: string,
+): Promise<LabelStyle | null> {
+  const doc = await labelStylesCol.doc(styleCode).get();
+  if (!doc.exists) return null;
+  const data = doc.data()!;
+  return {
+    styleCode,
+    templateId: data.templateId,
+    anchorPhoto: data.anchorPhoto,
+    labelCorners: data.labelCorners as [Point2D, Point2D, Point2D, Point2D],
+    pocketCorners: data.pocketCorners as [Point2D, Point2D, Point2D, Point2D],
+    updatedBy: data.updatedBy,
+    updatedAt: (data.updatedAt as { toDate?: () => Date })?.toDate?.() || new Date(),
+  };
+}
+
+export async function upsertLabelStyle(
+  s: Omit<LabelStyle, 'updatedAt'>,
+): Promise<void> {
+  await labelStylesCol.doc(s.styleCode).set(
+    {
+      templateId: s.templateId,
+      anchorPhoto: s.anchorPhoto,
+      labelCorners: s.labelCorners,
+      pocketCorners: s.pocketCorners,
+      updatedBy: s.updatedBy,
+      updatedAt: new Date(),
+    },
+    { merge: true },
+  );
+}
+
+// ── Tier 3: labelColorways ─────────────────────────────────────────────────
+
+export function colorwayDocId(styleCode: string, colorwayCode: string): string {
+  return `${styleCode}_${colorwayCode}`;
+}
+
+export async function getLabelColorway(
+  styleCode: string,
+  colorwayCode: string,
+): Promise<LabelColorway | null> {
+  const doc = await labelColorwaysCol
+    .doc(colorwayDocId(styleCode, colorwayCode))
+    .get();
+  if (!doc.exists) return null;
+  const data = doc.data()!;
+  return {
+    styleCode,
+    colorwayCode,
+    colorwayName: data.colorwayName,
+    baseColor: data.baseColor,
+    stitchColor: data.stitchColor,
+    embossStrength: data.embossStrength,
+    grainVariant: data.grainVariant,
+    sampledFromPhoto: data.sampledFromPhoto,
+    updatedBy: data.updatedBy,
+    updatedAt: (data.updatedAt as { toDate?: () => Date })?.toDate?.() || new Date(),
+  };
+}
+
+export async function upsertLabelColorway(
+  c: Omit<LabelColorway, 'updatedAt'>,
+): Promise<void> {
+  await labelColorwaysCol.doc(colorwayDocId(c.styleCode, c.colorwayCode)).set(
+    {
+      styleCode: c.styleCode,
+      colorwayCode: c.colorwayCode,
+      colorwayName: c.colorwayName || null,
+      baseColor: c.baseColor,
+      stitchColor: c.stitchColor || null,
+      embossStrength: c.embossStrength,
+      grainVariant: c.grainVariant,
+      sampledFromPhoto: c.sampledFromPhoto || null,
+      updatedBy: c.updatedBy,
+      updatedAt: new Date(),
+    },
+    { merge: true },
+  );
+}
+
+// ── Resolve: merge all three tiers into a single render config ─────────────
+
+/**
+ * Read template + style + colorway, merge into a single LabelRenderConfig
+ * ready for the hybrid-label shader. Returns null if any tier is missing —
+ * caller should log and skip the composite in that case.
+ */
+export async function resolveLabelRenderConfig(
+  styleCode: string,
+  colorwayCode: string,
+): Promise<LabelRenderConfig | null> {
+  const style = await getLabelStyle(styleCode);
+  if (!style) return null;
+  const colorway = await getLabelColorway(styleCode, colorwayCode);
+  if (!colorway) return null;
+  const template = await getLabelTemplate(style.templateId);
+  if (!template) return null;
+  const materialTileUrl = template.materialTileUrls[colorway.grainVariant];
+  if (!materialTileUrl) return null;
+  return {
+    templateId: template.templateId,
+    artworkUrl: template.artworkUrl,
+    materialTileUrl,
+    baseColor: colorway.baseColor,
+    stitchColor: colorway.stitchColor,
+    embossStrength: colorway.embossStrength,
+    grainVariant: colorway.grainVariant,
+    labelCorners: style.labelCorners,
+    pocketCorners: style.pocketCorners,
+    anchorPhotoWidth: style.anchorPhoto.width,
+    anchorPhotoHeight: style.anchorPhoto.height,
+  };
 }
 
 export default db;

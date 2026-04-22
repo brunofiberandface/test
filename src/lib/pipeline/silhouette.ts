@@ -1,9 +1,14 @@
 /**
- * Silhouette analysis via Flash Lite.
+ * Silhouette analysis via Claude Opus 4.6.
  * Analyzes garment width, fit, drape, and proportions from fit model images.
  * Output is injected into generation prompts as {silhouette}.
+ *
+ * Upgraded from Gemini 2.5 Flash Lite → Claude Opus 4.6 (April 2026).
+ * A/B test showed Opus produces significantly more precise silhouette
+ * descriptions (specific width ratios per zone, 3D construction details,
+ * drape mechanics) at ~$0.03/job — negligible vs generation cost.
  */
-import { analyzeWithFlashLite } from '@/lib/vertex';
+import { analyzeWithClaude } from '@/lib/anthropic';
 import { prepareForAnalysis } from './image-prep';
 
 const FRONT_ANALYSIS_PROMPT = `You are a garment analysis expert. Study these 4 images of the same pair of pants:
@@ -60,16 +65,34 @@ export interface SilhouetteResult {
 }
 
 /**
+ * Build a fit-hint block to prepend to the analysis prompt.
+ * Uses the wardrobe item's product description (e.g. "LOUX BOYFRIEND WMN",
+ * "G-STRAIGHT", "SKINNY") as ground truth so the model cannot drift
+ * toward a slimmer classification when the fit model is slim-bodied.
+ */
+function buildFitHintBlock(fitHint?: string): string {
+  const trimmed = (fitHint || '').trim();
+  if (!trimmed) return '';
+  return `PRODUCT FIT SPEC (GROUND TRUTH): The product description for this garment is: "${trimmed}".
+Your analysis MUST be consistent with this description. If the description indicates a boyfriend, relaxed, loose, wide-leg, or oversized fit, do NOT classify it as skinny or slim just because the fit model's body happens to be slim. Describe the garment as the fit the product description specifies. If the description indicates a skinny or slim fit, describe it as such. When in doubt, the product description wins.
+
+`;
+}
+
+/**
  * Run silhouette analysis for both front and back views.
  * Input: flat images + 3 fit model angles per view direction.
+ * Optional fitHint (typically the wardrobe item's description) is
+ * prepended to the analysis prompt as a ground-truth anchor.
  */
 export async function analyzeSilhouette(images: {
   flatFront: Buffer;
   flatBack: Buffer | null;  // null if not available
   frontAngles: Buffer[];    // [front, front45Left, front45Right]
   backAngles: Buffer[];     // [back, back45Left, back45Right]
+  fitHint?: string;         // optional product description / fit spec
 }): Promise<SilhouetteResult> {
-  console.log('[Silhouette] Starting front + back analysis');
+  console.log(`[Silhouette] Starting front + back analysis via Claude Opus 4.6${images.fitHint ? ` (fitHint="${images.fitHint.slice(0, 60)}${images.fitHint.length > 60 ? '…' : ''}")` : ''}`);
 
   // Prepare images at 1200px
   const frontFlat = await prepareForAnalysis(images.flatFront);
@@ -80,21 +103,25 @@ export async function analyzeSilhouette(images: {
     : frontFlat; // fallback to front flat if no back available
   const backAnglesBufs = await Promise.all(images.backAngles.map(b => prepareForAnalysis(b)));
 
+  const fitHintBlock = buildFitHintBlock(images.fitHint);
+
   // Run both analyses in parallel
   const [frontResult, backResult] = await Promise.all([
-    analyzeWithFlashLite({
-      prompt: FRONT_ANALYSIS_PROMPT,
+    analyzeWithClaude({
+      prompt: fitHintBlock + FRONT_ANALYSIS_PROMPT,
       images: [
         { buffer: frontFlat, mimeType: 'image/jpeg' },
         ...frontAnglesBufs.map(b => ({ buffer: b, mimeType: 'image/jpeg' as const })),
       ],
+      model: 'claude-opus-4-6',
     }),
-    analyzeWithFlashLite({
-      prompt: BACK_ANALYSIS_PROMPT,
+    analyzeWithClaude({
+      prompt: fitHintBlock + BACK_ANALYSIS_PROMPT,
       images: [
         { buffer: backFlat, mimeType: 'image/jpeg' },
         ...backAnglesBufs.map(b => ({ buffer: b, mimeType: 'image/jpeg' as const })),
       ],
+      model: 'claude-opus-4-6',
     }),
   ]);
 
@@ -104,4 +131,75 @@ export async function analyzeSilhouette(images: {
     front: frontResult,
     back: backResult,
   };
+}
+
+// ── Helper for downloading images by URL ──
+async function downloadImage(url: string): Promise<Buffer> {
+  const res = await fetch(url.split('?')[0], { signal: AbortSignal.timeout(15_000) });
+  if (!res.ok) throw new Error(`Failed to download ${url}: ${res.status}`);
+  return Buffer.from(await res.arrayBuffer());
+}
+
+/**
+ * Run silhouette analysis for a wardrobe item and store the result on the doc.
+ * Called once during wardrobe upload and by the backfill endpoint.
+ * Returns the silhouette result (also written to Firestore).
+ */
+export async function runSilhouetteForWardrobe(wardrobeItemId: string): Promise<SilhouetteResult> {
+  const { wardrobeCol, getWardrobeItem } = await import('@/lib/firestore');
+  const { normalizeWardrobeItem } = await import('@/lib/wardrobe-compat');
+
+  const item = await getWardrobeItem(wardrobeItemId) as any;
+  if (!item) throw new Error(`Wardrobe item ${wardrobeItemId} not found`);
+
+  const normalized = normalizeWardrobeItem(item);
+  if (!normalized?.flatFrontUrl) {
+    throw new Error(`Wardrobe item ${wardrobeItemId} has no flat front image`);
+  }
+
+  const fm = normalized.fitModels;
+  if (!fm?.front || !fm?.back) {
+    throw new Error(`Wardrobe item ${wardrobeItemId} missing fit model angles`);
+  }
+
+  console.log(`[Silhouette] Running for wardrobe "${item.name}" (${wardrobeItemId})...`);
+
+  // Download all images
+  const [
+    frontBuf, front45LBuf, front45RBuf,
+    backBuf, back45LBuf, back45RBuf,
+    flatFrontBuf, flatBackBuf,
+  ] = await Promise.all([
+    downloadImage(fm.front),
+    downloadImage(fm.front45Left),
+    downloadImage(fm.front45Right),
+    downloadImage(fm.back),
+    downloadImage(fm.back45Left),
+    downloadImage(fm.back45Right),
+    downloadImage(normalized.flatFrontUrl),
+    normalized.flatBackUrl
+      ? downloadImage(normalized.flatBackUrl)
+      : Promise.resolve(null),
+  ]);
+
+  const fitHint = [item.name, item.description].filter(Boolean).join(' — ');
+
+  const result = await analyzeSilhouette({
+    flatFront: flatFrontBuf,
+    flatBack: flatBackBuf,
+    frontAngles: [frontBuf, front45LBuf, front45RBuf],
+    backAngles: [backBuf, back45LBuf, back45RBuf],
+    ...(fitHint ? { fitHint } : {}),
+  });
+
+  // Cache on the wardrobe doc
+  await wardrobeCol.doc(wardrobeItemId).update({
+    silhouetteFront: result.front,
+    silhouetteBack: result.back,
+    silhouetteAnalyzedAt: new Date(),
+    updatedAt: new Date(),
+  });
+
+  console.log(`[Silhouette] Cached on wardrobe "${item.name}" (front: ${result.front.length} chars, back: ${result.back.length} chars)`);
+  return result;
 }

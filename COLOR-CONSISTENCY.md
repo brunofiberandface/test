@@ -91,7 +91,7 @@ Return format:
 Return ONLY valid JSON.
 ```
 
-**Why bounding boxes over polygons:** VLMs are reliable at bounding boxes (simple 4-number outputs) but brittle at dense polygon coordinates. GrabCut then refines to pixel-perfect edges using color clustering — the same technique already proven in the label extraction pipeline.
+**Why bounding boxes over polygons:** VLMs are reliable at bounding boxes (simple 4-number outputs) but brittle at dense polygon coordinates. GrabCut then refines to pixel-perfect edges using color clustering — the same bbox-first, pixel-second discipline used by the hybrid label pipeline (Gemini 2.5 Flash Lite returns a 4-corner pocket quad; homography + OpenCV handles the rest).
 
 **Fallback:** If Gemini returns malformed JSON, fall back to full-image approach: white background exclusion (>240 gray) + skin HSV exclusion.
 
@@ -108,7 +108,8 @@ def normalize_to_pixel(norm_coord, dimension):
 def create_garment_mask(image, boxes):
     """
     Create pixel-perfect garment mask using Gemini bounding boxes + GrabCut.
-    Same pattern as label extraction pipeline.
+    Same Gemini-for-semantic / OpenCV-for-pixels split used by the hybrid
+    label pipeline (see LABEL-STRATEGY.md).
 
     Args:
         image: BGR image (the generated shot)

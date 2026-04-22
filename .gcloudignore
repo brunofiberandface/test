@@ -29,8 +29,9 @@ test_outputs/
 # Coverage reports
 coverage/
 
-# Local scripts — label_composite.py is needed for the label composite pipeline
-# Other scripts are excluded individually if needed
+# scripts/ MUST ship in the Cloud Build upload — contains label_hybrid.py for the
+# leather-label composite pipeline, called from src/lib/label-hybrid.ts via subprocess.
+# DO NOT add `scripts/` to the ignore list.
 
 # Old patch archives and scripts — frequently left in root, massively inflate upload size
 *.tar.gz

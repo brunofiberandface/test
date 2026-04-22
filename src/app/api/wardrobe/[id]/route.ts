@@ -31,10 +31,11 @@ export async function PATCH(
   try {
     const { id } = await params;
     const body = await req.json();
-    const { name, description, category, isPrimary, gender, openShoes, hasHeels, fitModelUrls, flatFrontBase64, flatBackBase64 } = body;
+    const { name, designNumber, description, category, isPrimary, gender, openShoes, hasHeels, fitModelUrls, fitModels, flatFrontBase64, flatBackBase64 } = body;
 
     const updates: Record<string, any> = { updatedAt: new Date() };
     if (name !== undefined) updates.name = name;
+    if (designNumber !== undefined) updates.designNumber = designNumber;
     if (description !== undefined) updates.description = description;
     if (category !== undefined) updates.category = category;
     if (isPrimary !== undefined) updates.isPrimary = isPrimary;
@@ -42,6 +43,28 @@ export async function PATCH(
     if (openShoes !== undefined) updates.openShoes = openShoes;
     if (hasHeels !== undefined) updates.hasHeels = hasHeels;
     if (fitModelUrls !== undefined) updates.fitModelUrls = fitModelUrls;
+
+    // v2 fit-model slot map — written by the angle-setup page.
+    // Accepts a partial map; merged into the existing doc. Setting a slot to '' clears it.
+    //
+    // Important: we do NOT touch the legacy fitModelUrls array. It stays as the raw pool of
+    // uploaded photos (including any "unused" ones not assigned to a canonical slot). Once
+    // fitModels is written, normalizeWardrobeItem() will read v2 first (sentinel on
+    // item.fitModels.front), so the legacy array is historical — we keep it so re-remapping
+    // later can still see all available photos.
+    if (fitModels !== undefined && fitModels !== null && typeof fitModels === 'object') {
+      const existing = (await getWardrobeItem(id) as any)?.fitModels || {};
+      const merged: Record<string, string> = { ...existing };
+      for (const [k, v] of Object.entries(fitModels as Record<string, string>)) {
+        if (typeof v === 'string') merged[k] = v;
+      }
+      updates.fitModels = merged;
+      if (merged.front) updates.thumbnailUrl = merged.front;
+    }
+
+    // Accept direct GCS URLs for flat images (no re-upload needed)
+    if (body.flatFrontUrl && !flatFrontBase64) updates.flatFrontUrl = body.flatFrontUrl;
+    if (body.flatBackUrl && !flatBackBase64) updates.flatBackUrl = body.flatBackUrl;
 
     // Upload flat front image if provided as base64
     if (flatFrontBase64) {

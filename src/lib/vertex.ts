@@ -1,12 +1,17 @@
 /**
- * Vertex AI Gemini client — v2 Pro pipeline.
+ * Gemini client — v3 dual-backend pipeline.
  *
  * Two models:
  * - gemini-3-pro-image-preview: Image generation (4K native)
  * - gemini-2.5-flash-lite: Silhouette analysis (text-only, fast)
  *
- * Uses Vertex AI global endpoint with OAuth.
- * Project: gstar-ai-studio (same project for auth + API).
+ * Supports two backends:
+ * - Generative Language API (preferred): API key auth, per-key rate limits
+ * - Vertex AI (fallback): OAuth token auth, per-project rate limits
+ *
+ * When an API key is provided, uses the Generative Language API.
+ * When no key is provided, falls back to Vertex AI with OAuth.
+ * This enables parallel generation with separate rate limit pools.
  */
 
 export interface ReferenceImage {
@@ -22,6 +27,11 @@ export interface GenerateImageParams {
   imageSize?: string;     // '4K' for Pro native upscaler
   model?: string;
   seed?: number;
+  apiKey?: string;        // If set, use Generative Language API instead of Vertex AI
+  // NOTE: Neither negative_prompt nor system_instruction work on the
+  // Vertex AI generateContent endpoint for image generation models.
+  // Both cause 400 errors. Foot proportion fix must be done via
+  // two-pass inpainting (generate → detect → re-generate bottom).
 }
 
 export interface GenerateImageResult {
@@ -34,6 +44,7 @@ export interface AnalyzeParams {
   images: { buffer: Buffer; mimeType: string }[];
   model?: string;
   temperature?: number;
+  apiKey?: string;        // If set, use Generative Language API instead of Vertex AI
 }
 
 // Retry config
@@ -49,6 +60,10 @@ function getGcpProject(): string {
 function getVertexUrl(model: string): string {
   const project = getGcpProject();
   return `https://aiplatform.googleapis.com/v1/projects/${project}/locations/global/publishers/google/models/${model}:generateContent`;
+}
+
+function getGeminiApiUrl(model: string, apiKey: string): string {
+  return `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
 }
 
 // Token cache
@@ -88,7 +103,12 @@ export async function generateImage(params: GenerateImageParams): Promise<Genera
     imageSize = '4K',
     model = 'gemini-3-pro-image-preview',
     seed,
+    apiKey: paramKey,
   } = params;
+
+  // Resolve API key: explicit param > env var > null (fall back to Vertex AI)
+  const apiKey = paramKey || process.env.GEMINI_API_KEY;
+  const useGeminiApi = !!apiKey;
 
   const parts: Array<Record<string, unknown>> = [];
 
@@ -109,19 +129,23 @@ export async function generateImage(params: GenerateImageParams): Promise<Genera
 
   parts.push({ text: prompt });
 
-  const url = getVertexUrl(model);
-  const accessToken = await getCachedAccessToken();
+  // Choose backend: Generative Language API (key-based) or Vertex AI (OAuth)
+  const url = useGeminiApi ? getGeminiApiUrl(model, apiKey!) : getVertexUrl(model);
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (!useGeminiApi) {
+    const accessToken = await getCachedAccessToken();
+    headers['Authorization'] = `Bearer ${accessToken}`;
+  }
+  const backend = useGeminiApi ? 'GeminiAPI' : 'Vertex';
+  const keyHint = useGeminiApi ? ` key=...${apiKey!.slice(-4)}` : '';
 
-  console.log(`[Vertex] Generating: model=${model}, images=${referenceImages?.length || 0}, aspect=${aspectRatio}, size=${imageSize}`);
+  console.log(`[${backend}] Generating: model=${model}, images=${referenceImages?.length || 0}, aspect=${aspectRatio}, size=${imageSize}${keyHint}`);
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     try {
       const response = await fetch(url, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${accessToken}`,
-        },
+        headers,
         signal: AbortSignal.timeout(300_000),
         body: JSON.stringify({
           contents: [{ role: 'user', parts }],
@@ -140,32 +164,35 @@ export async function generateImage(params: GenerateImageParams): Promise<Genera
       if (response.status === 429) {
         if (attempt < MAX_RETRIES) {
           const delay = RETRY_DELAYS[attempt];
-          console.warn(`[Vertex] Rate limited (429), retrying in ${delay / 1000}s (attempt ${attempt + 1}/${MAX_RETRIES})`);
+          console.warn(`[${backend}] Rate limited (429), retrying in ${delay / 1000}s (attempt ${attempt + 1}/${MAX_RETRIES})`);
           await new Promise(r => setTimeout(r, delay));
           continue;
         }
-        throw new Error(`Vertex AI rate limited (429) after ${MAX_RETRIES} retries`);
+        throw new Error(`${backend} rate limited (429) after ${MAX_RETRIES} retries`);
       }
 
       if (response.status === 401 || response.status === 403) {
-        console.warn(`[Vertex] Auth error ${response.status}, refreshing token...`);
-        cachedToken = null;
-        await getCachedAccessToken();
+        if (!useGeminiApi) {
+          console.warn(`[${backend}] Auth error ${response.status}, refreshing token...`);
+          cachedToken = null;
+          await getCachedAccessToken();
+          headers['Authorization'] = `Bearer ${await getCachedAccessToken()}`;
+        }
         if (attempt < MAX_RETRIES) continue;
         const error = await response.text();
-        throw new Error(`Vertex AI auth error ${response.status}: ${error.substring(0, 200)}`);
+        throw new Error(`${backend} auth error ${response.status}: ${error.substring(0, 200)}`);
       }
 
       if (!response.ok) {
         const error = await response.text();
-        throw new Error(`Vertex AI error ${response.status}: ${error}`);
+        throw new Error(`${backend} error ${response.status}: ${error}`);
       }
 
       const result = await response.json();
       const candidate = result.candidates?.[0];
       if (!candidate?.content?.parts) {
         if (attempt < MAX_RETRIES) {
-          console.warn(`[Vertex] Empty response (safety filter?), retrying (attempt ${attempt + 1}/${MAX_RETRIES})`);
+          console.warn(`[${backend}] Empty response (safety filter?), retrying (attempt ${attempt + 1}/${MAX_RETRIES})`);
           await new Promise(r => setTimeout(r, RETRY_DELAYS[attempt]));
           continue;
         }
@@ -193,13 +220,13 @@ export async function generateImage(params: GenerateImageParams): Promise<Genera
         msg.includes('ENOTFOUND') || msg.includes('fetch failed');
 
       if (isTimeout && attempt < 1) {
-        console.warn(`[Vertex] Timeout — retrying once`);
+        console.warn(`[${backend}] Timeout — retrying once`);
         await new Promise(r => setTimeout(r, 5_000));
         continue;
       }
       if (attempt < MAX_RETRIES && (isRateLimit || isNetworkError)) {
         const delay = isRateLimit ? RETRY_DELAYS[attempt] : NETWORK_RETRY_DELAYS[attempt];
-        console.warn(`[Vertex] ${isRateLimit ? 'Rate limit' : 'Network error'}, retrying in ${delay / 1000}s`);
+        console.warn(`[${backend}] ${isRateLimit ? 'Rate limit' : 'Network error'}, retrying in ${delay / 1000}s`);
         await new Promise(r => setTimeout(r, delay));
         continue;
       }
@@ -220,7 +247,12 @@ export async function analyzeWithFlashLite(params: AnalyzeParams): Promise<strin
     images,
     model = 'gemini-2.5-flash-lite',
     temperature = 0.3,
+    apiKey: paramKey,
   } = params;
+
+  // Resolve API key: explicit param > env var > null (fall back to Vertex AI)
+  const apiKey = paramKey || process.env.GEMINI_API_KEY;
+  const useGeminiApi = !!apiKey;
 
   const parts: Array<Record<string, unknown>> = [];
 
@@ -234,17 +266,19 @@ export async function analyzeWithFlashLite(params: AnalyzeParams): Promise<strin
   }
   parts.push({ text: prompt });
 
-  const url = getVertexUrl(model);
-  const accessToken = await getCachedAccessToken();
+  const url = useGeminiApi ? getGeminiApiUrl(model, apiKey!) : getVertexUrl(model);
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (!useGeminiApi) {
+    const accessToken = await getCachedAccessToken();
+    headers['Authorization'] = `Bearer ${accessToken}`;
+  }
+  const backend = useGeminiApi ? 'GeminiAPI' : 'Vertex';
 
-  console.log(`[Vertex] Analyzing: model=${model}, images=${images.length}`);
+  console.log(`[${backend}] Analyzing: model=${model}, images=${images.length}`);
 
   const response = await fetch(url, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${accessToken}`,
-    },
+    headers,
     signal: AbortSignal.timeout(30_000),
     body: JSON.stringify({
       contents: [{ role: 'user', parts }],
@@ -257,7 +291,7 @@ export async function analyzeWithFlashLite(params: AnalyzeParams): Promise<strin
 
   if (!response.ok) {
     const error = await response.text();
-    throw new Error(`Flash Lite analysis error ${response.status}: ${error.substring(0, 300)}`);
+    throw new Error(`${backend} analysis error ${response.status}: ${error.substring(0, 300)}`);
   }
 
   const result = await response.json();

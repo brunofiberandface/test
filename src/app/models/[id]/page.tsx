@@ -6,6 +6,21 @@ import Link from 'next/link';
 import Shell from '@/components/Shell';
 import { useSession } from 'next-auth/react';
 
+interface CelebrityCheckData {
+  timestamp?: string | { _seconds: number; _nanoseconds: number };
+  status: 'pass' | 'review' | 'blocked' | 'error';
+  facesDetected?: number;
+  topMatch?: string | null;
+  topScore?: number;
+  flaggedMatches?: Array<{ name: string; score: number }>;
+  modelVersion?: string;
+  databaseVersion?: string;
+  thresholds?: { review: number; block: number };
+  durationMs?: number;
+  note?: string;
+  error?: string;
+}
+
 interface ModelData {
   id: string;
   modelId: string;
@@ -14,8 +29,10 @@ interface ModelData {
   gender: 'male' | 'female';
   referenceImageUrl?: string;
   cardImageUrl?: string;
+  backReferenceImageUrl?: string;
   active: boolean;
   createdAt?: string;
+  celebrityCheck?: CelebrityCheckData;
 }
 
 export default function ModelDetailPage() {
@@ -53,6 +70,33 @@ export default function ModelDetailPage() {
   const [cloneDescription, setCloneDescription] = useState('');
   const [cloneGender, setCloneGender] = useState<'male' | 'female'>('female');
   const [showCloneForm, setShowCloneForm] = useState(false);
+
+  // Back view generation state
+  const [generatingBack, setGeneratingBack] = useState(false);
+
+  // Generate back view
+  const handleGenerateBack = async () => {
+    if (!model) return;
+    setGeneratingBack(true);
+    setError('');
+    try {
+      const res = await fetch('/api/models/generate-back', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ modelId: model.modelId || model.id }),
+      });
+      const data = await res.json();
+      if (data.success && data.backUrl) {
+        setModel({ ...model, backReferenceImageUrl: data.backUrl });
+      } else {
+        setError(data.error || 'Back view generation failed');
+      }
+    } catch {
+      setError('Back view generation failed');
+    } finally {
+      setGeneratingBack(false);
+    }
+  };
 
   useEffect(() => {
     async function fetchModel() {
@@ -202,8 +246,8 @@ export default function ModelDetailPage() {
       </Link>
 
       <div className="flex gap-8">
-        {/* Left — reference image with zoom controls */}
-        <div className="w-[280px] flex-shrink-0">
+        {/* Left — front + back reference images */}
+        <div className="flex-shrink-0">
           {/* Zoom buttons */}
           <div className="flex gap-1 mb-3">
             {([
@@ -225,30 +269,72 @@ export default function ModelDetailPage() {
             ))}
           </div>
 
-          {/* Image container */}
-          <div
-            ref={imgContainerRef}
-            className="aspect-[9/16] bg-neutral-100 border border-neutral-200 overflow-hidden relative cursor-pointer"
-            onClick={() => {
-              const modes: Array<'full' | 'head' | 'torso'> = ['full', 'head', 'torso'];
-              const idx = modes.indexOf(zoomMode);
-              setZoomMode(modes[(idx + 1) % modes.length]);
-            }}
-          >
-            {(model.referenceImageUrl || model.cardImageUrl) ? (
-              <img
-                src={(model.referenceImageUrl || model.cardImageUrl)!}
-                alt={`${model.modelId} — ${model.name}`}
-                className="w-full h-full transition-transform duration-500 ease-out"
-                style={zoomStyles[zoomMode]}
-              />
-            ) : (
-              <div className="w-full h-full flex items-center justify-center text-neutral-300 text-sm">
-                No reference photo
+          {/* Front + Back side by side */}
+          <div className="flex gap-3">
+            {/* Front reference */}
+            <div className="w-[220px]">
+              <p className="text-[10px] font-medium text-neutral-400 uppercase tracking-wider mb-1">Front</p>
+              <div
+                ref={imgContainerRef}
+                className="aspect-[9/16] bg-neutral-100 border border-neutral-200 overflow-hidden relative cursor-pointer"
+                onClick={() => {
+                  const modes: Array<'full' | 'head' | 'torso'> = ['full', 'head', 'torso'];
+                  const idx = modes.indexOf(zoomMode);
+                  setZoomMode(modes[(idx + 1) % modes.length]);
+                }}
+              >
+                {(model.referenceImageUrl || model.cardImageUrl) ? (
+                  <img
+                    src={(model.referenceImageUrl || model.cardImageUrl)!}
+                    alt={`${model.modelId} — front`}
+                    className="w-full h-full transition-transform duration-500 ease-out"
+                    style={zoomStyles[zoomMode]}
+                  />
+                ) : (
+                  <div className="w-full h-full flex items-center justify-center text-neutral-300 text-sm">
+                    No reference photo
+                  </div>
+                )}
+                <div className="absolute bottom-2 right-2 bg-black/60 text-white text-[10px] px-2 py-1">
+                  {zoomMode === 'full' ? 'Click to zoom' : zoomMode === 'head' ? 'Head' : 'Torso'}
+                </div>
               </div>
-            )}
-            <div className="absolute bottom-2 right-2 bg-black/60 text-white text-[10px] px-2 py-1">
-              {zoomMode === 'full' ? 'Click to zoom in' : zoomMode === 'head' ? 'Head close-up' : 'Torso view'} — click to cycle
+            </div>
+
+            {/* Back reference */}
+            <div className="w-[220px]">
+              <p className="text-[10px] font-medium text-neutral-400 uppercase tracking-wider mb-1">Back</p>
+              <div className="aspect-[9/16] bg-neutral-100 border border-neutral-200 overflow-hidden relative">
+                {model.backReferenceImageUrl ? (
+                  <img
+                    src={model.backReferenceImageUrl}
+                    alt={`${model.modelId} — back`}
+                    className="w-full h-full object-contain"
+                  />
+                ) : (
+                  <div className="w-full h-full flex flex-col items-center justify-center text-neutral-300 text-sm gap-3">
+                    <span>No back view</span>
+                    {isAdmin && (
+                      <button
+                        onClick={handleGenerateBack}
+                        disabled={generatingBack}
+                        className="border border-neutral-300 px-3 py-1.5 text-xs font-medium text-neutral-600 hover:bg-neutral-50 transition-colors disabled:opacity-30"
+                      >
+                        {generatingBack ? 'Generating...' : 'Generate Back View'}
+                      </button>
+                    )}
+                  </div>
+                )}
+                {model.backReferenceImageUrl && isAdmin && (
+                  <button
+                    onClick={handleGenerateBack}
+                    disabled={generatingBack}
+                    className="absolute bottom-2 left-2 bg-black/60 text-white text-[10px] px-2 py-1 hover:bg-black/80 transition-colors disabled:opacity-50"
+                  >
+                    {generatingBack ? 'Generating...' : 'Regenerate'}
+                  </button>
+                )}
+              </div>
             </div>
           </div>
 
@@ -267,7 +353,7 @@ export default function ModelDetailPage() {
                 disabled={uploading}
                 className="w-full border border-neutral-300 px-4 py-2 text-xs font-medium text-neutral-600 hover:bg-neutral-50 transition-colors disabled:opacity-30"
               >
-                {uploading ? 'Uploading...' : 'Replace Reference Photo'}
+                {uploading ? 'Uploading...' : 'Replace Front Reference Photo'}
               </button>
             </div>
           )}
@@ -287,6 +373,70 @@ export default function ModelDetailPage() {
               {model.active ? 'Active' : 'Inactive'}
             </span>
           </div>
+
+          {/* Celebrity Resemblance Audit */}
+          {model.celebrityCheck ? (
+            <div className={`mb-6 border px-4 py-3 ${
+              model.celebrityCheck.status === 'pass' ? 'border-green-200 bg-green-50' :
+              model.celebrityCheck.status === 'review' ? 'border-orange-200 bg-orange-50' :
+              model.celebrityCheck.status === 'blocked' ? 'border-red-200 bg-red-50' :
+              'border-neutral-200 bg-neutral-50'
+            }`}>
+              <div className="flex items-center gap-2 mb-1">
+                <span className={`text-sm font-semibold ${
+                  model.celebrityCheck.status === 'pass' ? 'text-green-700' :
+                  model.celebrityCheck.status === 'review' ? 'text-orange-700' :
+                  model.celebrityCheck.status === 'blocked' ? 'text-red-700' :
+                  'text-neutral-600'
+                }`}>
+                  {model.celebrityCheck.status === 'pass' ? '\u2713 No celebrity resemblance' :
+                   model.celebrityCheck.status === 'review' ? '\u26A0 Possible resemblance detected' :
+                   model.celebrityCheck.status === 'blocked' ? '\u2717 Celebrity resemblance blocked' :
+                   '\u26A0 Check error'}
+                </span>
+              </div>
+              {model.celebrityCheck.topMatch && model.celebrityCheck.topScore !== undefined && (
+                <p className="text-xs text-neutral-600 mb-1">
+                  Closest match: <span className="font-medium">{model.celebrityCheck.topMatch}</span> ({(model.celebrityCheck.topScore * 100).toFixed(1)}% similarity)
+                </p>
+              )}
+              {model.celebrityCheck.flaggedMatches && model.celebrityCheck.flaggedMatches.length > 1 && (
+                <details className="text-xs text-neutral-500 mt-1">
+                  <summary className="cursor-pointer hover:text-neutral-700">
+                    {model.celebrityCheck.flaggedMatches.length} matches above threshold
+                  </summary>
+                  <ul className="mt-1 space-y-0.5 pl-3">
+                    {model.celebrityCheck.flaggedMatches.map((m, i) => (
+                      <li key={i}>{m.name} — {(m.score * 100).toFixed(1)}%</li>
+                    ))}
+                  </ul>
+                </details>
+              )}
+              <p className="text-[10px] text-neutral-400 mt-2">
+                {model.celebrityCheck.timestamp
+                  ? new Date(
+                      typeof model.celebrityCheck.timestamp === 'object' && '_seconds' in model.celebrityCheck.timestamp
+                        ? model.celebrityCheck.timestamp._seconds * 1000
+                        : model.celebrityCheck.timestamp
+                    ).toLocaleString()
+                  : ''} · {model.celebrityCheck.modelVersion} · DB {model.celebrityCheck.databaseVersion}
+                {model.celebrityCheck.durationMs ? ` · ${model.celebrityCheck.durationMs}ms` : ''}
+              </p>
+              {model.celebrityCheck.note === 'no_face_detected' && (
+                <p className="text-[10px] text-neutral-400">No face detected in reference image</p>
+              )}
+              {model.celebrityCheck.error && (
+                <p className="text-[10px] text-red-400 mt-1">Error: {model.celebrityCheck.error}</p>
+              )}
+            </div>
+          ) : (
+            <div className="mb-6 border border-neutral-200 bg-neutral-50 px-4 py-3">
+              <div className="flex items-center gap-2">
+                <div className="w-3 h-3 border border-neutral-300 border-t-neutral-600 rounded-full animate-spin" />
+                <span className="text-xs text-neutral-500">Celebrity resemblance check pending...</span>
+              </div>
+            </div>
+          )}
 
           {/* Description */}
           <div className="mb-8">

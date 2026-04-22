@@ -8,13 +8,13 @@ type WardrobeCategory = 'shoes' | 'top' | 'bottom';
 
 type WardrobeGender = 'male' | 'female' | 'unisex';
 
-/** 6 labeled fit model camera angles */
+/** 6 labeled fit model camera angles — ordered: 45°L, center, 45°R per row */
 const FIT_MODEL_SLOTS = [
-  { key: 'front', label: 'Front', row: 'front' },
   { key: 'front45Left', label: '45° Left', row: 'front' },
+  { key: 'front', label: 'Front', row: 'front' },
   { key: 'front45Right', label: '45° Right', row: 'front' },
-  { key: 'back', label: 'Back', row: 'back' },
   { key: 'back45Left', label: 'Back 45° Left', row: 'back' },
+  { key: 'back', label: 'Back', row: 'back' },
   { key: 'back45Right', label: 'Back 45° Right', row: 'back' },
 ] as const;
 
@@ -33,6 +33,7 @@ interface WardrobeItem {
   id: string;
   wardrobeId: string;
   name: string;
+  designNumber?: string;
   category: WardrobeCategory | string; // string for legacy categories
   gender?: WardrobeGender;
   description: string;
@@ -57,11 +58,24 @@ const CATEGORIES: { value: WardrobeCategory; label: string }[] = [
   { value: 'bottom', label: 'Bottoms' },
 ];
 
+/**
+ * Extract the style-code prefix from a full design number.
+ * e.g. "D15264-C052-D332" -> "D15264". Empty-safe.
+ * Multiple colorways / fits of the same style share the same prefix, which
+ * is what the style-code selector filters on.
+ */
+function extractStyleCode(designNumber?: string): string {
+  if (!designNumber) return '';
+  const firstSegment = designNumber.split('-')[0]?.trim();
+  return firstSegment || '';
+}
+
 export default function WardrobePage() {
   const { data: session } = useSession();
   const [items, setItems] = useState<WardrobeItem[]>([]);
   const [filterCategory, setFilterCategory] = useState<WardrobeCategory | 'all'>('all');
   const [filterGender, setFilterGender] = useState<'all' | 'male' | 'female' | 'unisex'>('all');
+  const [filterStyleCode, setFilterStyleCode] = useState<string>('all');
   const [loading, setLoading] = useState(true);
   const [showForm, setShowForm] = useState(false);
 
@@ -69,6 +83,7 @@ export default function WardrobePage() {
   const [selectedItem, setSelectedItem] = useState<WardrobeItem | null>(null);
   const [lightboxUrl, setLightboxUrl] = useState<string | null>(null);
   const [editName, setEditName] = useState('');
+  const [editDesignNumber, setEditDesignNumber] = useState('');
   const [editDescription, setEditDescription] = useState('');
   const [editCategory, setEditCategory] = useState<WardrobeCategory>('shoes');
   const [editGender, setEditGender] = useState<WardrobeGender>('unisex');
@@ -82,7 +97,9 @@ export default function WardrobePage() {
   const [editFlatBackPreview, setEditFlatBackPreview] = useState<string | null>(null);
 
   // Add form state
+  const [itemType, setItemType] = useState<'focus' | 'styling'>('focus');
   const [name, setName] = useState('');
+  const [designNumberCreate, setDesignNumberCreate] = useState('');
   const [category, setCategory] = useState<WardrobeCategory>('top');
   const [genderCreate, setGenderCreate] = useState<WardrobeGender>('unisex');
   const [openShoesCreate, setOpenShoesCreate] = useState<boolean>(false);
@@ -136,10 +153,30 @@ export default function WardrobePage() {
 
   useEffect(() => { fetchItems(); }, [fetchItems]);
 
+  // Reset style-code filter whenever category changes — style codes are
+  // category-scoped (bottoms have their own codes, tops have theirs).
+  useEffect(() => { setFilterStyleCode('all'); }, [filterCategory]);
+
   // Client-side gender filter
-  const filteredItems = filterGender === 'all'
+  const itemsAfterGender = filterGender === 'all'
     ? items
     : items.filter(i => (i.gender || 'unisex') === filterGender || (i.gender || 'unisex') === 'unisex');
+
+  // Unique style codes available in the current category + gender slice.
+  // Sorted for stable dropdown ordering. Items without a designNumber are
+  // skipped — they show up as "all" only.
+  const availableStyleCodes = Array.from(
+    new Set(
+      itemsAfterGender
+        .map(i => extractStyleCode(i.designNumber))
+        .filter(Boolean)
+    )
+  ).sort();
+
+  // Apply style-code filter
+  const filteredItems = filterStyleCode === 'all'
+    ? itemsAfterGender
+    : itemsAfterGender.filter(i => extractStyleCode(i.designNumber) === filterStyleCode);
 
   // Count how many fit model images an item has
   function countFitImages(item: WardrobeItem): number {
@@ -153,6 +190,7 @@ export default function WardrobePage() {
   function openItem(item: WardrobeItem) {
     setSelectedItem(item);
     setEditName(item.name);
+    setEditDesignNumber(item.designNumber || '');
     setEditDescription(item.description);
     setEditCategory(item.category as WardrobeCategory);
     setEditGender(item.gender || 'unisex');
@@ -181,7 +219,7 @@ export default function WardrobePage() {
       if (editFlatBackFile) flatBackBase64 = await fileToBase64(editFlatBackFile);
 
       const patchBody: Record<string, any> = {
-        name: editName, description: editDescription, category: editCategory,
+        name: editName, designNumber: editDesignNumber, description: editDescription, category: editCategory,
         gender: editGender, openShoes: editOpenShoes, hasHeels: editHasHeels,
       };
       if (flatFrontBase64) patchBody.flatFrontBase64 = flatFrontBase64;
@@ -195,7 +233,7 @@ export default function WardrobePage() {
       if (res.ok) {
         const data = await res.json();
         const updated = {
-          ...selectedItem, name: editName, description: editDescription, category: editCategory,
+          ...selectedItem, name: editName, designNumber: editDesignNumber, description: editDescription, category: editCategory,
           gender: editGender, openShoes: editOpenShoes, hasHeels: editHasHeels,
           ...(data.flatFrontUrl ? { flatFrontUrl: data.flatFrontUrl } : {}),
           ...(data.flatBackUrl ? { flatBackUrl: data.flatBackUrl } : {}),
@@ -243,7 +281,10 @@ export default function WardrobePage() {
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     const filledSlots = Object.values(fitModelFiles).filter(Boolean).length;
-    if (!name || !description || filledSlots === 0) return;
+    const isFocusItem = itemType === 'focus';
+    if (!name || !description) return;
+    if (isFocusItem && filledSlots === 0) return;
+    if (!isFocusItem && !fileFlatFront) return;
     setUploading(true);
     try {
       // Convert fit model files to base64 keyed by slot name
@@ -261,7 +302,7 @@ export default function WardrobePage() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          name, category, description,
+          name, designNumber: designNumberCreate, category, description,
           fitModelBase64: Object.values(fitModelBase64), // Array for backward compat with API
           fitModelSlots: fitModelBase64, // Keyed by slot name for v2
           flatFrontBase64, flatBackBase64,
@@ -271,8 +312,8 @@ export default function WardrobePage() {
         }),
       });
       if (res.ok) {
-        setName(''); setDescription(''); setFitModelFiles({}); setFileFlatFront(null); setFileFlatBack(null); setShowForm(false);
-        setGenderCreate('unisex');
+        setName(''); setDesignNumberCreate(''); setDescription(''); setFitModelFiles({}); setFileFlatFront(null); setFileFlatBack(null); setShowForm(false);
+        setGenderCreate('unisex'); setItemType('focus');
         fetchItems();
       } else {
         const err = await res.json();
@@ -316,13 +357,41 @@ export default function WardrobePage() {
       {/* Add form */}
       {showForm && (
         <form onSubmit={handleSubmit} className="mb-8 bg-white border border-neutral-200 p-6 space-y-4">
-          <div className="grid grid-cols-2 gap-4">
+          {/* Item type toggle */}
+          <div>
+            <label className="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-2">Item Type</label>
+            <div className="flex gap-2">
+              <button type="button" onClick={() => { setItemType('focus'); setFitModelFiles({}); }}
+                className={`px-4 py-2 text-sm border transition-colors ${itemType === 'focus' ? 'bg-neutral-900 text-white border-neutral-900' : 'bg-white text-neutral-600 border-neutral-300 hover:border-neutral-400'}`}>
+                Focus Item
+              </button>
+              <button type="button" onClick={() => { setItemType('styling'); setFitModelFiles({}); }}
+                className={`px-4 py-2 text-sm border transition-colors ${itemType === 'styling' ? 'bg-neutral-900 text-white border-neutral-900' : 'bg-white text-neutral-600 border-neutral-300 hover:border-neutral-400'}`}>
+                Styling Item
+              </button>
+            </div>
+            <p className="text-xs text-neutral-400 mt-1">
+              {itemType === 'focus'
+                ? 'Focus items need 6 fit model angles + flat images for AI generation.'
+                : 'Styling items only need flat front & back images. Used as outfit context, not as the main garment.'}
+            </p>
+          </div>
+
+          <div className="grid grid-cols-3 gap-4">
             <div>
               <label className="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-1">Name</label>
               <input
                 type="text" value={name} onChange={(e) => setName(e.target.value)}
-                placeholder="e.g., Black Chelsea Boot"
+                placeholder="e.g., CONTOR 3D EXTREME LOOSE WMN"
                 className="w-full border border-neutral-300 px-3 py-2 text-sm" required
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-1">Design Number</label>
+              <input
+                type="text" value={designNumberCreate} onChange={(e) => setDesignNumberCreate(e.target.value)}
+                placeholder="e.g., D27690-D315-001"
+                className="w-full border border-neutral-300 px-3 py-2 text-sm"
               />
             </div>
             <div>
@@ -384,7 +453,7 @@ export default function WardrobePage() {
                 <span className="text-xs text-neutral-500">Open shoes:</span>
                 <button type="button" onClick={() => setOpenShoesCreate(!openShoesCreate)}
                   className={`px-2.5 py-1 text-xs border transition-colors ${openShoesCreate ? 'bg-orange-600 text-white border-orange-600' : 'bg-white text-neutral-500 border-neutral-300 hover:border-neutral-500'}`}>
-                  {openShoesCreate ? 'Open toe' : 'Closed'}
+                  {openShoesCreate ? 'Open heel' : 'Closed'}
                 </button>
               </div>
               <div className="flex items-center gap-2">
@@ -397,8 +466,8 @@ export default function WardrobePage() {
             </div>
           )}
 
-          {/* 6 Labeled Fit Model Angle Slots */}
-          <div>
+          {/* 6 Labeled Fit Model Angle Slots — only for focus items */}
+          {itemType === 'focus' && (<div>
             <label className="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-2">
               Fit Model Photos — 6 Labeled Angles
             </label>
@@ -497,21 +566,44 @@ export default function WardrobePage() {
             <p className="text-xs text-neutral-400 mt-2">
               {Object.values(fitModelFiles).filter(Boolean).length}/6 angles uploaded
             </p>
-          </div>
+          </div>)}
 
           {/* Flat images */}
-          <div className="grid grid-cols-2 gap-4">
-            <div>
-              <label className="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-1">Flat Front</label>
-              <input type="file" accept="image/*" onChange={(e) => setFileFlatFront(e.target.files?.[0] || null)} className="w-full text-sm" />
-            </div>
-            <div>
-              <label className="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-1">Flat Back</label>
-              <input type="file" accept="image/*" onChange={(e) => setFileFlatBack(e.target.files?.[0] || null)} className="w-full text-sm" />
+          <div>
+            {itemType === 'styling' && (
+              <label className="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-2">
+                Flat Product Images {itemType === 'styling' && <span className="text-red-500 normal-case">*required</span>}
+              </label>
+            )}
+            <div className="grid grid-cols-2 gap-4">
+              <div>
+                <label className="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-1">
+                  Flat Front {itemType === 'styling' && <span className="text-red-500">*</span>}
+                </label>
+                {fileFlatFront && (
+                  <div className="mb-2 relative inline-block">
+                    <img src={URL.createObjectURL(fileFlatFront)} alt="Flat front preview" className="h-32 w-32 object-contain border border-neutral-200 bg-white" />
+                    <button type="button" onClick={() => setFileFlatFront(null)}
+                      className="absolute top-1 right-1 w-5 h-5 bg-red-600 text-white text-[10px] flex items-center justify-center hover:bg-red-700">x</button>
+                  </div>
+                )}
+                <input type="file" accept="image/*" onChange={(e) => setFileFlatFront(e.target.files?.[0] || null)} className="w-full text-sm" />
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-1">Flat Back</label>
+                {fileFlatBack && (
+                  <div className="mb-2 relative inline-block">
+                    <img src={URL.createObjectURL(fileFlatBack)} alt="Flat back preview" className="h-32 w-32 object-contain border border-neutral-200 bg-white" />
+                    <button type="button" onClick={() => setFileFlatBack(null)}
+                      className="absolute top-1 right-1 w-5 h-5 bg-red-600 text-white text-[10px] flex items-center justify-center hover:bg-red-700">x</button>
+                  </div>
+                )}
+                <input type="file" accept="image/*" onChange={(e) => setFileFlatBack(e.target.files?.[0] || null)} className="w-full text-sm" />
+              </div>
             </div>
           </div>
 
-          <button type="submit" disabled={uploading || !name || !description || Object.values(fitModelFiles).filter(Boolean).length === 0}
+          <button type="submit" disabled={uploading || !name || !description || (itemType === 'focus' ? Object.values(fitModelFiles).filter(Boolean).length === 0 : !fileFlatFront)}
             className="px-6 py-2 bg-neutral-900 text-white text-sm hover:bg-neutral-800 disabled:opacity-40 transition-colors">
             {uploading ? 'Uploading...' : 'Save to Wardrobe'}
           </button>
@@ -537,6 +629,25 @@ export default function WardrobePage() {
             </button>
           ))}
         </div>
+        {/* Style-code filter — only shown once a specific category is picked. */}
+        {filterCategory !== 'all' && availableStyleCodes.length > 0 && (
+          <>
+            <div className="w-px h-6 bg-neutral-300" />
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-neutral-500 uppercase tracking-wider">Style</span>
+              <select
+                value={filterStyleCode}
+                onChange={(e) => setFilterStyleCode(e.target.value)}
+                className="px-3 py-1.5 text-sm border border-neutral-300 bg-white text-neutral-700 hover:border-neutral-400 focus:outline-none focus:border-neutral-900"
+              >
+                <option value="all">All styles ({availableStyleCodes.length})</option>
+                {availableStyleCodes.map(code => (
+                  <option key={code} value={code}>{code}</option>
+                ))}
+              </select>
+            </div>
+          </>
+        )}
       </div>
 
       {/* Items grid */}
@@ -570,7 +681,7 @@ export default function WardrobePage() {
                 )}
               </div>
               <div className="p-3">
-                <h3 className="text-sm font-medium text-neutral-900 truncate">{item.name}</h3>
+                <h3 className="text-sm font-medium text-neutral-900 truncate">{item.designNumber || item.name}</h3>
                 <p className="text-xs text-neutral-500 mt-1 line-clamp-2">{item.description}</p>
               </div>
             </div>
@@ -626,6 +737,33 @@ export default function WardrobePage() {
                 </div>
 
                 <div>
+                  <label className="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-1">Design Number</label>
+                  <input
+                    type="text" value={editDesignNumber} onChange={(e) => setEditDesignNumber(e.target.value)}
+                    placeholder="e.g., D27690-D315-001"
+                    className="w-full border border-neutral-300 px-3 py-2 text-sm focus:outline-none focus:border-neutral-900"
+                  />
+                  {/* Leather label setup link — only for bottoms with a parseable design number */}
+                  {editCategory === 'bottom' && /^[^_\s-]+-[^_\s-]+-/.test(editDesignNumber.trim()) && selectedItem?.id && (
+                    <a
+                      href={`/wardrobe/${selectedItem.id}/label-setup`}
+                      className="mt-2 inline-flex items-center gap-1.5 px-3 py-1.5 text-xs border border-neutral-300 hover:border-neutral-900 hover:bg-neutral-900 hover:text-white transition-colors"
+                    >
+                      Configure leather label →
+                    </a>
+                  )}
+                  {/* Angle setup — available for any item with fit model photos, v1 or v2 */}
+                  {selectedItem?.id && (
+                    <a
+                      href={`/wardrobe/${selectedItem.id}/angle-setup`}
+                      className="mt-2 ml-2 inline-flex items-center gap-1.5 px-3 py-1.5 text-xs border border-neutral-300 hover:border-neutral-900 hover:bg-neutral-900 hover:text-white transition-colors"
+                    >
+                      Configure fit angles →
+                    </a>
+                  )}
+                </div>
+
+                <div>
                   <label className="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-1">Category</label>
                   <div className="flex gap-2 flex-wrap">
                     {CATEGORIES.map(c => (
@@ -649,7 +787,7 @@ export default function WardrobePage() {
                       <span className="text-xs text-neutral-500">Open shoes:</span>
                       <button type="button" onClick={() => setEditOpenShoes(!editOpenShoes)}
                         className={`px-2.5 py-1 text-xs border transition-colors ${editOpenShoes ? 'bg-orange-600 text-white border-orange-600' : 'bg-white text-neutral-500 border-neutral-300 hover:border-neutral-500'}`}>
-                        {editOpenShoes ? 'Open toe' : 'Closed shoe'}
+                        {editOpenShoes ? 'Open heel' : 'Closed shoe'}
                       </button>
                     </div>
                     <div className="flex items-center gap-2 mt-2">

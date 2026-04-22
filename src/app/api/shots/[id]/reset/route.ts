@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { shotsCol, jobsCol } from '@/lib/firestore';
+import { FieldValue } from '@google-cloud/firestore';
 
 /**
  * POST /api/shots/[id]/reset
@@ -16,9 +17,11 @@ export async function POST(
   try {
     // Parse optional body (may be empty for legacy callers)
     let incrementVersion = false;
+    let useDressedBase: boolean | undefined;
     try {
       const body = await req.json();
       incrementVersion = body?.incrementVersion === true;
+      if (body?.useDressedBase === true) useDressedBase = true;
     } catch { /* no body — that's fine */ }
 
     const shotDoc = await shotsCol.doc(shotId).get();
@@ -31,14 +34,17 @@ export async function POST(
     const nextVersion = incrementVersion ? currentVersion + 1 : currentVersion;
 
     // Reset shot to queued — clear stale progress text so UI doesn't show old state
-    await shotsCol.doc(shotId).update({
+    const updateData: Record<string, unknown> = {
       status: 'queued',
       error: null,
       progressStep: '',
       progressPct: 0,
       version: nextVersion,
       updatedAt: new Date(),
-    });
+    };
+    // Set or clear the useDressedBase flag — prevents stale flags from previous resets
+    updateData.useDressedBase = useDressedBase === true ? true : FieldValue.delete();
+    await shotsCol.doc(shotId).update(updateData);
 
     // Ensure parent job is set to generating (so run-all will fire)
     if (shotData.jobId) {

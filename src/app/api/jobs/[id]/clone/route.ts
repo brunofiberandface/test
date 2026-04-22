@@ -3,7 +3,7 @@
  * Copies wardrobe selections, model, and prompt revisions from the original.
  */
 import { NextRequest, NextResponse } from 'next/server';
-import { getJob, listJobs, jobsCol, createShot, updateJobStatus, getActivePrompt } from '@/lib/firestore';
+import { getJob, listJobs, jobsCol, createShot, updateJobStatus, getActivePrompt, enqueueJob } from '@/lib/firestore';
 import { APP_CONFIG } from '@/lib/config';
 
 export async function POST(
@@ -63,7 +63,18 @@ export async function POST(
       });
     }
 
-    return NextResponse.json({ success: true, jobId: newJobId, jobName: cloneName });
+    // Enqueue + kick worker (respond-then-fire pattern)
+    await updateJobStatus(newJobId, 'generating');
+    await enqueueJob(newJobId, cloneName);
+
+    const response = NextResponse.json({ success: true, jobId: newJobId, jobName: cloneName });
+
+    const port = process.env.PORT || '3000';
+    fetch(`http://localhost:${port}/api/jobs/process-queue`, { method: 'POST' })
+      .then(res => console.log(`[Clone] Worker kick: ${res.status}`))
+      .catch(err => console.warn(`[Clone] Worker kick failed (non-blocking):`, err));
+
+    return response;
   } catch (error) {
     console.error('Clone error:', error);
     return NextResponse.json({ error: 'Clone failed' }, { status: 500 });

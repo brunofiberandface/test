@@ -12,7 +12,7 @@ export const APP_CONFIG = {
   // Generation — v2 Pro pipeline
   generationModel: 'gemini-3-pro-image-preview',
   analysisModel: 'gemini-2.5-flash-lite',
-  defaultAspectRatio: '9:16' as const,
+  defaultAspectRatio: '3:4' as const,
   detailAspectRatio: '3:4' as const,
   imageSize: '4K' as const,
 
@@ -25,10 +25,10 @@ export const APP_CONFIG = {
 
   // Shot metadata
   shots: {
-    M01: { name: 'Cropped Front', aspect: '9:16' as const, dependsOn: ['M03'] as const, view: 'front' as const },
-    M02: { name: 'Cropped Back', aspect: '9:16' as const, dependsOn: ['M04'] as const, view: 'back' as const },
-    M03: { name: 'Full Body Front', aspect: '9:16' as const, dependsOn: [] as const, view: 'front' as const },
-    M04: { name: 'Full Body Back', aspect: '9:16' as const, dependsOn: ['M03'] as const, view: 'back' as const },
+    M01: { name: 'Cropped Front', aspect: '3:4' as const, dependsOn: ['M03'] as const, view: 'front' as const },
+    M02: { name: 'Cropped Back', aspect: '3:4' as const, dependsOn: ['M04'] as const, view: 'back' as const },
+    M03: { name: 'Full Body Front', aspect: '3:4' as const, dependsOn: [] as const, view: 'front' as const },
+    M04: { name: 'Full Body Back', aspect: '3:4' as const, dependsOn: ['M03'] as const, view: 'back' as const },
     M05: { name: 'Pocket Detail', aspect: '3:4' as const, dependsOn: ['M03', 'M04'] as const, view: 'back' as const },
   },
 
@@ -51,3 +51,8 @@ export const APP_CONFIG = {
     white: '#FFFFFF',
   },
 } as const;
+// build: 1776240122
+// build: 1776241977
+// build: 1776243836
+// build: 1776254278
+// build: 1776344339

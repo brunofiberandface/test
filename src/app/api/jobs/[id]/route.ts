@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getJob, listShots, updateJobStatus, getWardrobeItem, archiveJob, deleteJob, shotsCol, jobsCol, releaseSlot, removeFromQueue } from '@/lib/firestore';
+import { getJob, listShots, updateJobStatus, updateJob, getWardrobeItem, archiveJob, deleteJob, shotsCol, jobsCol, releaseSlot, removeFromQueue } from '@/lib/firestore';
 import { FieldValue } from '@google-cloud/firestore';
 
 // GET /api/jobs/[id] — get job details with all shots
@@ -124,10 +124,16 @@ export async function PATCH(
   try {
     const { id } = await params;
     const body = await req.json();
-    const { archived, clearGarmentDNA } = body;
+    const { archived, clearGarmentDNA, jobName } = body;
 
     if (archived !== undefined) {
       await archiveJob(id, archived);
+    }
+
+    // Update job name
+    if (jobName !== undefined) {
+      await updateJob(id, { jobName, updatedAt: new Date() });
+      console.log(`[Jobs] Updated jobName for job ${id} to "${jobName}"`);
     }
 
     // Clear cached garment DNA so next generation re-analyzes

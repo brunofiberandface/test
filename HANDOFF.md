@@ -172,3 +172,169 @@ Saved at `rollback-2026-04-02-sequential-and-fallback.patch` — covers the sequ
 | src/app/api/generate/route.ts | Modified | Killed dressed-base fallback, wired QC into pipeline, M03 anchor gate |
 | src/lib/shot-qc.ts | **New** | Two-layer QC module (deterministic + Gemini Flash Lite) |
 | src/app/api/qc/route.ts | Modified | Re-enabled with new flat-comparison QC logic |
+
+---
+
+# Hybrid Leather Label — Option B Full Port — April 11, 2026
+
+## Changes Made
+
+### 1. Three-Tier Label Schema (NEW)
+
+Replaces the old per-wardrobe `labelConfig` with three Firestore collections:
+
+- **`labelTemplates`** — one doc per physical label SKU (e.g. `L2936-8.0`). Holds artwork URL + grain tile URLs per variant (pebbled/smooth/coarse) + aspect ratio.
+- **`labelStyles`** — one doc per styleCode (e.g. `D22889`). Holds `templateId` + saved `pocketCorners` and `labelCorners` on an `anchorPhoto`. Geometry is set up once per style and reused by every colorway.
+- **`labelColorways`** — one doc per `${styleCode}_${colorwayCode}`. Holds only the color delta: `baseColor`, `stitchColor`, `grainVariant`, `embossStrength`.
+
+`resolveLabelRenderConfig(styleCode, colorwayCode)` in `src/lib/firestore.ts` joins all three. Returns null if any tier is missing.
+
+### 2. API Routes (NEW)
+
+- `GET/POST /api/label/templates` + `GET /api/label/templates/[templateId]`
+- `GET/PUT /api/label/styles/[styleCode]` — validates 4-length quads of `{x,y}`
+- `GET/PUT /api/label/colorways/[docId]` — `docId = ${styleCode}_${colorwayCode}`
+- `GET/POST /api/label/bootstrap` — idempotent `L2936-8.0` seed
+- `GET /api/label/image-proxy?url=...` — CORS proxy for canvas color sampling
+
+### 3. Pocket-Anchor Homography (NEW)
+
+**Files:**
+- `src/lib/pocket-detector.ts` — Gemini 2.5 Flash Lite finds the right back pocket's 4 corners in a generated image. Strict JSON-only prompt, bounds clamp, rejects quads <20px. Returns null on any error.
+- `src/lib/label-render.ts` — pure TypeScript 4-point DLT homography via 8×8 Gauss elimination. Takes saved `pocketCorners` + `labelCorners` (setup anchor coords) + newly detected `pocketCorners`, returns projected label corners in the generated image's coord space.
+
+No OpenCV SVD needed in TS — the shader still uses `cv2.getPerspectiveTransform` for the actual warp, but TS handles the re-projection maths.
+
+### 4. Setup UI (NEW)
+
+`src/app/wardrobe/[id]/label-setup/page.tsx` (~1280 lines). React port of `label_POC/wardrobe_mockup/index.html`.
+
+- 4-photo picker: `fitModels.back`, `back45Left`, `back45Right`, `flatBackUrl`
+- Pan/zoom canvas with CSS transform, `--ptscale` CSS var for inverted point sizing
+- 8 draggable corner points (pocket quad + label quad), TL/TR/BR/BL enforced via `sortQuad` (sum/diff trick)
+- 5×5-pixel color sampler — requires CORS, routed through `/api/label/image-proxy`
+- Grain variant select + emboss slider
+- Luminance-preserving multiply tint live preview (POC math)
+- Dual PUT save → `/api/label/styles/${styleCode}` + `/api/label/colorways/${styleCode}_${colorwayCode}`
+- Auto-bootstraps `L2936-8.0` on first load
+- Save blocked if `designNumber` doesn't parse
+
+Entry point: "Configure leather label →" button in the wardrobe detail panel in `src/app/wardrobe/page.tsx`, shown only for `bottom` category items with a parseable `designNumber`.
+
+### 5. Runtime Orchestration (NEW)
+
+`src/lib/label-auto.ts` — `applyAutoHybridLabel()` — single entry called from `src/app/api/generate/route.ts` after Gemini returns. Reads `ENABLE_HYBRID_LABEL_AUTO` (default ON). Guards: shotType ∈ {M02, M04}, env flag, Python available, parseable designNumber, resolvable config, detectable pocket, valid homography. **ANY failure logs and returns the original buffer. Never throws.**
+
+### 6. Gated Negative Prompt (NEW)
+
+`src/lib/pipeline/generate.ts`:
+
+- Added `LABEL_NEGATIVE_PROMPT` constant telling Gemini NOT to draw any text / letters / logos in the pocket patch area (prevents bleed under the shader output).
+- Added `hasLabelConfigForItem(focusItem)` — parses designNumber via `styleAndColorwayOf()`, calls `resolveLabelRenderConfig()`, returns true only if all three tiers exist. Never throws.
+- Wrapped three back-shot `finalPrompt` assignments (`generateM04WithDressedBase`, `generateM04`, `generateM02`) with the gate:
+  ```ts
+  const hasLabel = await hasLabelConfigForItem(focusItem);
+  if (hasLabel) finalPrompt = appendLabelNegative(finalPrompt);
+  ```
+- **M05 is intentionally NOT wrapped** — pocket close-up has no composite pass, so Gemini should draw its best-effort label.
+
+The gate keeps prompt and shader in lockstep: unconfigured garments render exactly like today (no negative prompt, no composite). Configured garments get both.
+
+### 7. Design Number Parser (NEW)
+
+`src/lib/design-number.ts` — `parseDesignNumber('D22889-D933-H087')` → `{styleCode: 'D22889', colorwayCode: 'D933', sizeCode: 'H087'}`. Tolerates missing segments and case. Unparseable → null.
+
+### 8. Asset Pipeline
+
+- `public/label-assets/L2936-8.0.png` — RGBA template artwork (alpha = height map for Sobel deboss)
+- `public/label-assets/leather-pebbled.png` — shared pebbled grain tile
+- Served by Next.js at build time; referenced as relative `/label-assets/...` URLs in Firestore; `resolveAssetUrl()` converts to `http://localhost:${PORT}/...` for Cloud Run self-fetch.
+
+## Testing Done
+
+- TypeScript compilation: ✅ `./node_modules/.bin/tsc --noEmit` clean (exit 0)
+- Failure-isolation audit: every error path in `applyAutoHybridLabel` returns the original buffer
+- Gate predicate verification: `hasLabelConfigForItem` and `applyAutoHybridLabel` both use `resolveLabelRenderConfig` — prompt/shader stay locked together
+
+**NOT tested:** runtime execution against a real generated shot. First run will be in prod.
+
+## Deployed
+
+- **NOT YET DEPLOYED** — awaiting explicit deploy instruction. See `NEXT-STEP.md`.
+
+## Rollback
+
+- `gcloud run services update gstar-ai-studio --set-env-vars ENABLE_HYBRID_LABEL_AUTO=0` — kills the auto-label path without a redeploy. OFF values (case-insensitive): `0`, `false`, `off`, `no`.
+- Per-garment: delete the `labelStyles/${styleCode}` doc in Firestore. Gate flips to unconfigured on the next job.
+- Manual escape hatch: `POST /api/shots/[id]/apply-label` still works.
+
+## Cost Impact
+
+- Pocket detection: +1 Gemini 2.5 Flash Lite call per configured M02/M04 shot (~$0.002)
+- Firestore reads: +1 to +3 per back shot for the gate (~€0.0001/doc, negligible)
+- Python subprocess: CPU only, no API cost
+- Estimated cost per job: +$0.004 to +$0.008 total when all shots are configured
+
+## Files Changed
+
+| File | Type | Summary |
+|------|------|---------|
+| src/lib/pipeline/generate.ts | Modified | Negative prompt + `hasLabelConfigForItem` gate on M04/M02 back shots |
+| src/app/api/generate/route.ts | Modified | Post-process hook calls `applyAutoHybridLabel()` at 78% |
+| src/app/wardrobe/page.tsx | Modified | "Configure leather label →" button in detail panel |
+| src/lib/label-auto.ts | **New** | Orchestrator with full failure isolation |
+| src/lib/label-render.ts | **New** | Homography + asset URL resolver + config bridge |
+| src/lib/pocket-detector.ts | **New** | Gemini pocket corner detection |
+| src/lib/design-number.ts | **New** | `D{style}-D{colorway}-H{size}` parser |
+| src/app/api/label/templates/route.ts | **New** | Templates CRUD |
+| src/app/api/label/templates/[templateId]/route.ts | **New** | Template fetch |
+| src/app/api/label/styles/[styleCode]/route.ts | **New** | Styles tier CRUD |
+| src/app/api/label/colorways/[docId]/route.ts | **New** | Colorways tier CRUD |
+| src/app/api/label/bootstrap/route.ts | **New** | Idempotent L2936-8.0 seed |
+| src/app/api/label/image-proxy/route.ts | **New** | CORS proxy for canvas sampling |
+| src/app/wardrobe/[id]/label-setup/page.tsx | **New** | Setup UI (~1280 lines) |
+| LABEL-STRATEGY.md | Rewrite | 3-tier hybrid shader pipeline |
+| NEXT-STEP.md | Rewrite | Deploy + post-deploy checklist |
+| docs/SKILL-UPDATE-HYBRID-LABEL.md | **New** | Patch text for the read-only SKILL.md mount |
+
+## Label isolation mode (future hook)
+
+L2936 is a full-rectangle label, so `run_preview()` in `scripts/label_hybrid.py`
+writes `alpha = 255` for the entire output canvas. That's fine for rectangular
+labels. For future non-rectangular labels (woven tags, patches, embroidered
+labels, cut-out shapes) the hook is:
+
+1. Add `labelSilhouetteUrl: string` to the `labelTemplates` Firestore schema
+   (RGBA PNG where the alpha channel defines where the label is vs transparent).
+2. `resolveLabelRenderConfig()` in `src/lib/firestore.ts` passes it through.
+3. `src/app/api/label/preview/route.ts` downloads it alongside `materialTileUrl`
+   and `artworkUrl`, forwards the temp path in the args JSON.
+4. `run_preview()` uses it as the output alpha channel: resize to canvas, then
+   `label_bgra[:, :, 3] = silhouette_alpha`. If absent, keep current full-rect.
+5. `run()` uses the same silhouette to confine the composite mask (instead of
+   the current full-rectangle quad fill).
+
+Backward compatible: existing templates without the field fall back to full-rect.
+
+## Blue-in-preview bug (fixed 2026-04-11)
+
+Symptom: picker preview PNG showed blue-ish pixels scattered through the
+tinted leather, visible when dragged onto a white t-shirt.
+
+Root cause: `tint_texture()` preserved L, a, AND b channel variance from the
+source material tile. For a target near-neutral colour like `#3d3934`
+(target_lab ≈ 128/128 in a/b), any source pixel below `mean_b` ended up below
+128 in b after recentering → blue half of the a*b* plane → visible blue.
+Same mechanism for the a channel → green contamination.
+
+Fix: keep L variance (grain is a luminance phenomenon), flatten a/b to target
+chroma with zero variance. Pure target colour, grain preserved through L.
+
+Related reverts done in the same fix:
+- Removed cv2.inpaint stage from `run()` — was smearing t-shirt/jeans pixels
+  around the label quad because it was compensating for the wrong diagnosis.
+- Removed 9x9 mask dilate in `warp_texture_into_quad()` — same reason.
+- Removed `PREVIEW_DILATION = 0.08` in `LabelCornerPicker.tsx` — same.
+
+The user handles are now the single source of truth for label position, and
+the tint is mathematically free of chroma surprises.

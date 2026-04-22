@@ -29,6 +29,9 @@ export async function POST(req: NextRequest) {
     const shotType = formData.get('shotType') as string;
     const category = formData.get('category') as string | null;
     const uploadedBy = formData.get('uploadedBy') as string;
+    const isAlternative = formData.get('isAlternative') === 'true';
+    const label = formData.get('label') as string | null;
+    const pipeline = formData.get('pipeline') as 'gemini' | 'seedream' | null;
 
     if (!file || !shotType || !uploadedBy) {
       return NextResponse.json(
@@ -64,6 +67,9 @@ export async function POST(req: NextRequest) {
       uploadedBy,
       silhouettePrompt: silhouettePrompt || undefined,
       generationPrompt: generationPrompt || undefined,
+      isAlternative,
+      label: label || undefined,
+      pipeline: pipeline || undefined,
     });
 
     return NextResponse.json({

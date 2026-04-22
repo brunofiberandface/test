@@ -5,6 +5,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { listModels, createModel } from '@/lib/firestore';
 import { uploadModelCardImage } from '@/lib/gcs';
+import { triggerCelebrityCheck } from '@/lib/celebrity-check';
 
 // GET /api/models — list all active models
 export async function GET(req: NextRequest) {
@@ -45,6 +46,13 @@ export async function POST(req: NextRequest) {
       gender,
       createdBy,
     });
+
+    // Fire-and-forget celebrity check on the reference image
+    if (finalImageUrl) {
+      triggerCelebrityCheck(trimmedId, finalImageUrl).catch(err =>
+        console.error(`[Models] Celebrity check fire failed for ${trimmedId}:`, err)
+      );
+    }
 
     return NextResponse.json({ success: true, modelId: trimmedId });
   } catch (error) {

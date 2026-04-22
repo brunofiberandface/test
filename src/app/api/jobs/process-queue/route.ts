@@ -1,11 +1,17 @@
 /**
- * POST /api/jobs/process-queue — v2 Pro pipeline worker.
+ * POST /api/jobs/process-queue — v3 parallel pipeline worker.
  *
  * Processes generation queue with shot dependency chain:
  * M03 → M04 → M01 + M02 (parallel) → M05
  *
  * Each job's shots are generated sequentially within a slot,
  * respecting dependencies. Only one worker runs at a time.
+ *
+ * Parallel generation: N API keys = N jobs in parallel.
+ * Each job checks out a key from the pool. When all keys are
+ * in use, remaining jobs wait in queue until a key frees up.
+ * Uses Generative Language API (per-key rate limits) instead
+ * of Vertex AI (per-project rate limits).
  */
 import { NextRequest } from 'next/server';
 import {
@@ -30,7 +36,7 @@ function getInternalBase(): string {
 
 const MAX_RETRY_PASSES = 2;
 const SHOT_TIMEOUT_MS = 540_000;  // 9 min per shot (Pro takes 80-130s but with retries)
-const SHOT_COOLDOWN_MS = 10_000;  // 10s between shots to reduce 429s
+const SHOT_COOLDOWN_MS = 5_000;   // 5s between shots (reduced — each key has its own rate limit)
 const STALE_THRESHOLD_MS = 720_000;
 const IDLE_CHECK_MS = 10_000;
 const MAX_IDLE_CYCLES = 30;       // Exit after 5 min idle
@@ -38,11 +44,49 @@ const MAX_IDLE_CYCLES = 30;       // Exit after 5 min idle
 // Shot dependency order — M03 first, then M04, then M01+M02, then M05
 const SHOT_ORDER = APP_CONFIG.shotOrder; // ['M03', 'M04', 'M01', 'M02', 'M05']
 
+// ── API Key Pool with checkout/checkin ──
+// Each key is an independent rate limit pool on the Generative Language API.
+// A job checks out a key when it starts, returns it when done.
+// If all keys are in use, remaining jobs wait in queue.
+const KEY_POOL = [
+  process.env.GEMINI_API_KEY,
+  process.env.GEMINI_API_KEY_2,
+  process.env.GEMINI_API_KEY_3,
+  process.env.GEMINI_API_KEY_4,
+  process.env.GEMINI_API_KEY_5,
+].filter(Boolean) as string[];
+
+// In-memory key tracking (single worker process — safe for in-memory)
+const checkedOutKeys = new Map<string, string>(); // jobId → apiKey
+
+function checkoutKey(jobId: string): string | null {
+  // Already has a key?
+  const existing = checkedOutKeys.get(jobId);
+  if (existing) return existing;
+  // Find first available key
+  const inUse = new Set(checkedOutKeys.values());
+  const available = KEY_POOL.find(k => !inUse.has(k));
+  if (!available) return null;
+  checkedOutKeys.set(jobId, available);
+  const keyHint = `...${available.slice(-4)}`;
+  console.log(`[Worker] Key ${keyHint} checked out → job ${jobId} (${checkedOutKeys.size}/${KEY_POOL.length} in use)`);
+  return available;
+}
+
+function checkinKey(jobId: string): void {
+  const key = checkedOutKeys.get(jobId);
+  if (key) {
+    checkedOutKeys.delete(jobId);
+    const keyHint = `...${key.slice(-4)}`;
+    console.log(`[Worker] Key ${keyHint} returned ← job ${jobId} (${checkedOutKeys.size}/${KEY_POOL.length} in use)`);
+  }
+}
+
 /**
  * Get the next shot to generate for a job, respecting dependency chain.
  * Returns null if all shots are done or if dependencies aren't met.
  */
-async function getNextShot(jobId: string): Promise<{ shotId: string; shotType: string } | null> {
+async function getNextShot(jobId: string): Promise<{ shotId: string; shotType: string; useDressedBase?: boolean } | null> {
   const shots = await listShots(jobId);
   if (shots.length === 0) return null;
 
@@ -61,8 +105,12 @@ async function getNextShot(jobId: string): Promise<{ shotId: string; shotType: s
     const status = (shot as any).status;
     if (status === 'done' || status === 'approved' || status === 'generating') continue;
 
-    // Check if status is pending or failed (eligible for generation)
-    if (status !== 'pending' && status !== 'failed' && status !== 'queued') continue;
+    // Only 'pending' and 'queued' are eligible for generation.
+    // 'failed' is terminal — the worker's 5xx retry block re-sets to 'pending'
+    // for its one-shot retry, but once a shot is marked 'failed' by generate/route.ts
+    // we must NOT re-pick it, or 4xx errors (e.g. BytePlus 400 on oversized ref)
+    // will cause an infinite retry loop.
+    if (status !== 'pending' && status !== 'queued') continue;
 
     // Check dependencies
     const deps = APP_CONFIG.shots[shotType as keyof typeof APP_CONFIG.shots]?.dependsOn || [];
@@ -72,7 +120,11 @@ async function getNextShot(jobId: string): Promise<{ shotId: string; shotType: s
     });
 
     if (depsMet) {
-      return { shotId: (shot as any).shotId || (shot as any).id, shotType };
+      return {
+        shotId: (shot as any).shotId || (shot as any).id,
+        shotType,
+        ...((shot as any).useDressedBase ? { useDressedBase: true } : {}),
+      };
     }
   }
 
@@ -92,7 +144,7 @@ async function isJobComplete(jobId: string): Promise<boolean> {
 /**
  * Process a single slot — generates shots for the assigned job sequentially.
  */
-async function processSlot(jobId: string): Promise<void> {
+async function processSlot(jobId: string, apiKey?: string): Promise<void> {
   const job = await getJob(jobId) as any;
   if (!job) {
     console.warn(`[Worker] Job ${jobId} not found — releasing slot`);
@@ -145,6 +197,8 @@ async function processSlot(jobId: string): Promise<void> {
           shotId: next.shotId,
           jobId,
           shotType: next.shotType,
+          apiKey,
+          ...(next.useDressedBase ? { useDressedBase: true } : {}),
         }),
         signal: controller.signal,
       });
@@ -183,7 +237,8 @@ async function processSlot(jobId: string): Promise<void> {
     await new Promise(r => setTimeout(r, SHOT_COOLDOWN_MS));
   }
 
-  // Release slot, pull next job from queue
+  // Return API key to pool, release slot, pull next job from queue
+  checkinKey(jobId);
   const next = await releaseSlot(jobId);
   if (next) {
     console.log(`[Worker] Next job from queue: ${next.jobId}`);
@@ -200,10 +255,11 @@ export async function POST(req: NextRequest) {
     });
   }
 
-  console.log('[Worker] Claimed worker role — starting loop');
+  console.log(`[Worker] Claimed worker role — ${KEY_POOL.length} API key(s) → max ${KEY_POOL.length} parallel job(s)`);
 
   try {
     let idleCycles = 0;
+    const runningJobs = new Map<string, Promise<void>>();
 
     while (idleCycles < MAX_IDLE_CYCLES) {
       const state = await getQueueState();
@@ -221,20 +277,58 @@ export async function POST(req: NextRequest) {
 
       idleCycles = 0;
 
-      // Process active slots sequentially (one at a time to avoid race conditions)
+      // Try to check out a key for each active slot.
+      // Jobs that get a key run in parallel. Jobs without a key wait.
+      const jobsWithKeys: { jobId: string; apiKey: string }[] = [];
+      const waitingJobs: string[] = [];
+
       for (const slot of activeSlots) {
-        if (slot) {
-          await processSlot(slot.jobId);
-          await updateWorkerHeartbeat();
+        if (!slot) continue;
+        const key = checkoutKey(slot.jobId);
+        if (key) {
+          jobsWithKeys.push({ jobId: slot.jobId, apiKey: key });
+        } else {
+          waitingJobs.push(slot.jobId);
         }
       }
 
-      // Brief pause before checking for more work
-      await new Promise(r => setTimeout(r, 2000));
+      if (waitingJobs.length > 0) {
+        console.log(`[Worker] ${jobsWithKeys.length} job(s) running, ${waitingJobs.length} waiting for a free key`);
+      }
+
+      if (jobsWithKeys.length > 0) {
+        // Launch NEW jobs (not already running) as background promises.
+        // Already-running jobs just get re-checked-out (idempotent) — skip them.
+        for (const { jobId, apiKey } of jobsWithKeys) {
+          if (!runningJobs.has(jobId)) {
+            console.log(`[Worker] Launching job ${jobId} in background`);
+            const p = processSlot(jobId, apiKey)
+              .then(() => updateWorkerHeartbeat())
+              .finally(() => runningJobs.delete(jobId));
+            runningJobs.set(jobId, p);
+          }
+        }
+      }
+
+      // Re-check for new jobs every 5s, even while existing jobs are running.
+      // This is what enables parallel: the loop discovers new queued jobs
+      // and launches them with separate API keys while others are in-flight.
+      if (runningJobs.size > 0) {
+        await Promise.race([
+          ...runningJobs.values(),
+          new Promise(r => setTimeout(r, 5000)),
+        ]).catch(() => {});
+      } else {
+        await new Promise(r => setTimeout(r, IDLE_CHECK_MS));
+      }
     }
   } catch (err) {
     console.error('[Worker] Fatal error:', err);
   } finally {
+    // Return all checked-out keys on exit
+    for (const jobId of [...checkedOutKeys.keys()]) {
+      checkinKey(jobId);
+    }
     await releaseWorker();
     console.log('[Worker] Released worker role');
   }

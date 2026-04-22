@@ -113,6 +113,26 @@ gcloud run deploy gstar-ai-studio \
   --set-env-vars "GEMINI_API_KEY=<your-key>"
 ```
 
+### Environment Variables
+
+| Name | Default | Purpose |
+|---|---|---|
+| `GEMINI_API_KEY` | — | Required. Gemini generation key (billed to Pipeline project). |
+| `ENABLE_HYBRID_LABEL_AUTO` | `1` (ON) | Kill switch for the hybrid leather-label pipeline. Set to `0`, `false`, `off`, or `no` (case-insensitive) to disable the auto-composite on M02/M04 without a redeploy. When disabled, back shots ship exactly as Gemini returns them (no shader, no negative prompt side effects apply). |
+
+**Rollback the hybrid label without a redeploy:**
+```bash
+gcloud run services update gstar-ai-studio \
+  --region europe-west1 --project gstar-ai-studio \
+  --set-env-vars ENABLE_HYBRID_LABEL_AUTO=0
+```
+Remember: `--set-env-vars` REPLACES all vars. Use `--update-env-vars` if you only want to touch this one:
+```bash
+gcloud run services update gstar-ai-studio \
+  --region europe-west1 --project gstar-ai-studio \
+  --update-env-vars ENABLE_HYBRID_LABEL_AUTO=0
+```
+
 ### Deploy Checklist
 
 1. `gcloud config get-value project` → must say `gstar-ai-studio`

@@ -30,6 +30,23 @@ export interface GarmentMetadata {
   customFields?: Record<string, string>;
 }
 
+// ── Celebrity Check Audit ──
+
+export interface CelebrityCheckAudit {
+  timestamp: Date;
+  status: 'pass' | 'review' | 'blocked' | 'error';
+  facesDetected?: number;
+  topMatch: string | null;
+  topScore: number;
+  flaggedMatches?: Array<{ name: string; score: number }>;
+  modelVersion: string;
+  databaseVersion: string;
+  thresholds: { review: number; block: number };
+  durationMs?: number;
+  note?: string;
+  error?: string;
+}
+
 // ── AI Models (simplified — 1 reference photo) ──
 
 export type ModelGender = 'male' | 'female';
@@ -38,16 +55,21 @@ export interface AIModel {
   modelId: string;
   name: string;
   description: string;
-  referenceImageUrl: string;  // Single 4K reference photo (was: cardImageUrl)
+  referenceImageUrl: string;      // Front 4K reference photo
+  backReferenceImageUrl?: string; // Back view reference photo (auto-generated from front)
   gender: ModelGender;
   active: boolean;
   createdBy: string;
   createdAt: Date;
+  celebrityCheck?: CelebrityCheckAudit;
 }
 
 // ── Jobs (v2: 3 wardrobe items + focus) ──
 
 export type JobStatus = 'pending' | 'generating' | 'review' | 'complete' | 'failed';
+
+/** Which image-generation backend to use. Defaults to 'gemini' everywhere absent. */
+export type GenerationProvider = 'gemini' | 'seedream';
 
 export interface JobWardrobe {
   shoe: { itemId: string; isFocus: boolean };
@@ -84,6 +106,9 @@ export interface Job {
   m03AnchorUrl?: string;
   m04AnchorUrl?: string;
 
+  // Image-generation backend for this job. Absent = 'gemini' (production default).
+  provider?: GenerationProvider;
+
   createdAt: Date;
   updatedAt: Date;
 }
@@ -103,6 +128,8 @@ export interface Shot {
   imageUrl?: string;
   prompt: string;
   promptRevision: number;  // which .md version was used
+  alternativePromptId?: string;  // if set, this alternative prompt was used instead of base
+  alternativePromptLabel?: string;  // label for display, e.g. "Color Fidelity"
   createdAt: Date;
   updatedAt?: Date;
   // Progress tracking
@@ -113,7 +140,11 @@ export interface Shot {
     imageUrl: string;
     version: number;
     createdAt: Date;
+    provider?: GenerationProvider;
   }>;
+  // Per-shot provider override for one-shot reruns (e.g. "Rerun with Seedream").
+  // If set, takes precedence over job.provider. Absent = use job.provider (or 'gemini').
+  provider?: GenerationProvider;
 }
 
 // ── Modifications ──
@@ -158,6 +189,7 @@ export interface FitModelAngles {
 export interface WardrobeItem {
   wardrobeId: string;
   name: string;
+  designNumber?: string;
   category: WardrobeCategory;
   description: string;
 
@@ -188,6 +220,10 @@ export interface PromptFile {
   gcsUrl: string;          // backup in GCS for download
   uploadedBy: string;      // admin email
   uploadedAt: Date;
+
+  // Alternative prompt support
+  isAlternative?: boolean; // true = rerun-only prompt, not used for initial generation
+  label?: string;          // display label for rerun button, e.g. "Color Fidelity"
 
   // Extracted at upload time for quick access
   silhouettePrompt?: string;
@@ -226,3 +262,95 @@ export const CATEGORY_FIELDS: Record<GarmentCategory, CategoryFieldConfig[]> = {
     { key: 'fitDescription', label: 'Item Description', type: 'text', placeholder: 'e.g., belt, bag, hat, scarf...' },
   ],
 };
+
+// ══════════════════════════════════════════════════════════════════════════
+// Leather label — three-tier schema (ADR-001 Option B, v1 2026-04-11)
+// ══════════════════════════════════════════════════════════════════════════
+//
+// Tier 1: labelTemplates/{templateId}     — artwork (shared across styles)
+// Tier 2: labelStyles/{styleCode}         — geometry (shared across colorways)
+// Tier 3: labelColorways/{styleCode}_{colorwayCode} — color-only delta
+//
+// At generation time the three tiers are merged into a single LabelRenderConfig
+// passed to applyHybridLabel().
+// ══════════════════════════════════════════════════════════════════════════
+
+export type GrainVariant = 'pebbled' | 'smooth' | 'coarse';
+
+export interface ColorRGB {
+  r: number;
+  g: number;
+  b: number;
+  hex: string;
+}
+
+export interface Point2D {
+  x: number;
+  y: number;
+}
+
+/** Tier 1 — physical label artwork. One doc per templateId (e.g. "L2936-8.0"). */
+export interface LabelTemplate {
+  templateId: string;          // doc id
+  name?: string;               // friendly name
+  artworkUrl: string;          // full-resolution template PNG (height map)
+  materialTileUrls: Partial<Record<GrainVariant, string>>; // plain-leather tiles per grain
+  aspectRatio: number;         // width / height of physical label
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+/** Tier 2 — per-style geometry. One doc per styleCode (e.g. "D22889"). */
+export interface LabelStyle {
+  styleCode: string;           // doc id
+  templateId: string;          // ref → labelTemplates/{templateId}
+
+  // Which fit-model photo we annotated on
+  anchorPhoto: {
+    wardrobeItemId: string;    // source of truth for the photo
+    photoKey: keyof FitModelAngles | 'flatBack'; // which angle was used
+    url: string;               // cached url for display
+    width: number;             // natural dimensions
+    height: number;
+  };
+
+  // All corners are in NATURAL PIXEL coordinates on the anchor photo.
+  // Order is canonical: TL, TR, BR, BL (post-sortQuad).
+  labelCorners: [Point2D, Point2D, Point2D, Point2D];
+  pocketCorners: [Point2D, Point2D, Point2D, Point2D];
+
+  updatedBy: string;           // admin email
+  updatedAt: Date;
+}
+
+/** Tier 3 — per-colorway color-only delta. Doc id: `${styleCode}_${colorwayCode}`. */
+export interface LabelColorway {
+  styleCode: string;
+  colorwayCode: string;
+  colorwayName?: string;       // friendly, e.g. "grey Judee loose"
+
+  baseColor: ColorRGB;         // leather body — sampled from reference
+  stitchColor?: ColorRGB;      // optional contrast thread
+  embossStrength: number;      // 0..1 — shader deboss strength (tan 0.85, black 0.35)
+  grainVariant: GrainVariant;  // which material tile to use from the template
+
+  sampledFromPhoto?: string;   // url of the photo color was sampled from (audit)
+  updatedBy: string;
+  updatedAt: Date;
+}
+
+/** Fully-resolved config handed to the hybrid-label shader at generation time. */
+export interface LabelRenderConfig {
+  templateId: string;
+  artworkUrl: string;
+  materialTileUrl: string;
+  baseColor: ColorRGB;
+  stitchColor?: ColorRGB;
+  embossStrength: number;
+  grainVariant: GrainVariant;
+  // Geometry — natural-pixel corners on the anchor photo
+  labelCorners: [Point2D, Point2D, Point2D, Point2D];
+  pocketCorners: [Point2D, Point2D, Point2D, Point2D];
+  anchorPhotoWidth: number;
+  anchorPhotoHeight: number;
+}

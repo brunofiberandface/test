@@ -6,6 +6,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getModel } from '@/lib/firestore';
 import { db } from '@/lib/firestore';
 import { uploadModelCardImage } from '@/lib/gcs';
+import { triggerCelebrityCheck } from '@/lib/celebrity-check';
 
 // GET /api/models/:id
 export async function GET(
@@ -60,6 +61,13 @@ export async function PATCH(
     updates.updatedAt = new Date();
 
     await docRef.update(updates);
+
+    // Re-run celebrity check if reference image changed
+    if (updates.referenceImageUrl) {
+      triggerCelebrityCheck(id, updates.referenceImageUrl as string).catch(err =>
+        console.error(`[Models] Celebrity check fire failed for ${id}:`, err)
+      );
+    }
 
     return NextResponse.json({ success: true, referenceImageUrl: updates.referenceImageUrl });
   } catch (error) {

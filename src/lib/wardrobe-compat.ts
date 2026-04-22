@@ -87,4 +87,4 @@ export function normalizeWardrobeItem(item: any): NormalizedWardrobe | null {
 
   return { fitModels, flatFrontUrl, flatBackUrl };
 }
-// build-bust: 1775332757
+// build-bust: v2-styling-refs-20260404

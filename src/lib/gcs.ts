@@ -5,6 +5,7 @@
 import { Storage } from '@google-cloud/storage';
 
 const BUCKET_NAME = 'gstar-ai-studio-assets';
+const UPLOAD_TIMEOUT_MS = 120_000; // 2 min timeout for GCS uploads
 
 let _storage: Storage | null = null;
 
@@ -75,11 +76,17 @@ export async function uploadGeneratedImage(
   const gcsPath = `output/${designNumber}/${filename}`;
   const file = bucket.file(gcsPath);
 
-  await file.save(imageBuffer, {
-    metadata: {
-      contentType: mimeType,
-    },
-  });
+  // Wrap upload in a timeout to prevent indefinite hangs
+  await Promise.race([
+    file.save(imageBuffer, {
+      metadata: {
+        contentType: mimeType,
+      },
+    }),
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error(`GCS upload timed out after ${UPLOAD_TIMEOUT_MS / 1000}s for ${gcsPath} (${(imageBuffer.length / 1024 / 1024).toFixed(1)}MB)`)), UPLOAD_TIMEOUT_MS)
+    ),
+  ]);
 
   return `https://storage.googleapis.com/${BUCKET_NAME}/${gcsPath}`;
 }
@@ -103,6 +110,30 @@ export async function uploadModelCardImage(
     metadata: {
       contentType: mimeType,
       cacheControl: 'no-cache', // Allow immediate updates
+    },
+  });
+
+  return `https://storage.googleapis.com/${BUCKET_NAME}/${gcsPath}?v=${Date.now()}`;
+}
+
+/**
+ * Upload a model back reference image to GCS.
+ * Path: model-cards/{modelId}_back.png
+ */
+export async function uploadModelBackImage(
+  modelId: string,
+  imageBuffer: Buffer,
+  mimeType = 'image/png'
+): Promise<string> {
+  const storage = getStorage();
+  const bucket = storage.bucket(BUCKET_NAME);
+  const gcsPath = `model-cards/${modelId}_back.png`;
+  const file = bucket.file(gcsPath);
+
+  await file.save(imageBuffer, {
+    metadata: {
+      contentType: mimeType,
+      cacheControl: 'no-cache',
     },
   });
 

@@ -12,9 +12,9 @@ interface ShellProps {
 const NAV_ITEMS = [
   { href: '/dashboard', label: 'Dashboard', roles: ['admin', 'creator'] },
   { href: '/jobs/new', label: 'New Job', roles: ['admin', 'creator'], exact: true },
-  { href: '/jobs', label: 'Jobs', roles: ['admin', 'creator'] },
   { href: '/models', label: 'Models', roles: ['admin', 'creator'] },
   { href: '/wardrobe', label: 'Wardrobe', roles: ['admin', 'creator'] },
+  { href: '/prompt-vault', label: 'Prompt Vault', roles: ['admin'] },
   { href: '/admin/users', label: 'Users', roles: ['admin'] },
   { href: '/admin/learning', label: 'Learning', roles: ['admin'] },
 ];

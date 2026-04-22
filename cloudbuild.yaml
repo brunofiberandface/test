@@ -2,7 +2,7 @@
 steps:
   # Build Docker image
   - name: 'gcr.io/cloud-builders/docker'
-    args: ['build', '-t', 'gcr.io/$PROJECT_ID/gstar-studio', '.']
+    args: ['build', '--no-cache', '-t', 'gcr.io/$PROJECT_ID/gstar-studio', '.']
 
   # Push to Container Registry
   - name: 'gcr.io/cloud-builders/docker'
@@ -21,11 +21,14 @@ steps:
       - '--allow-unauthenticated'
       - '--memory=2Gi'
       - '--cpu=2'
-      - '--timeout=600'
+      - '--timeout=3600'
       - '--min-instances=0'
       - '--max-instances=5'
+      # NEXTAUTH_SECRET intentionally NOT in this list — it's already set on the
+      # live Cloud Run revision, and --update-env-vars only touches keys you name,
+      # so the existing value is preserved. Avoids the build-time substitution.
       - '--update-env-vars'
-      - 'GCP_PROJECT=gstar-ai-studio,NEXTAUTH_URL=https://gstar-ai-studio-674145888056.europe-west1.run.app,NEXTAUTH_SECRET=${_NEXTAUTH_SECRET}'
+      - 'GCP_PROJECT=gstar-ai-studio,NEXTAUTH_URL=https://gstar-ai-studio-674145888056.europe-west1.run.app'
 
 images:
   - 'gcr.io/$PROJECT_ID/gstar-studio'
