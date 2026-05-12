@@ -144,6 +144,33 @@ export async function generateM06WithGemini(ctx: GeminiM06Context): Promise<Gemi
   }
   console.log(`[GeminiM06] wardrobe top: ${wardrobeTopDescription ? `"${wardrobeTopDescription.slice(0, 60)}..."` : '(none — sports-bra fallback)'}`);
 
+  // 2026-05-12 FIX: pull wardrobe.shoe so M06 doesn't hardcode stiletto heels.
+  // Old behavior shipped heels for every M06 regardless of job — wrong for
+  // male models (Bruno: "M06 needs to wear what was chosen on the job, clothes
+  // and model"), wrong for jobs with specific footwear (work boots, sneakers,
+  // chunky sole, etc.). M01-M05 already use wardrobe.shoe via Seedream's
+  // getStylingRefs — M06 now matches.
+  const shoeConfig = ctx.wardrobe['shoe' as keyof JobWardrobe];
+  let wardrobeShoeDescription = '';
+  if (shoeConfig?.itemId) {
+    const shoeItem = await getWardrobeItem(shoeConfig.itemId) as any;
+    if (shoeItem) {
+      wardrobeShoeDescription = shoeItem.shoesDescription
+        || shoeItem.description
+        || shoeItem.name
+        || '';
+    }
+  }
+  console.log(`[GeminiM06] wardrobe shoe: ${wardrobeShoeDescription ? `"${wardrobeShoeDescription.slice(0, 60)}..."` : '(none — heels fallback)'}`);
+
+  // 2026-05-12 FIX: surface model gender + identity description so Gemini
+  // doesn't drift to a generic Caucasian editorial face on male / non-default
+  // models. Bruno caught M6 (East Asian male "Gao") rendering as a
+  // generic Caucasian male in M06 while M01-M05 (Seedream) rendered the
+  // correct identity.
+  const modelGender = (model?.gender as string) || 'female';
+  const modelDescription = (model?.description as string) || '';
+
   console.log('[GeminiM06] Fetching reference images...');
   const refs: ReferenceImage[] = [];
 
@@ -196,7 +223,7 @@ FULL-BODY composition with HEADROOM. The ENTIRE model is visible inside the fram
 If the chosen pose would cause cropping, ZOOM OUT — make the model smaller within the frame rather than crop any part of the body.
 
 ═══ IDENTITY (from IMAGE 2 ONLY) ═══
-The rendered model is the SAME PERSON as in IMAGE 2 — exact same skin tone, complexion depth, hair color, hair length, hair texture, facial features, and body proportions. The model in IMAGE 1 (if present) is a DIFFERENT person whose pose is being copied — the rendered model's identity does NOT take ANY attributes from IMAGE 1. If IMAGE 1's model has lighter skin or different hair, the rendered model still has IMAGE 2's exact skin tone and hair.
+The rendered model is the SAME PERSON as in IMAGE 2 — a ${modelGender} model with these specific attributes${modelDescription ? `: ${modelDescription.split('\n')[0].slice(0, 280)}` : ''}. Exact same skin tone, complexion depth, hair color, hair length, hair texture, facial features, body proportions, and ${modelGender === 'male' ? 'facial-hair / beard pattern' : 'face structure'}. The model in IMAGE 1 (if present) is a DIFFERENT person whose pose is being copied — the rendered model's identity does NOT take ANY attributes from IMAGE 1. If IMAGE 1's model has lighter skin, different hair, different ethnicity, or a different gender, the rendered model still has IMAGE 2's exact identity. The rendered model is ${modelGender.toUpperCase()} — never invent a different gender.
 
 ═══ POSE (from IMAGE 1 / text description) ═══
 The model in the rendered output is in EXACTLY the body pose specified below. Specifically:
@@ -233,8 +260,11 @@ The model's UPPER BODY wears ONLY a plain black athletic sports bra (basic athle
 CLOTHING ISOLATION: The clothing visible in IMAGE 1 (if present) is NOT the rendered model's clothing. IGNORE everything the IMAGE 1 model wears on the upper body. The rendered upper body is bare arms + plain black sports bra ONLY.`
 }
 
-═══ FOOTWEAR — MANDATORY ═══
-The model ALWAYS wears black pointed-toe stiletto heels. ALWAYS render the heels at the bottom of the frame, regardless of what footwear (or no footwear) is shown in IMAGE 1. The model is NEVER barefoot.
+═══ FOOTWEAR — MANDATORY (from wardrobe) ═══
+${wardrobeShoeDescription
+  ? `The model wears: ${wardrobeShoeDescription}. Match this footwear description EXACTLY — material, color, sole shape, height, lacing/buckles, branding. The footwear shown in IMAGE 1 (if present) is NOT the rendered footwear — IGNORE that and render EXACTLY the shoes described above. The model is NEVER barefoot.`
+  : `The model wears appropriate, simple footwear matching the outfit. The model is NEVER barefoot. The footwear in IMAGE 1 (if present) is NOT the rendered footwear.`
+}
 
 ═══ STUDIO ═══
 Backdrop: clean light-grey studio sweep, no scuffs, no texture, no marks. Floor: continuous extension of the backdrop with a faint contact shadow under the feet.
@@ -250,7 +280,7 @@ Backdrop: clean light-grey studio sweep, no scuffs, no texture, no marks. Floor:
 - WRONG: any part of the head, hair, scalp, or hairstyle being cut off, cropped, or touching the top edge of the frame. The head MUST sit at least 8% below the top edge with clear background visible above it.
 - WRONG: heels or feet cut off, cropped, or touching the bottom edge. There MUST be clear floor visible below the heels.
 
-The pose MUST match the spec. The identity MUST match IMAGE 2. The top MUST be ${wardrobeTopDescription ? 'the top described in the TOP section above' : 'a plain black sports bra'}. The footwear MUST be black pointed heels. These are non-negotiable.`;
+The pose MUST match the spec. The identity MUST match IMAGE 2 (${modelGender} model). The top MUST be ${wardrobeTopDescription ? 'the top described in the TOP section above' : 'a plain black sports bra'}. The footwear MUST be ${wardrobeShoeDescription ? 'the footwear described in the FOOTWEAR section above' : 'appropriate simple shoes'}. These are non-negotiable.`;
 
   console.log(`[GeminiM06] Calling Gemini-3-pro-image-preview (${refs.length} refs, pose=${pose.id})...`);
   const t0 = Date.now();
@@ -315,9 +345,39 @@ async function generateM06TopFocusWithGemini(ctx: GeminiM06Context): Promise<Gem
   const topDescription = topItem.topDescription || topItem.description || topName;
   console.log(`[GeminiM06:topfocus] top: "${topName}" — flat=${!!topFlat} angles=${topAngles.length}`);
 
+  // 2026-05-12 FIX: pull wardrobe bottom + shoe so M06 doesn't hardcode
+  // "plain medium-wash blue denim jeans" + "black stiletto heels" regardless
+  // of the actual job. Bruno: "M06 needs to wear what was chosen on the job,
+  // clothes and model".
+  const bottomConfig = ctx.wardrobe['bottom' as keyof JobWardrobe];
+  let wardrobeBottomDescription = '';
+  if (bottomConfig?.itemId) {
+    const bottomItem = await getWardrobeItem(bottomConfig.itemId) as any;
+    if (bottomItem) {
+      wardrobeBottomDescription = bottomItem.bottomDescription
+        || bottomItem.description
+        || bottomItem.name
+        || '';
+    }
+  }
+  const shoeConfig = ctx.wardrobe['shoe' as keyof JobWardrobe];
+  let wardrobeShoeDescription = '';
+  if (shoeConfig?.itemId) {
+    const shoeItem = await getWardrobeItem(shoeConfig.itemId) as any;
+    if (shoeItem) {
+      wardrobeShoeDescription = shoeItem.shoesDescription
+        || shoeItem.description
+        || shoeItem.name
+        || '';
+    }
+  }
+  console.log(`[GeminiM06:topfocus] bottom: ${wardrobeBottomDescription ? `"${wardrobeBottomDescription.slice(0,60)}..."` : '(none)'}, shoe: ${wardrobeShoeDescription ? `"${wardrobeShoeDescription.slice(0,60)}..."` : '(none)'}`);
+
   const model = await getModel(ctx.modelId) as any;
   const modelRefUrl = model?.referenceImageUrl || model?.cardImageUrl;
   if (!modelRefUrl) throw new Error(`[GeminiM06:topfocus] no model card for ${ctx.modelId}`);
+  const modelGender = (model?.gender as string) || 'female';
+  const modelDescription = (model?.description as string) || '';
 
   // Fetch refs
   console.log('[GeminiM06:topfocus] Fetching reference images...');
@@ -388,7 +448,7 @@ async function generateM06TopFocusWithGemini(ctx: GeminiM06Context): Promise<Gem
 FULL-BODY composition with HEADROOM. The ENTIRE model is visible inside the frame from the very top of the head DOWN to the soles of the feet. ~8-12% clear background ABOVE the top of the head; ~5-8% clear floor BELOW the heels. Subject centered horizontally. If the chosen pose would cause cropping, ZOOM OUT — make the model smaller within the frame rather than crop any part of the body. The TOP GARMENT must be fully visible from neckline to hem.
 
 ═══ IDENTITY (from IMAGE 2 + IMAGE 2B ONLY) ═══
-The rendered model is the SAME PERSON as in IMAGE 2 and IMAGE 2B. IMAGE 1 (POSE REFERENCE) is BODY-ONLY — the head is intentionally cropped because IMAGE 1's model is a DIFFERENT person whose identity must NOT appear in the rendered output. Even though IMAGE 1 has no head, you must NOT invent a head based on IMAGE 1's body shape or skin tone. The head — face, hair, skin tone, eye color, facial features — comes EXCLUSIVELY from IMAGE 2 + IMAGE 2B.
+The rendered model is the SAME PERSON as in IMAGE 2 and IMAGE 2B — a ${modelGender} model${modelDescription ? ` with these specific attributes: ${modelDescription.split('\n')[0].slice(0, 280)}` : ''}. IMAGE 1 (POSE REFERENCE) is BODY-ONLY — the head is intentionally cropped because IMAGE 1's model is a DIFFERENT person whose identity must NOT appear in the rendered output. Even though IMAGE 1 has no head, you must NOT invent a head based on IMAGE 1's body shape, skin tone, or gender. The head — face, hair, skin tone, eye color, ${modelGender === 'male' ? 'facial-hair / beard pattern,' : ''} facial features — comes EXCLUSIVELY from IMAGE 2 + IMAGE 2B. The rendered model is ${modelGender.toUpperCase()} — never render a different gender.
 
 ═══ POSE (from IMAGE 1 + text below) ═══
 The rendered model is in EXACTLY the body pose shown in IMAGE 1, reinforced by the text description below. All 5 top-focus poses are STRICTLY FRONT-FACING — body squared to the camera, no 3/4 turn, no profile. Eyes direct at the lens. Head level, chin neutral. Shoulders relaxed. Fingers soft, never clenched. Match hand placement and weight shift from IMAGE 1 literally (no mirroring).
@@ -406,11 +466,17 @@ Match the top EXACTLY: color, fabric, neckline/collar, sleeves, hem position on 
 
 CRITICAL — the top in IMAGE 1 (POSE REFERENCE) is NOT the target top. IGNORE the top garment shown in IMAGE 1. The rendered model's top is the garment in IMAGE 3 + IMAGE 4+, period.
 
-═══ BOTTOM (incidental — minimal interference) ═══
-The model wears plain medium-wash blue denim jeans (straight-leg or relaxed-straight fit). Clean, neutral mid-blue denim — no bold wash, no rips, no distress, no embellishments. The jeans must NOT distract from the top.
+═══ BOTTOM (from wardrobe — supporting, do not distract from the top) ═══
+${wardrobeBottomDescription
+  ? `The model wears: ${wardrobeBottomDescription}. Match this bottom description faithfully — color, wash, fit, fabric, length. The bottom is supporting context for the top (which is the hero) — render accurately but do not over-emphasize.`
+  : `The model wears plain medium-wash blue denim jeans (straight-leg or relaxed-straight fit), clean and neutral.`
+}
 
-═══ FOOTWEAR ═══
-The model wears black pointed-toe stiletto heels at the bottom of the frame. Heels are visible — the model is never barefoot. Heels never touch the bottom edge (clear floor visible).
+═══ FOOTWEAR (from wardrobe) ═══
+${wardrobeShoeDescription
+  ? `The model wears: ${wardrobeShoeDescription}. Match this footwear EXACTLY — material, color, sole, height, lacing, branding. The footwear in IMAGE 1 (if visible) is NOT the rendered footwear — IGNORE it. The model is NEVER barefoot. Footwear is visible at the bottom of the frame with clear floor below.`
+  : `The model wears appropriate, simple footwear matching the outfit. Visible at the bottom of the frame, never barefoot, clear floor below.`
+}
 
 ═══ STUDIO ═══
 Clean light-grey studio sweep (#D9DAD2), no scuffs / texture / marks. Floor: continuous backdrop extension with a faint contact shadow under the feet. Soft diffused 5500K lighting, even illumination, no harsh shadows.
