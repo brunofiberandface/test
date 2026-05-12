@@ -18,6 +18,7 @@ interface Job {
   focusFitModelFrontUrl?: string;
   modelName?: string;
   modelId?: string;
+  jobNumber?: number;
   createdAt: string;
   updatedAt?: string;
   creatorEmail?: string;
@@ -63,7 +64,9 @@ function formatDate(isoString: string | undefined): string {
   try {
     const d = new Date(isoString);
     if (isNaN(d.getTime())) return '—';
-    return d.toLocaleString('en-GB', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+    // Shortened format: "12 May 14:30" → "12 May" (drop time — date column is for quick scan,
+    // not precise timestamp).
+    return d.toLocaleString('en-GB', { day: 'numeric', month: 'short' });
   } catch {
     return '—';
   }
@@ -808,7 +811,12 @@ export default function DashboardPage() {
                       })()}
                     </td>
                     <td className="px-5 py-3 text-sm text-neutral-600 truncate max-w-[180px]" title={job.creatorEmail || ''}>{job.creatorEmail || '—'}</td>
-                    <td className="px-5 py-3 text-sm text-neutral-400">{formatDate(job.updatedAt || job.createdAt)}</td>
+                    <td className="px-5 py-3 text-sm text-neutral-400">
+                      {job.jobNumber != null && (
+                        <span className="text-neutral-700 font-medium mr-2">#{job.jobNumber}</span>
+                      )}
+                      <span className="text-neutral-400">{formatDate(job.updatedAt || job.createdAt)}</span>
+                    </td>
                     <td className="px-5 py-3">
                       <span className={`inline-flex text-xs px-2 py-0.5 font-medium ${STATUS_STYLES[statusKey] || STATUS_STYLES.generating}`}>
                         {statusKey === 'queued' && job.queuePosition

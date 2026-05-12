@@ -168,6 +168,27 @@ export async function updateModel(modelId: string, data: Partial<{
 }
 
 // ── Job operations (v2: structured wardrobe + prompt revisions) ──
+
+/**
+ * Atomic counter for the sequential `jobNumber` (1, 2, 3, ...) shown in the
+ * UI for human-readable references in screenshots / comms. Stored at
+ * system/jobCounter.next — backfilled to 127 on 2026-05-12 (after the
+ * existing 126 jobs got jobNumber=1..126 in createdAt order).
+ *
+ * Race-safe via Firestore transaction. New jobs always get a unique,
+ * monotonically increasing number even if multiple are created concurrently.
+ */
+const JOB_COUNTER_DOC = db.collection('system').doc('jobCounter');
+
+export async function getNextJobNumber(): Promise<number> {
+  return db.runTransaction(async (tx) => {
+    const doc = await tx.get(JOB_COUNTER_DOC);
+    const next = doc.exists ? (doc.data()?.next as number) || 1 : 1;
+    tx.set(JOB_COUNTER_DOC, { next: next + 1, updatedAt: new Date() }, { merge: true });
+    return next;
+  });
+}
+
 export async function createJob(data: {
   jobName: string;
   creatorEmail: string;
@@ -183,8 +204,10 @@ export async function createJob(data: {
   m06PoseId?: string;  // optional — id from src/lib/m06-poses.ts
 }) {
   const ref = jobsCol.doc();
+  const jobNumber = await getNextJobNumber();
   await ref.set({
     jobId: ref.id,
+    jobNumber,
     ...data,
     status: 'pending',
     createdAt: new Date(),

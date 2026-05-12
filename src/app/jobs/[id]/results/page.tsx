@@ -40,6 +40,7 @@ interface ShotData {
 interface JobData {
   designNumber: string;
   jobName?: string;
+  jobNumber?: number;
   description: string;
   garmentCategory: string;
   status: string;
@@ -921,6 +922,9 @@ export default function ResultsPage() {
           )}
           <div className="flex-1 min-w-0">
             <h1 className="text-2xl font-bold text-neutral-900">
+              {job?.jobNumber != null && (
+                <span className="text-neutral-500 font-medium mr-2">#{job.jobNumber}</span>
+              )}
               {job?.jobName || job?.designNumber || jobId}
             </h1>
             <p className="text-xs text-neutral-400 mt-0.5 mb-1">{job?.designNumber}</p>
