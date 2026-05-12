@@ -29,7 +29,7 @@ import type { JobWardrobe } from '@/types';
 import { generateSeedreamImage, type SeedreamReferenceImage } from './seedream-client';
 import { ensureSeedreamSafeUrl } from './seedream-image-safe';
 import { uploadGeneratedImage } from '@/lib/gcs';
-import { silhouetteIndicatesCroppedHem } from './cropped-hem-detector';
+import { silhouetteHasRolledCuff } from './cropped-hem-detector';
 
 const STUDIO_BACKDROP_URL =
   'https://storage.googleapis.com/gstar-ai-studio-assets/backdrops/clean-studio-grey.jpg';
@@ -168,8 +168,13 @@ export async function seedreamM04TwoPass(
   // indicates a cropped / cuffed / rolled hem, swap to the cuff-preserving
   // prompt + ref labels. The default "jeans go over the shoes" path destroys
   // the cuff; the CUFFED path respects the fit-model cuff exactly.
+  // Use the STRICT rolled-cuff detector — not the broad cropped-hem one used
+  // by shoe-edit's SKIP rule. False positives here force a cuff onto a
+  // garment that doesn't have one (2026-05-12 incident: 3301 Flares,
+  // Culottes, RADAR, CONTOR all picked up unwanted cuffs because the broad
+  // detector matched "mid-calf" / "cropped length" / "raw selvedge").
   const silhouetteBack: string = (bottomItem.silhouetteBack || bottomItem.silhouetteFront || '') as string;
-  const isCuffed = silhouetteIndicatesCroppedHem(silhouetteBack);
+  const isCuffed = silhouetteHasRolledCuff(silhouetteBack);
 
   let pass2Prompt: string;
   let pass2Refs: SeedreamReferenceImage[];
