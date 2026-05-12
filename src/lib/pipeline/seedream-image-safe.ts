@@ -1,13 +1,16 @@
 /**
- * Seedream image size guard.
+ * Seedream image safety guard.
  *
- * BytePlus rejects reference images > 10 MiB. Our GCS bucket stores user-uploaded
- * fit model photos at full resolution — some exceed 10 MiB. We only hit this
- * problem for Seedream (it fetches URLs server-side); Gemini takes inline buffers
- * and has a much higher per-image budget.
+ * BytePlus has two hard rules for reference images:
+ *   1. Size <= 10 MiB
+ *   2. Format must be JPEG or PNG (AVIF / WebP / HEIC / TIFF / etc. → 400)
+ *
+ * Our GCS bucket has wardrobe assets that violate both rules:
+ *   - Some user-uploaded fit-model photos exceed 10 MiB
+ *   - Some files are AVIF (sometimes saved with a misleading .jpg extension)
  *
  * This helper returns a "Seedream-safe" URL for any GCS asset URL:
- *   - If the asset is <= SAFE_LIMIT_BYTES → return original URL unchanged.
+ *   - If the asset is JPEG/PNG and <= SAFE_LIMIT_BYTES → return original URL.
  *   - Otherwise → download, re-encode as JPEG with Sharp at <= 2000px long edge,
  *     upload to a sibling path `<name>_seedream.jpg`, and return that URL.
  *
@@ -61,6 +64,33 @@ async function objectExistsAndSize(gcsPath: string): Promise<number | null> {
   }
 }
 
+/**
+ * Detect whether a GCS asset is in a Seedream-supported format.
+ * BytePlus accepts JPEG and PNG only — AVIF/WebP/HEIC/TIFF/etc. all 400 with
+ * UnsupportedImageFormat. We can't trust GCS Content-Type metadata (sometimes
+ * stale or wrong, e.g. an AVIF file stored as image/jpeg) so we read magic
+ * bytes from the first 16 bytes of the file via a partial download.
+ */
+async function isSeedreamFormat(gcsPath: string): Promise<boolean> {
+  try {
+    const bucket = getStorage().bucket(BUCKET_NAME);
+    const [head] = await bucket.file(gcsPath).download({ start: 0, end: 31 });
+    if (head.length < 8) return false;
+    // JPEG: FF D8 FF
+    if (head[0] === 0xff && head[1] === 0xd8 && head[2] === 0xff) return true;
+    // PNG: 89 50 4E 47 0D 0A 1A 0A
+    if (head[0] === 0x89 && head[1] === 0x50 && head[2] === 0x4e && head[3] === 0x47) return true;
+    // Anything else (AVIF "ftypavif", WebP "RIFF...WEBP", HEIC "ftypheic",
+    // TIFF "II*\0" or "MM\0*", etc.) — treat as unsupported.
+    return false;
+  } catch (err) {
+    console.warn(`[SeedreamSafe] Magic-byte check failed for ${gcsPath}:`, err);
+    // On error, conservatively assume non-supported so we trigger conversion
+    // rather than letting a bad file reach BytePlus.
+    return false;
+  }
+}
+
 async function downsizeToJpeg(input: Buffer): Promise<Buffer> {
   // Progressive quality step-down until under TARGET_MAX_BYTES.
   let quality = JPEG_QUALITY_INITIAL;
@@ -111,11 +141,20 @@ export async function ensureSeedreamSafeUrl(url: string): Promise<string> {
     return url.split('?')[0];
   }
 
-  if (size <= SAFE_LIMIT_BYTES) {
+  // Two reasons to convert: oversize OR non-JPEG/PNG format.
+  const oversize = size > SAFE_LIMIT_BYTES;
+  let needsFormatConversion = false;
+  if (!oversize) {
+    // Only check format when size is fine — saves a partial download per call
+    // for the common case (JPEG/PNG under the limit).
+    const ok = await isSeedreamFormat(gcsPath);
+    needsFormatConversion = !ok;
+  }
+  if (!oversize && !needsFormatConversion) {
     return url.split('?')[0];
   }
 
-  // Oversized — check for cached sibling first.
+  // Need conversion. Check for cached sibling first.
   const siblingPath = seedreamSiblingPath(gcsPath);
   const siblingSize = await objectExistsAndSize(siblingPath);
   const siblingUrl = `https://storage.googleapis.com/${BUCKET_NAME}/${siblingPath}`;
@@ -126,7 +165,8 @@ export async function ensureSeedreamSafeUrl(url: string): Promise<string> {
   }
 
   // Need to create/recreate the sibling.
-  console.log(`[SeedreamSafe] Downsizing ${gcsPath} (${(size / 1024 / 1024).toFixed(1)} MiB) → ${siblingPath}`);
+  const reason = oversize ? `oversize ${(size / 1024 / 1024).toFixed(1)} MiB` : 'non-JPEG/PNG format';
+  console.log(`[SeedreamSafe] Converting ${gcsPath} (${reason}) → ${siblingPath}`);
   const bucket = getStorage().bucket(BUCKET_NAME);
   const [originalBuf] = await bucket.file(gcsPath).download();
   const resizedBuf = await downsizeToJpeg(originalBuf);

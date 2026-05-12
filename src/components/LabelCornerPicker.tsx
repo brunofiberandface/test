@@ -126,7 +126,7 @@ const DEFAULT_POCKET_CORNERS = {
 interface Props {
   imageUrl: string;
   shotId: string;
-  shotType: 'M02' | 'M04';
+  shotType: 'M02' | 'M04' | 'M05';
   onClose: () => void;
   onApplied: (result: { imageUrl: string; version: number }) => void;
 }

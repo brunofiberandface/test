@@ -824,6 +824,46 @@ def run_woven(args):
     }
 
 
+def run_passthrough(args):
+    """Composite a pre-rendered photo of a leather label (typically a JPEG of
+    the actual back-patch) onto a target image — no synthesis, no material
+    tile, no template, no emboss shader.
+
+    Used when the wardrobe item has uploaded a `leatherLabelImageUrl` and we
+    want to skip the three-tier deboss synthesis (which requires a
+    labelStyles + labelColorways data pair). The picker UI shows the JPEG,
+    the user drags the 4 corners, this function warps + blends it onto the
+    shot with the same edge feathering and luminance-matching as the woven
+    label path.
+
+    Internally identical to `run_woven` — the only differences are:
+      - input arg name: `label_image` (vs. `woven_label`)
+      - source format: JPEG (RGB, no alpha) is normalised to RGBA with full
+        opacity, so the soft edge mask comes purely from the quad geometry +
+        gaussian blur — exactly what you want when the leather JPEG fills
+        its own frame.
+
+    `args`:
+    {
+      "target_image":  "/tmp/target.png",
+      "label_image":   "/tmp/leather-label.jpg",
+      "quad": [{"x":..,"y":..}, ...],   # 4 corners TL,TR,BR,BL on target
+      "output":        "/tmp/out.png",
+      "debug_dir":     "/tmp/dbg"        # optional
+    }
+    """
+    # Translate `label_image` → the arg name run_woven expects, then dispatch.
+    # No re-implementation: the alpha-fallback in run_woven (when the loaded
+    # image has no alpha channel, alpha defaults to all 1s) already handles
+    # the JPEG-with-no-alpha case correctly — the rectangular crop becomes
+    # the label, edges feather, drop shadow renders, luminance matches.
+    woven_args = dict(args)
+    woven_args["woven_label"] = args["label_image"]
+    result = run_woven(woven_args)
+    result["mode"] = "passthrough"
+    return result
+
+
 def main():
     if len(sys.argv) < 2:
         print(json.dumps({"ok": False, "error": "usage: label_hybrid.py <args.json>"}))
@@ -836,6 +876,8 @@ def main():
             result = run_preview(args)
         elif mode == "woven":
             result = run_woven(args)
+        elif mode == "passthrough":
+            result = run_passthrough(args)
         else:
             result = run(args)
         print(json.dumps(result))

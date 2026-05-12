@@ -3,13 +3,18 @@
  * wardrobe item into the canonical {styleCode, colorwayCode} pair used by the
  * three-tier label schema (ADR-001 Option B).
  *
- * G-Star convention (confirmed by Bruno): `D{styleCode}-D{colorwayCode}-H{sizeCode}`
- * Example: `D22889-D933-H087` → styleCode=D22889, colorwayCode=D933, size=H087
+ * G-Star convention (multiple seen):
+ *   3-part: `D{styleCode}-D{colorwayCode}-H{sizeCode}`
+ *           e.g. `D22889-D933-H087` → style=D22889, colorway=D933, size=H087
+ *   4-part: `D{styleCode}-{colorway}-{detail} {sizeCode}` (April 28 shoot onward)
+ *           e.g. `D02153-6553-89 52` → style=D02153, colorway=6553, detail=89, size=52
  *
  * We tolerate:
  *   - Missing segments (colorway/size optional, styleCode required)
  *   - Lower/upper case
- *   - Extra whitespace
+ *   - Extra whitespace, mixed separators ('-', '_', ' ')
+ *   - Optional 4th segment used as size when present (3-segment numbers keep
+ *     existing semantics — segment 3 is the size)
  *
  * We DO NOT auto-derive anything if the format doesn't match — callers get
  * null back and should fall back to the manual label picker.
@@ -22,7 +27,8 @@ export interface ParsedDesignNumber {
   sizeCode: string | null;
 }
 
-const DESIGN_NUMBER_RE = /^\s*([A-Za-z0-9]+?)(?:[-_ ]+([A-Za-z0-9]+))?(?:[-_ ]+([A-Za-z0-9]+))?\s*$/;
+// Up to 4 alphanumeric segments separated by '-', '_', or whitespace.
+const DESIGN_NUMBER_RE = /^\s*([A-Za-z0-9]+?)(?:[-_ ]+([A-Za-z0-9]+))?(?:[-_ ]+([A-Za-z0-9]+))?(?:[-_ ]+([A-Za-z0-9]+))?\s*$/;
 
 export function parseDesignNumber(
   raw: string | undefined | null,
@@ -30,13 +36,16 @@ export function parseDesignNumber(
   if (!raw || typeof raw !== 'string') return null;
   const m = DESIGN_NUMBER_RE.exec(raw);
   if (!m) return null;
-  const [, style, colorway, size] = m;
+  const [, style, colorway, third, fourth] = m;
   if (!style) return null;
+  // 4-part numbers: third segment is a "detail" code (sub-style or wash code),
+  // fourth segment is the size. 3-part numbers: third segment IS the size.
+  const sizeCode = fourth || third || null;
   return {
     raw: raw.trim(),
     styleCode: style.toUpperCase(),
     colorwayCode: colorway ? colorway.toUpperCase() : null,
-    sizeCode: size ? size.toUpperCase() : null,
+    sizeCode: sizeCode ? sizeCode.toUpperCase() : null,
   };
 }
 

@@ -55,9 +55,10 @@ export default function ModelDetailPage() {
   const [zoomMode, setZoomMode] = useState<'full' | 'head' | 'torso'>('full');
   const imgContainerRef = useRef<HTMLDivElement>(null);
 
-  // Replace reference image
-  const [uploading, setUploading] = useState(false);
-  const fileInputRef = useRef<HTMLInputElement>(null);
+  // Replace-reference-image upload path removed 2026-05-10. Generation +
+  // Regenerate (overlay button on front image) is now the canonical flow.
+  // To restore: re-add `uploading` state + `fileInputRef`, the `handleReplacePhoto`
+  // handler below, and the JSX block that was at the bottom of the front column.
 
   // Delete state
   const [deleting, setDeleting] = useState(false);
@@ -73,6 +74,8 @@ export default function ModelDetailPage() {
 
   // Back view generation state
   const [generatingBack, setGeneratingBack] = useState(false);
+  // Front view regeneration state
+  const [regeneratingFront, setRegeneratingFront] = useState(false);
 
   // Generate back view
   const handleGenerateBack = async () => {
@@ -95,6 +98,38 @@ export default function ModelDetailPage() {
       setError('Back view generation failed');
     } finally {
       setGeneratingBack(false);
+    }
+  };
+
+  // Regenerate front reference — uses /api/models/generate-front, which
+  // takes the existing front (or original upload) as identity anchor and
+  // regenerates with the v2 styling (sports bra/bare torso + compression
+  // shorts + infinity cove). Use case: a freshly-created model whose card
+  // came out wrong (e.g. wrong styling, identity drift, distracting
+  // background) — click to redo without deleting the model. The original
+  // upload is preserved on the doc as `originalReferenceImageUrl`.
+  const handleRegenerateFront = async () => {
+    if (!model) return;
+    setRegeneratingFront(true);
+    setError('');
+    try {
+      const res = await fetch('/api/models/generate-front', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ modelId: model.modelId || model.id }),
+      });
+      const data = await res.json();
+      if (data.success && data.frontUrl) {
+        // Cache-bust the URL so the browser reloads the new image
+        const cacheBusted = `${data.frontUrl}${data.frontUrl.includes('?') ? '&' : '?'}t=${Date.now()}`;
+        setModel({ ...model, referenceImageUrl: cacheBusted });
+      } else {
+        setError(data.error || data.details || 'Front regeneration failed');
+      }
+    } catch {
+      setError('Front regeneration failed');
+    } finally {
+      setRegeneratingFront(false);
     }
   };
 
@@ -121,44 +156,9 @@ export default function ModelDetailPage() {
     if (modelId) fetchModel();
   }, [modelId]);
 
-  // Replace reference photo
-  const handleReplacePhoto = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file || !model) return;
-
-    if (!file.type.startsWith('image/')) return;
-    if (file.size > 20 * 1024 * 1024) {
-      setError('Image too large. Max 20MB.');
-      return;
-    }
-
-    setUploading(true);
-    setError('');
-
-    const reader = new FileReader();
-    reader.onload = async (ev) => {
-      const dataUrl = ev.target?.result as string;
-      try {
-        const res = await fetch(`/api/models/${model.modelId || model.id}`, {
-          method: 'PATCH',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ referenceImageUrl: dataUrl }),
-        });
-        const data = await res.json();
-        if (data.success) {
-          // Update local state with new URL (GCS URL returned from server)
-          setModel({ ...model, referenceImageUrl: data.referenceImageUrl || dataUrl });
-        } else {
-          setError('Upload failed');
-        }
-      } catch {
-        setError('Upload error');
-      } finally {
-        setUploading(false);
-      }
-    };
-    reader.readAsDataURL(file);
-  };
+  // handleReplacePhoto removed 2026-05-10 — see comment near uploading-state
+  // declaration. /api/models/{id} PATCH still accepts a base64 dataUrl in
+  // the referenceImageUrl field; the only thing removed was the UI surface.
 
   // Delete model
   const handleDelete = async () => {
@@ -295,9 +295,16 @@ export default function ModelDetailPage() {
                     No reference photo
                   </div>
                 )}
-                <div className="absolute bottom-2 right-2 bg-black/60 text-white text-[10px] px-2 py-1">
-                  {zoomMode === 'full' ? 'Click to zoom' : zoomMode === 'head' ? 'Head' : 'Torso'}
-                </div>
+                {(model.referenceImageUrl || model.cardImageUrl) && isAdmin && (
+                  <button
+                    onClick={(e) => { e.stopPropagation(); handleRegenerateFront(); }}
+                    disabled={regeneratingFront}
+                    className="absolute bottom-2 left-2 bg-black/80 text-white text-xs font-medium px-3 py-1.5 hover:bg-black transition-colors disabled:opacity-50 shadow-lg"
+                    title="Regenerate the front reference using the existing card as identity anchor + the v2 base layer (sports bra / bare torso + compression shorts + infinity cove)."
+                  >
+                    {regeneratingFront ? 'Regenerating…' : 'Regenerate'}
+                  </button>
+                )}
               </div>
             </div>
 
@@ -338,25 +345,9 @@ export default function ModelDetailPage() {
             </div>
           </div>
 
-          {/* Replace Reference Photo (admin) */}
-          {isAdmin && (
-            <div className="mt-3">
-              <input
-                ref={fileInputRef}
-                type="file"
-                accept="image/*"
-                onChange={handleReplacePhoto}
-                className="hidden"
-              />
-              <button
-                onClick={() => fileInputRef.current?.click()}
-                disabled={uploading}
-                className="w-full border border-neutral-300 px-4 py-2 text-xs font-medium text-neutral-600 hover:bg-neutral-50 transition-colors disabled:opacity-30"
-              >
-                {uploading ? 'Uploading...' : 'Replace Front Reference Photo'}
-              </button>
-            </div>
-          )}
+          {/* Replace-by-upload button removed 2026-05-10 — Regenerate (front
+              image overlay) is the canonical flow. /api/models/{id} PATCH
+              still supports a base64 referenceImageUrl if needed via curl. */}
         </div>
 
         {/* Right — model info + actions */}

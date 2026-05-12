@@ -3,7 +3,10 @@ import { storeOTP, verifyOTP, getUser, createUser, userHasPassword, setUserPassw
 import { sendOTPEmail } from '@/lib/email';
 import crypto from 'crypto';
 
-const ALLOWED_DOMAINS = ['gstar-raw.com', 'g-star.com', 'fiberandface.com'];
+// Email/OTP path is admin-only. Other domains (gstar-raw.com, g-star.com)
+// must sign in via Microsoft. This list is kept narrow on purpose — if you
+// add a domain here it bypasses the Entra group check.
+const ALLOWED_DOMAINS = ['fiberandface.com'];
 
 // POST /api/auth/otp — check email, send OTP, verify OTP, set password
 export async function POST(req: NextRequest) {

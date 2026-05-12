@@ -19,6 +19,18 @@ export const promptVaultCol = db.collection('promptVault');
 export const labelTemplatesCol = db.collection('labelTemplates');
 export const labelStylesCol = db.collection('labelStyles');
 export const labelColorwaysCol = db.collection('labelColorways');
+// Photo-based label asset library — separate from the three-tier
+// labelTemplates/labelStyles/labelColorways pipeline. Contains canonical
+// alpha-masked PNG renders of leather waistband patches and woven pocket
+// patches that wardrobe items reference via {leather|pocket}LabelTemplateId.
+export const labelAssetsCol = db.collection('labelAssets');
+
+// QA: shoe × model proportion matrix. One doc per (shoeId, modelId) pair, doc
+// id = `${shoeId}_${modelId}`. Used to pre-render every model wearing every shoe
+// (basics + shoes only, no jeans) so reviewers can spot bad scale/fit combos
+// (e.g. chunky platform loafer reads as oversized on tall slim models) and
+// flag them as `blocked` so the new-job wizard warns when picking that combo.
+export const qaShoeMatrixCol = db.collection('qaShoeMatrix');
 
 // ── User operations ──
 export async function getUser(email: string) {
@@ -168,6 +180,7 @@ export async function createJob(data: {
   promptRevisions: Record<string, number>;
   stylingNotes?: string;
   provider?: 'gemini' | 'seedream';
+  m06PoseId?: string;  // optional — id from src/lib/m06-poses.ts
 }) {
   const ref = jobsCol.doc();
   await ref.set({
@@ -380,8 +393,12 @@ export async function updateWardrobeItem(wardrobeId: string, data: Record<string
 export async function listWardrobeItems(category?: string) {
   let query: FirebaseFirestore.Query = wardrobeCol;
   if (category) query = query.where('category', '==', category);
+  // NOTE: NOT using `query.orderBy('createdAt', 'asc')` here — combining
+  // where('category', '==', X) + orderBy('createdAt') would require a
+  // Firestore composite index. Instead we sort client-side below. Wardrobe
+  // is small enough (~66 items) that JS sort is trivial.
   const snap = await query.get();
-  return snap.docs.map(d => {
+  const items = snap.docs.map(d => {
     const data = d.data();
     return {
       id: d.id,
@@ -390,6 +407,18 @@ export async function listWardrobeItems(category?: string) {
       updatedAt: data.updatedAt?.toDate?.() ? data.updatedAt.toDate().toISOString() : data.updatedAt,
     };
   });
+  // Sort by createdAt ascending — oldest first, newest last. Items missing
+  // createdAt sort to the end (won't happen in practice; verified all docs
+  // have it, and new uploads always write it).
+  items.sort((a, b) => {
+    const aT = (a as { createdAt?: string }).createdAt || '';
+    const bT = (b as { createdAt?: string }).createdAt || '';
+    if (!aT && !bT) return 0;
+    if (!aT) return 1;
+    if (!bT) return -1;
+    return aT < bT ? -1 : aT > bT ? 1 : 0;
+  });
+  return items;
 }
 
 export async function getWardrobeItem(wardrobeId: string) {
@@ -609,7 +638,11 @@ export async function setActivePromptRevision(id: string): Promise<void> {
 // ── Generation Queue v2 ──
 
 const QUEUE_DOC = db.collection('system').doc('generationQueue');
-const MAX_SLOTS = 2;
+// 2026-05-11: bumped 2 → 6 to better utilize the 9-Gemini / 10-BytePlus key pool.
+// Each shot uses 1 of each key. With MAX_SLOTS=6, up to ~6 concurrent shots can
+// run (still capped by key pool at 9). Bruno's complaint: 20-shot rerun "takes
+// forever" with MAX_SLOTS=2. 6 should ~3x throughput.
+const MAX_SLOTS = 6;
 
 export interface QueueEntry {
   jobId: string;
@@ -1053,6 +1086,76 @@ export async function resolveLabelRenderConfig(
     anchorPhotoWidth: style.anchorPhoto.width,
     anchorPhotoHeight: style.anchorPhoto.height,
   };
+}
+
+// ── Label asset library ──
+// Photo-based label templates (alpha-masked PNGs in GCS). Wardrobe items
+// reference these via leatherLabelTemplateId / pocketLabelTemplateId.
+// One doc per template: { templateId, name, type: 'leather'|'pocket',
+// imageUrl, sourceTiffPath?, updatedAt }.
+
+export interface LabelAsset {
+  templateId: string;
+  name: string;
+  type: 'leather' | 'pocket';
+  imageUrl: string;
+  sourceTiffPath?: string;
+  updatedAt?: Date;
+}
+
+export async function getLabelAsset(
+  templateId: string | undefined | null,
+): Promise<LabelAsset | null> {
+  if (!templateId) return null;
+  const doc = await labelAssetsCol.doc(templateId).get();
+  if (!doc.exists) return null;
+  const data = doc.data() as LabelAsset;
+  if (!data?.imageUrl) return null;
+  return data;
+}
+
+/**
+ * Resolve the leather + pocket label image URLs for a focus wardrobe item.
+ *
+ * Lookup order for leather:
+ *   1. leatherLabelTemplateId → labelAssets/{id}.imageUrl  (canonical, alpha-masked PNG)
+ *   2. leatherLabelImageUrl                                (legacy direct URL — typically a JPEG)
+ * Pocket has no legacy field, so it's purely templateId.
+ *
+ * Returns { leatherUrl: null, pocketUrl: null } when nothing is available.
+ * This is the single source of truth used by Seedream gen, the manual warp
+ * preview, and the apply-label endpoint, so there's no drift between paths.
+ */
+export interface ResolvedLabelUrls {
+  leatherUrl: string | null;
+  pocketUrl: string | null;
+}
+
+export async function resolveLabelAssetUrls(focusItem: {
+  leatherLabelTemplateId?: string | null;
+  pocketLabelTemplateId?: string | null;
+  leatherLabelImageUrl?: string | null;
+}): Promise<ResolvedLabelUrls> {
+  let leatherUrl: string | null = null;
+  let pocketUrl: string | null = null;
+
+  if (focusItem.leatherLabelTemplateId) {
+    const asset = await getLabelAsset(focusItem.leatherLabelTemplateId);
+    if (asset?.imageUrl) leatherUrl = asset.imageUrl;
+  }
+  // Fall back to the legacy direct-URL field if templateId is unset OR the
+  // doc lookup miss-fired (asset deleted, typo, etc). Keeps older wardrobe
+  // items working without forcing a migration.
+  if (!leatherUrl && focusItem.leatherLabelImageUrl) {
+    leatherUrl = focusItem.leatherLabelImageUrl;
+  }
+
+  if (focusItem.pocketLabelTemplateId) {
+    const asset = await getLabelAsset(focusItem.pocketLabelTemplateId);
+    if (asset?.imageUrl) pocketUrl = asset.imageUrl;
+  }
+
+  return { leatherUrl, pocketUrl };
 }
 
 export default db;

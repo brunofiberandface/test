@@ -20,13 +20,22 @@ function topForGender(gender: ModelGender): string {
     : 'Simple plain BLACK SPORTS BRA — minimal design, no logos, no text, thin straps.';
 }
 
-/** Shared studio environment block — identical for front and back */
+/** Shared studio environment block — identical for front and back.
+ *
+ * 2026-05-10: switched from warm light grey infinity cove (#D5D3CC) to PURE WHITE
+ * (#FFFFFF). Aligns with LEARNING #75: model cards on pure white backdrop fixed
+ * the warm-cast leak from beige cards into downstream M03/M04 renders ("F1 Culotte
+ * job, M04 re-run → v3. Floor now reads as Seedance's clean light grey (~RGB
+ * 200-210), no warm cast"). The May 5 batch re-mattéd 20 active models onto
+ * white; new generations / regenerations now match that target directly without
+ * needing a separate matte step. Bruno: "models should also be on a white
+ * background as F1." */
 const STUDIO_ENVIRONMENT = `
 STUDIO ENVIRONMENT (CRITICAL — must be identical across all shots):
-- Background: seamless INFINITY COVE in warm light grey (hex #D5D3CC). The curved cove sweeps from the back wall smoothly into the floor with ZERO visible seam, crease, horizon line, or edge between wall and floor. The entire background is one continuous smooth surface.
-- Floor: same warm light grey (#D5D3CC) as the backdrop, completely smooth and featureless. No tiles, no texture lines, no reflections, no markings.
+- Background: SOLID PURE WHITE (#FFFFFF). The entire background is a flat, featureless, uniform pure white sweep. NO walls, NO horizon line, NO seam between wall and floor, NO gradient, NO infinity cove, NO grey, NO beige. Think product photography cutout on white.
+- Floor: same pure white (#FFFFFF) as the backdrop, completely smooth and featureless. No tiles, no texture lines, no reflections, no markings.
 - Lighting: bright, even, diffused studio lighting from large softboxes on both sides + overhead. Flat and uniform — no directional shadows, no warm color cast, no golden tones, no rim light. Neutral white-balanced light.
-- Shadow: ONE soft drop shadow directly beneath the feet, no secondary shadows.
+- Shadow: ONE very subtle soft drop shadow directly beneath the feet (so the model is grounded, not floating). No secondary shadows.
 - No props, no furniture, no set pieces, no background objects.`;
 
 /** Shared proportion and camera block */
@@ -68,6 +77,41 @@ FRAMING: Full body head-to-feet centered in frame.
 The ONLY purpose of this image is to extract the person's identity cleanly. Photorealistic quality.`;
 }
 
+/**
+ * From-description prompt — used by /api/models/generate-card to create the
+ * FIRST reference image for a brand-new model from text alone (no identity
+ * anchor image yet). Same v2 styling as MODEL_REF_PROMPT_FRONT (sports bra /
+ * bare torso + compression shorts + infinity cove + barefoot) so the
+ * generated card matches every other model in the system out of the box.
+ *
+ * Replaced the old v1 styling (white tee/tank + black compression boxer
+ * briefs on white backdrop) on 2026-05-10. Bruno test on F999 surfaced that
+ * the v1 styling looked nothing like the existing roster — all 20+ models
+ * had been regenerated to v2 via `regenerate-refs` long ago.
+ */
+export function MODEL_REF_PROMPT_FRONT_FROM_DESCRIPTION(gender: ModelGender, description: string): string {
+  const genderWord = gender === 'female' ? 'woman' : 'man';
+  const top = topForGender(gender);
+  const cleanDescription = description.replace(/^["']/, '').trim();
+
+  return `Photorealistic studio identity reference photograph of a ${genderWord}, FULL BODY, FRONT VIEW, 3:4 portrait.
+
+Subject: ${cleanDescription}
+
+The person faces the camera directly. Render the model with the appearance described above — ethnicity, age, build, hair (color, length, texture, style), skin tone with undertone, eye color, facial features, expression, and attitude exactly as written. Photorealistic, NOT illustrated.
+
+CLOTHING:
+- ${top}
+- Black compression shorts (mid-thigh length, fitted).
+- BAREFOOT — bare feet visible on studio floor.
+
+POSE: Standing in bilaterally symmetric stance — both legs straight down vertically from hip to floor, both feet planted flat on the floor parallel to each other (pointing forward) with approximately ONE FOOT-WIDTH of clear space between the inner edges of the two feet (~10cm gap, narrow — feet near each other but not touching, NOT shoulder-width, NOT wider than hip), weight 50/50 across both feet, hips centered and level (NO hip tilt, NO contrapposto, NO weight shift onto one leg). Arms relaxed naturally at the sides. Expression neutral and composed, mouth closed, looking directly at camera.
+${STUDIO_ENVIRONMENT}
+${PROPORTIONS}
+
+This is a MODEL IDENTITY REFERENCE photo used to anchor all future generations. Photorealistic studio quality. No branding, text, logos, jewelry, watches, or accessories.`;
+}
+
 /** Front view prompt */
 export function MODEL_REF_PROMPT_FRONT(gender: ModelGender): string {
   const genderWord = gender === 'female' ? 'woman' : 'man';
@@ -82,7 +126,7 @@ CLOTHING:
 - Black compression shorts (mid-thigh length, fitted).
 - BAREFOOT — bare feet visible on studio floor.
 
-POSE: Standing with subtle contrapposto — weight gently on one leg, hip-width stance, both feet parallel to the camera, both heels flat on the floor. Arms relaxed naturally at the sides. Expression neutral and composed, mouth closed, looking directly at camera.
+POSE: Standing in bilaterally symmetric stance — both legs straight down vertically from hip to floor, both feet planted flat on the floor parallel to each other (pointing forward) with approximately ONE FOOT-WIDTH of clear space between the inner edges of the two feet (~10cm gap, narrow — feet near each other but not touching, NOT shoulder-width, NOT wider than hip), weight 50/50 across both feet, hips centered and level (NO hip tilt, NO contrapposto, NO weight shift onto one leg). Arms relaxed naturally at the sides. Expression neutral and composed, mouth closed, looking directly at camera.
 ${STUDIO_ENVIRONMENT}
 ${PROPORTIONS}
 
@@ -103,7 +147,7 @@ CLOTHING:
 - Black compression shorts (mid-thigh length, fitted).
 - BAREFOOT — bare feet visible on studio floor.
 
-POSE: Standing naturally with slight weight shift, arms relaxed at sides. Back facing camera with very slight 3/4 turn (5-10 degrees) so silhouette is clear. Both heels flat on the floor.
+POSE: Standing in bilaterally symmetric stance — both legs straight down vertically from hip to floor, both feet planted flat on the floor parallel to each other (pointing forward) with approximately ONE FOOT-WIDTH of clear space between the inner edges of the two feet (~10cm gap, narrow), weight 50/50 across both feet, hips centered and level (NO hip tilt, NO weight shift onto one leg). Back facing camera with very slight 3/4 turn (5-10 degrees) so silhouette is clear. Arms relaxed naturally at the sides.
 ${STUDIO_ENVIRONMENT}
 ${PROPORTIONS}
 

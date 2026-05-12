@@ -43,6 +43,20 @@ export async function PATCH(
     if (openShoes !== undefined) updates.openShoes = openShoes;
     if (hasHeels !== undefined) updates.hasHeels = hasHeels;
     if (fitModelUrls !== undefined) updates.fitModelUrls = fitModelUrls;
+    // Label-template selection. Empty string → delete the field (revert to "needs setup").
+    // Any other string → set to that labelAssets templateId.
+    if (body.leatherLabelTemplateId !== undefined) {
+      const { FieldValue } = await import('@google-cloud/firestore');
+      updates.leatherLabelTemplateId = body.leatherLabelTemplateId === ''
+        ? FieldValue.delete()
+        : body.leatherLabelTemplateId;
+    }
+    if (body.pocketLabelTemplateId !== undefined) {
+      const { FieldValue } = await import('@google-cloud/firestore');
+      updates.pocketLabelTemplateId = body.pocketLabelTemplateId === ''
+        ? FieldValue.delete()
+        : body.pocketLabelTemplateId;
+    }
 
     // v2 fit-model slot map — written by the angle-setup page.
     // Accepts a partial map; merged into the existing doc. Setting a slot to '' clears it.

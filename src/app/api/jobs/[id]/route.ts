@@ -83,6 +83,27 @@ export async function GET(
       job.wardrobeItemNames = wardrobeItemNames;
     }
 
+    // Resolve focus item's front 0° fit-model image — surfaced on the results
+    // page as the "Original" reference next to the AI deliverables. Bruno
+    // 2026-05-07: visual A/B vs the source garment was missing. Falls back to
+    // flatFrontUrl when fitModels.front is missing (legacy items).
+    // Also surface focusSlot ('top'/'bottom'/'shoe') so the UI can gate
+    // top-focus-only features (e.g. M05 camera variant menu).
+    try {
+      const w = (job.wardrobe || {}) as any;
+      const focusEntryWithKey = (['shoe', 'top', 'bottom'] as const)
+        .map(k => ({ slot: k, v: w[k] }))
+        .find(x => x.v?.isFocus);
+      if (focusEntryWithKey?.v?.itemId) {
+        job.focusSlot = focusEntryWithKey.slot;
+        const item = await getWardrobeItem(focusEntryWithKey.v.itemId) as any;
+        if (item) {
+          const front = item.fitModels?.front || item.flatFrontUrl;
+          if (front) job.focusFitModelFrontUrl = front;
+        }
+      }
+    } catch { /* non-blocking */ }
+
     return NextResponse.json({ job, shots });
   } catch (error) {
     console.error('Error fetching job:', error);

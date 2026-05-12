@@ -1,10 +1,17 @@
 'use client';
 
-import { useState, useRef } from 'react';
+import { useState } from 'react';
 import { useSession } from 'next-auth/react';
 import { useRouter } from 'next/navigation';
 import Shell from '@/components/Shell';
 
+// RESTORED 2026-05-10 from commit d2cb22c^ (deleted in d2cb22c "v2 Pro pipeline"
+// rewrite, April 4 2026). Every existing model in the system was originally
+// created via this flow. Per Bruno: "i want the same as how they were created."
+// Two minor adaptations from the original v1: (1) the POST body field is
+// `referenceImageUrl` (current /api/models POST handler signature) instead of
+// the legacy `cardImageUrl`; (2) post-save redirects to `/models/${modelId}`
+// instead of `/models`, so the operator lands on the new model's detail page.
 export default function CreateModelPage() {
   const { data: session } = useSession();
   const router = useRouter();
@@ -18,42 +25,38 @@ export default function CreateModelPage() {
   const [name, setName] = useState('');
   const [gender, setGender] = useState<'male' | 'female'>('female');
   const [description, setDescription] = useState('');
+  const [generating, setGenerating] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [generatedImage, setGeneratedImage] = useState<string | null>(null);
   const [error, setError] = useState('');
 
-  // Reference image upload
-  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
-  const [imageDataUrl, setImageDataUrl] = useState<string | null>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
-
-  const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-
-    // Validate file type
-    if (!file.type.startsWith('image/')) {
-      setError('Please select an image file (PNG, JPG, etc.)');
-      return;
-    }
-
-    // Validate file size (max 20MB for 4K images)
-    if (file.size > 20 * 1024 * 1024) {
-      setError('Image too large. Max 20MB.');
-      return;
-    }
-
+  const handleGenerate = async () => {
+    if (!description) return;
+    setGenerating(true);
     setError('');
-    const reader = new FileReader();
-    reader.onload = (ev) => {
-      const dataUrl = ev.target?.result as string;
-      setPreviewUrl(dataUrl);
-      setImageDataUrl(dataUrl);
-    };
-    reader.readAsDataURL(file);
+    setGeneratedImage(null);
+
+    try {
+      const res = await fetch('/api/models/generate-card', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ description, gender }),
+      });
+      const data = await res.json();
+
+      if (data.success && data.image) {
+        setGeneratedImage(data.image);
+      } else {
+        setError(data.error || 'Generation failed');
+      }
+    } catch {
+      setError('Connection error');
+    }
+    setGenerating(false);
   };
 
   const handleSave = async () => {
-    if (!modelId || !name || !imageDataUrl) return;
+    if (!modelId || !name || !description || !generatedImage) return;
     setSaving(true);
     setError('');
 
@@ -66,14 +69,14 @@ export default function CreateModelPage() {
           name,
           description,
           gender,
-          referenceImageUrl: imageDataUrl,
+          referenceImageUrl: `data:image/png;base64,${generatedImage}`,
           createdBy: user.email,
         }),
       });
       const data = await res.json();
 
       if (data.success) {
-        router.push('/models');
+        router.push(`/models/${modelId}`);
       } else {
         setError(data.error || 'Failed to save');
       }
@@ -88,10 +91,26 @@ export default function CreateModelPage() {
       <div className="max-w-2xl">
         <h1 className="text-2xl font-bold text-neutral-900 mb-2">Create New Model</h1>
         <p className="text-sm text-neutral-500 mb-8">
-          Upload a high-resolution 4K reference photo of the model. This photo will be used as the identity reference for all generated shots.
+          Define a new AI model identity. The model card will always show the model in a neutral athletic base layer — this is the mandatory foundation for all AI models.
         </p>
 
         <div className="space-y-6">
+          {/* Base layer notice */}
+          <div className="bg-neutral-50 border border-neutral-200 p-4">
+            <p className="text-xs font-medium text-neutral-500 uppercase tracking-wider mb-2">
+              Base Layer — Automatic
+            </p>
+            <p className="text-sm text-neutral-700">
+              {gender === 'male'
+                ? 'Bare torso + black compression shorts (mid-thigh, fitted) — barefoot on the seamless infinity cove backdrop'
+                : 'Black sports bra (plain, no logos) + black compression shorts (mid-thigh, fitted) — barefoot on the seamless infinity cove backdrop'
+              }
+            </p>
+            <p className="text-xs text-neutral-400 mt-1">
+              Every model is generated in this neutral base layer to match the existing roster. This cannot be changed.
+            </p>
+          </div>
+
           {/* Model ID & Name */}
           <div className="grid grid-cols-2 gap-4">
             <div>
@@ -145,52 +164,41 @@ export default function CreateModelPage() {
           {/* Description */}
           <div>
             <label className="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-1.5">
-              Description (optional)
+              Full Description
             </label>
+            <p className="text-xs text-neutral-400 mb-2">
+              Describe the model in detail: ethnicity, age, height, build, hair, eyes, expression, attitude.
+              The AI will generate them in the standard base layer automatically.
+            </p>
             <textarea
               value={description}
               onChange={e => setDescription(e.target.value)}
-              rows={4}
-              placeholder="Notes about the model — ethnicity, build, distinguishing features, etc."
+              rows={10}
+              placeholder={`Example:\nEuropean woman (Mediterranean type), mid 20s, 175cm tall with athletic build.\nDark brown wavy hair past shoulders, olive skin with warm undertone.\nDark brown eyes, strong eyebrows, full lips.\nExpression: confident warmth, direct gaze, subtle smile.\nBODY SHAPE: Natural feminine curves, athletic legs.`}
               className="w-full border border-neutral-300 px-4 py-3 text-sm focus:outline-none focus:border-neutral-900 resize-none"
             />
           </div>
 
-          {/* Reference Image Upload */}
+          {/* Generate */}
           <div className="border-t border-neutral-200 pt-6">
             <p className="text-xs font-medium text-neutral-500 uppercase tracking-wider mb-3">
-              Reference Photo — 4K recommended
+              Model Card — in Neutral Base Layer
             </p>
-            <p className="text-xs text-neutral-400 mb-4">
-              Upload a high-resolution full-body photo of the model. This will be used as the identity reference
-              for all AI-generated shots. 4K (3000px+ height) recommended for best results.
-            </p>
+            <button
+              onClick={handleGenerate}
+              disabled={!description || generating}
+              className="bg-neutral-900 text-white px-6 py-2.5 text-sm font-medium hover:bg-neutral-800 transition-colors disabled:opacity-30"
+            >
+              {generating ? 'Generating (30-60s)...' : 'Generate Model Card'}
+            </button>
 
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept="image/*"
-              onChange={handleFileSelect}
-              className="hidden"
-            />
-
-            {!previewUrl ? (
-              <button
-                onClick={() => fileInputRef.current?.click()}
-                className="w-56 aspect-[3/4] border-2 border-dashed border-neutral-300 bg-neutral-50 hover:border-neutral-400 hover:bg-neutral-100 transition-colors flex flex-col items-center justify-center cursor-pointer"
-              >
-                <svg className="w-8 h-8 text-neutral-300 mb-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M12 4v16m8-8H4" />
-                </svg>
-                <span className="text-sm text-neutral-400">Upload Photo</span>
-                <span className="text-[10px] text-neutral-300 mt-1">PNG, JPG — max 20MB</span>
-              </button>
-            ) : (
-              <div className="flex gap-6 items-start">
-                <div className="w-56 aspect-[3/4] bg-neutral-100 border border-neutral-200 overflow-hidden relative">
+            {/* Preview */}
+            {generatedImage && (
+              <div className="mt-6 flex gap-6 items-start">
+                <div className="w-56 aspect-[3/4] bg-neutral-100 border border-neutral-200 overflow-hidden">
                   <img
-                    src={previewUrl}
-                    alt="Reference photo preview"
+                    src={`data:image/png;base64,${generatedImage}`}
+                    alt="Generated model card"
                     className="w-full h-full object-cover object-top"
                   />
                 </div>
@@ -200,20 +208,18 @@ export default function CreateModelPage() {
                     disabled={!modelId || !name || saving}
                     className="block bg-neutral-900 text-white px-5 py-2.5 text-sm font-medium hover:bg-neutral-800 disabled:opacity-30"
                   >
-                    {saving ? 'Saving...' : 'Save Model'}
+                    {saving ? 'Saving...' : 'Approve & Save'}
                   </button>
                   <button
-                    onClick={() => fileInputRef.current?.click()}
+                    onClick={handleGenerate}
+                    disabled={generating}
                     className="block border border-neutral-300 px-5 py-2.5 text-sm text-neutral-600 hover:bg-neutral-50"
                   >
-                    Replace Photo
+                    Regenerate
                   </button>
-                  <button
-                    onClick={() => { setPreviewUrl(null); setImageDataUrl(null); }}
-                    className="block text-xs text-neutral-400 hover:text-red-500 transition-colors"
-                  >
-                    Remove
-                  </button>
+                  <p className="text-xs text-neutral-400 max-w-[200px]">
+                    Model will always appear in the neutral base layer when used in product shots.
+                  </p>
                 </div>
               </div>
             )}

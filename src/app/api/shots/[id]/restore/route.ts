@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { shotsCol } from '@/lib/firestore';
+import { FieldValue } from '@google-cloud/firestore';
 
 // POST /api/shots/[id]/restore
 // Body: { version: number }  — the previous version number to restore
@@ -48,11 +49,22 @@ export async function POST(
     const allVersions = [shot.version, ...updatedHistory.map((v) => v.version)];
     const newVersion = Math.max(...allVersions) + 1;
 
+    // Restore the imageUrl AND clear the matte-pipeline siblings (greyMasterUrl,
+    // whiteMasterUrl, pdpUrl, plpUrl) — those are derived from the CURRENT
+    // imageUrl, not the restored one. Without clearing, `pickMaster()` in the
+    // results page reads greyMasterUrl which still points at the wrong version
+    // and the restore looks like it did nothing. After clear, the page falls
+    // back to imageUrl gracefully. The user can rerun the matte+shadow pipeline
+    // to regenerate masters for the restored version if needed.
     await shotsCol.doc(id).update({
       imageUrl: target.imageUrl,
       version: newVersion,
       previousVersions: updatedHistory,
       status: 'done',
+      greyMasterUrl: FieldValue.delete(),
+      whiteMasterUrl: FieldValue.delete(),
+      pdpUrl: FieldValue.delete(),
+      plpUrl: FieldValue.delete(),
       updatedAt: new Date(),
     });
 

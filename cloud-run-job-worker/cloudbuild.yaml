@@ -1,0 +1,30 @@
+# Cloud Build config for gstar-worker-job — builds the image with the
+# gstar-studio repo root as build context (so the Dockerfile can COPY src/
+# etc) but points Docker at cloud-run-job-worker/Dockerfile.
+#
+# Usage:
+#   gcloud builds submit . \
+#     --config=cloud-run-job-worker/cloudbuild.yaml \
+#     --project=gstar-ai-studio
+#
+# Then deploy the built image as a Cloud Run Job:
+#   gcloud run jobs deploy gstar-worker-job \
+#     --image=gcr.io/gstar-ai-studio/gstar-worker-job:latest \
+#     --region=europe-west1 \
+#     --project=gstar-ai-studio \
+#     --cpu=2 --memory=2Gi \
+#     --task-timeout=3600 \
+#     --max-retries=1 \
+#     --parallelism=1 \
+#     --set-env-vars="INTERNAL_BASE_URL=https://gstar-ai-studio-674145888056.europe-west1.run.app,FIRESTORE_PROJECT=gstar-ai-studio"
+
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - --file=cloud-run-job-worker/Dockerfile
+      - --tag=gcr.io/$PROJECT_ID/gstar-worker-job:latest
+      - .
+
+images:
+  - gcr.io/$PROJECT_ID/gstar-worker-job:latest

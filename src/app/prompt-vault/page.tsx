@@ -1,6 +1,8 @@
 'use client';
 
 import { useState, useEffect, useRef } from 'react';
+import { useSession } from 'next-auth/react';
+import Shell from '@/components/Shell';
 
 interface PromptFile {
   id: string;
@@ -16,16 +18,19 @@ interface PromptFile {
   pipeline?: 'gemini' | 'seedream';
 }
 
-const SHOT_TYPES = ['M01', 'M02', 'M03', 'M04', 'M05'];
+const SHOT_TYPES = ['M01', 'M02', 'M03', 'M04', 'M05', 'M06'];
 const SHOT_LABELS: Record<string, string> = {
   M01: 'Cropped Front',
   M02: 'Cropped Back',
   M03: 'Full Body Front',
   M04: 'Full Body Back',
   M05: 'Detail (Pocket)',
+  M06: 'Free Pose',
 };
 
 export default function PromptVaultPage() {
+  const { data: session } = useSession();
+  const user = session?.user as any;
   const [prompts, setPrompts] = useState<PromptFile[]>([]);
   const [loading, setLoading] = useState(true);
   const [filterType, setFilterType] = useState<string>('all');
@@ -124,14 +129,17 @@ export default function PromptVaultPage() {
 
   if (loading) {
     return (
-      <div className="flex items-center justify-center py-20">
-        <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-neutral-900" />
-      </div>
+      <Shell user={user}>
+        <div className="flex items-center justify-center py-20">
+          <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-neutral-900" />
+        </div>
+      </Shell>
     );
   }
 
   return (
-    <div>
+    <Shell user={user}>
+    <div className="max-w-7xl mx-auto px-6 py-8">
       {/* Header */}
       <div className="flex items-center justify-between mb-6">
         <div>
@@ -405,5 +413,6 @@ export default function PromptVaultPage() {
         </div>
       )}
     </div>
+    </Shell>
   );
 }

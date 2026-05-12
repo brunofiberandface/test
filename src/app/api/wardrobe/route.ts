@@ -1,8 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { createWardrobeItem, listWardrobeItems, wardrobeCol } from '@/lib/firestore';
+import { createWardrobeItem, listWardrobeItems, wardrobeCol, labelStylesCol } from '@/lib/firestore';
 import { uploadWardrobeImage } from '@/lib/gcs';
 import { runSilhouetteForWardrobe } from '@/lib/pipeline/silhouette';
 import { runTopDescriptionForWardrobe } from '@/lib/pipeline/top-description';
+import { styleCodeOf } from '@/lib/design-number';
 
 /**
  * GET /api/wardrobe?category=shoes
@@ -12,7 +13,34 @@ export async function GET(req: NextRequest) {
   try {
     const category = req.nextUrl.searchParams.get('category') || undefined;
     const items = await listWardrobeItems(category);
-    return NextResponse.json({ items });
+
+    // Compute leather-label readiness per BOTTOM item. A garment is "label
+    // ready" if EITHER:
+    //   (a) it has leatherLabelTemplateId set (new labelAssets system), OR
+    //   (b) its styleCode (parsed from designNumber) has a labelStyles doc
+    //       (legacy three-tier system).
+    // Either path means the warp tool will work for that garment. We compute
+    // server-side so the wardrobe UI can show a "Label ✓ / Label needed"
+    // badge per card without N round-trips. Other categories (top, shoes)
+    // get labelReady: undefined since they don't carry leather labels.
+    const styleCodesWithLabelConfig = new Set<string>();
+    try {
+      const styleSnap = await labelStylesCol.get();
+      styleSnap.docs.forEach(d => styleCodesWithLabelConfig.add(d.id));
+    } catch (e) {
+      console.warn('[Wardrobe GET] labelStyles fetch failed (non-blocking):', e);
+    }
+
+    const itemsWithLabelStatus = items.map(item => {
+      const wi = item as { category?: string; designNumber?: string; leatherLabelTemplateId?: string };
+      if (wi.category !== 'bottom') return item;
+      const hasTemplate = !!wi.leatherLabelTemplateId;
+      const styleCode = styleCodeOf(wi.designNumber);
+      const hasThreeTier = styleCode ? styleCodesWithLabelConfig.has(styleCode) : false;
+      return { ...item, labelReady: hasTemplate || hasThreeTier };
+    });
+
+    return NextResponse.json({ items: itemsWithLabelStatus });
   } catch (err: any) {
     console.error('[Wardrobe GET]', err);
     return NextResponse.json({ error: err.message }, { status: 500 });

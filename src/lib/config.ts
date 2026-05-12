@@ -17,19 +17,28 @@ export const APP_CONFIG = {
   imageSize: '4K' as const,
 
   // Shot types
-  shotTypes: ['M01', 'M02', 'M03', 'M04', 'M05'] as const,
+  shotTypes: ['M01', 'M02', 'M03', 'M04', 'M05', 'M06'] as const,
 
   // Shot dependency chain
-  // M03 first → M04 (needs M03) → M01 (needs M03) + M02 (needs M04) → M05 (needs M03 + M04)
-  shotOrder: ['M03', 'M04', 'M01', 'M02', 'M05'] as const,
+  // M03 first → M04 (needs M03) → M01 (crops M03) + M02 (crops M04) → M05 (needs M03 + M04) → M06 (independent free pose, runs after the e-comm hero set)
+  shotOrder: ['M03', 'M04', 'M01', 'M02', 'M05', 'M06'] as const,
 
   // Shot metadata
   shots: {
-    M01: { name: 'Cropped Front', aspect: '3:4' as const, dependsOn: ['M03'] as const, view: 'front' as const },
-    M02: { name: 'Cropped Back', aspect: '3:4' as const, dependsOn: ['M04'] as const, view: 'back' as const },
-    M03: { name: 'Full Body Front', aspect: '3:4' as const, dependsOn: [] as const, view: 'front' as const },
-    M04: { name: 'Full Body Back', aspect: '3:4' as const, dependsOn: ['M03'] as const, view: 'back' as const },
-    M05: { name: 'Pocket Detail', aspect: '3:4' as const, dependsOn: ['M03', 'M04'] as const, view: 'back' as const },
+    // Aspect 1:1 (square) per G-Star brand spec — matches the gstar.com reference
+    // images (e.g. 3301-regular-tapered 2000×2000 native square renders). Native
+    // generation at 1:1 → upscale to 4000×4000 in the generate route. Switched
+    // May 1 2026 from '3:4'.
+    M01: { name: 'Cropped Front', aspect: '1:1' as const, dependsOn: ['M03'] as const, view: 'front' as const },
+    M02: { name: 'Cropped Back', aspect: '1:1' as const, dependsOn: ['M04'] as const, view: 'back' as const },
+    M03: { name: 'Full Body Front', aspect: '1:1' as const, dependsOn: [] as const, view: 'front' as const },
+    // M04 deps were ['M03'] historically (stale — M04 generation never read m03AnchorUrl).
+    // Dropped Apr 30 2026 along with the per-shot parallel refactor so M03+M04+M06
+    // can all run from T=0 in parallel. Both shots share the same model identity refs
+    // so identity drift is not a concern.
+    M04: { name: 'Full Body Back', aspect: '1:1' as const, dependsOn: [] as const, view: 'back' as const },
+    M05: { name: 'Pocket Detail', aspect: '1:1' as const, dependsOn: ['M03', 'M04'] as const, view: 'back' as const },
+    M06: { name: 'Free Pose', aspect: '1:1' as const, dependsOn: [] as const, view: 'front' as const },
   },
 
   // Image preprocessing

@@ -1,12 +1,21 @@
 import NextAuth from 'next-auth';
 import CredentialsProvider from 'next-auth/providers/credentials';
+import AzureADProvider from 'next-auth/providers/azure-ad';
 import { getUser, createUser, updateLastLogin, verifyUserPassword, verifyOTP } from '@/lib/firestore';
 
-const ALLOWED_DOMAINS = ['gstar-raw.com', 'g-star.com', 'fiberandface.com'];
+// Email/OTP/password provider is admin-only after Azure SSO rollout.
+// Everyone else (gstar-raw.com, g-star.com) MUST sign in via Microsoft.
+const ALLOWED_DOMAINS = ['fiberandface.com'];
 const WHITELISTED_EMAILS = ['brunodheedene@gmail.com', 'bruno@fiberandface.com'];
 
 const handler = NextAuth({
   providers: [
+    AzureADProvider({
+      clientId: process.env.AZURE_AD_CLIENT_ID!,
+      clientSecret: process.env.AZURE_AD_CLIENT_SECRET!,
+      tenantId: process.env.AZURE_AD_TENANT_ID,
+      authorization: { params: { scope: 'openid profile email' } },
+    }),
     CredentialsProvider({
       id: 'credentials',
       name: 'Email',
@@ -72,6 +81,31 @@ const handler = NextAuth({
     maxAge: 30 * 24 * 60 * 60, // 30 days
   },
   callbacks: {
+    async signIn({ user, account, profile }) {
+      if (!user.email) return false;
+      const email = user.email.toLowerCase();
+
+      // Credentials provider: authorize() already validated everything.
+      if (account?.provider === 'credentials') return true;
+
+      // Azure AD: Phase 3 — temp allow any successful Entra login.
+      // Phase 4 will gate on group claim 749c0cf5-...
+      if (account?.provider === 'azure-ad') {
+        const existing = await getUser(email);
+        if (existing && (existing as Record<string, unknown>).active === false) {
+          console.log(`[auth] reject azure-ad: user ${email} is inactive`);
+          return false;
+        }
+        if (!existing) {
+          const displayName = (profile as { name?: string } | undefined)?.name || email.split('@')[0];
+          await createUser(email, { displayName, role: 'creator' });
+        }
+        await updateLastLogin(email);
+        return true;
+      }
+
+      return false;
+    },
     async jwt({ token, user }) {
       if (user) {
         token.email = user.email;

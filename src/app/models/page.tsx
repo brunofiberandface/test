@@ -58,6 +58,9 @@ export default function ModelsPage() {
   const [modalError, setModalError] = useState('');
   const [zoomMode, setZoomMode] = useState<'full' | 'head' | 'torso'>('full');
   const [generatingBack, setGeneratingBack] = useState(false);
+  const [regeneratingFront, setRegeneratingFront] = useState(false);
+  // `uploading` state preserved for the dormant Replace-by-upload handler;
+  // the UI surface was removed 2026-05-10 in favour of Regenerate Front.
   const [uploading, setUploading] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
@@ -206,6 +209,39 @@ export default function ModelsPage() {
     }
   };
 
+  // Regenerate front reference — uses /api/models/generate-front, which takes
+  // the existing front (or original upload) as identity anchor and regenerates
+  // with the v2 styling (sports bra/bare torso + compression shorts + infinity
+  // cove). Use case: a freshly-created model whose card came out wrong (wrong
+  // styling, identity drift, distracting backdrop). The original upload is
+  // preserved on the doc as `originalReferenceImageUrl`.
+  const handleRegenerateFront = async () => {
+    if (!selectedModel) return;
+    setRegeneratingFront(true);
+    setModalError('');
+    try {
+      const mid = (selectedModel.modelId || selectedModel.id).trim();
+      const res = await fetch('/api/models/generate-front', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ modelId: mid }),
+      });
+      const data = await res.json();
+      if (data.success && data.frontUrl) {
+        // Cache-bust so the browser actually reloads the new image
+        const newUrl = `${data.frontUrl}${data.frontUrl.includes('?') ? '&' : '?'}t=${Date.now()}`;
+        setSelectedModel({ ...selectedModel, referenceImageUrl: newUrl });
+        setModels(prev => prev.map(m => (m.modelId || m.id) === mid ? { ...m, referenceImageUrl: newUrl } : m));
+      } else {
+        setModalError(data.error || data.details || 'Front regeneration failed');
+      }
+    } catch {
+      setModalError('Front regeneration failed');
+    } finally {
+      setRegeneratingFront(false);
+    }
+  };
+
   const handleReplacePhoto = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file || !selectedModel) return;
@@ -302,8 +338,15 @@ export default function ModelsPage() {
     torso: { objectFit: 'cover' as const, objectPosition: 'center', transform: 'scale(2)', transformOrigin: '50% 28%' },
   };
 
-  const women = models.filter(m => m.gender === 'female');
-  const men = models.filter(m => m.gender === 'male');
+  // Natural sort by model id — F1, F2, F3 ... F10, F11 (not the lexicographic
+  // F1, F10, F11, F2, F3 ... that comes from raw string sort).
+  const naturalSort = (a: Model, b: Model) => {
+    const aId = (a.modelId || a.id || '').toString();
+    const bId = (b.modelId || b.id || '').toString();
+    return aId.localeCompare(bId, undefined, { numeric: true, sensitivity: 'base' });
+  };
+  const women = models.filter(m => m.gender === 'female').sort(naturalSort);
+  const men = models.filter(m => m.gender === 'male').sort(naturalSort);
 
   return (
     <Shell user={user}>
@@ -499,9 +542,16 @@ export default function ModelsPage() {
                             No reference photo
                           </div>
                         )}
-                        <div className="absolute bottom-2 right-2 bg-black/60 text-white text-[10px] px-2 py-1">
-                          {zoomMode === 'full' ? 'Click to zoom' : zoomMode === 'head' ? 'Head' : 'Torso'}
-                        </div>
+                        {(selectedModel.referenceImageUrl || selectedModel.cardImageUrl) && isAdmin && (
+                          <button
+                            onClick={(e) => { e.stopPropagation(); handleRegenerateFront(); }}
+                            disabled={regeneratingFront}
+                            className="absolute bottom-2 left-2 bg-black/80 text-white text-xs font-medium px-3 py-1.5 hover:bg-black transition-colors disabled:opacity-50 shadow-lg"
+                            title="Regenerate the front reference using the existing card as identity anchor + the v2 base layer (sports bra / bare torso + compression shorts + infinity cove)."
+                          >
+                            {regeneratingFront ? 'Regenerating…' : 'Regenerate'}
+                          </button>
+                        )}
                       </div>
                     </div>
 
@@ -542,25 +592,12 @@ export default function ModelsPage() {
                     </div>
                   </div>
 
-                  {/* Replace Reference Photo (admin) */}
-                  {isAdmin && (
-                    <div className="mt-3">
-                      <input
-                        ref={fileInputRef}
-                        type="file"
-                        accept="image/*"
-                        onChange={handleReplacePhoto}
-                        className="hidden"
-                      />
-                      <button
-                        onClick={() => fileInputRef.current?.click()}
-                        disabled={uploading}
-                        className="w-full border border-neutral-300 px-4 py-2 text-xs font-medium text-neutral-600 hover:bg-neutral-50 transition-colors disabled:opacity-30"
-                      >
-                        {uploading ? 'Uploading...' : 'Replace Front Reference Photo'}
-                      </button>
-                    </div>
-                  )}
+                  {/* Replace-by-upload button removed 2026-05-10. Regenerate
+                      (front-image overlay) is the canonical flow now.
+                      handleReplacePhoto + fileInputRef + uploading state are
+                      preserved as dormant code for easy restore — see git
+                      history for the JSX block if upload-by-file needs to
+                      come back as an admin escape hatch. */}
                 </div>
 
                 {/* Right — model info + actions */}

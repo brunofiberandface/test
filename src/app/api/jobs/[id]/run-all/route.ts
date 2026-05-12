@@ -1,5 +1,6 @@
 import { NextRequest } from 'next/server';
 import { getJob, enqueueJob } from '@/lib/firestore';
+import { triggerWorker } from '@/lib/worker/trigger';
 
 /**
  * POST /api/jobs/[id]/run-all
@@ -9,11 +10,6 @@ import { getJob, enqueueJob } from '@/lib/firestore';
  *
  * This endpoint exists for backwards compatibility (frontend buttons, etc.)
  */
-
-function getInternalBase(): string {
-  const port = process.env.PORT || '3000';
-  return `http://localhost:${port}`;
-}
 
 export async function POST(
   req: NextRequest,
@@ -36,12 +32,10 @@ export async function POST(
   const result = await enqueueJob(jobId, jobName);
   console.log(`[RunAll] Enqueued ${jobName}: slot=${result.slot}, position=${result.position}`);
 
-  // v37: Respond immediately, kick worker in background.
-  // The internal fetch creates a new request that keeps the container alive.
-  // Must NOT await — process-queue blocks for minutes during generation.
-  fetch(`${getInternalBase()}/api/jobs/process-queue`, { method: 'POST' })
-    .then(res => console.log(`[RunAll] Worker kick response: ${res.status}`))
-    .catch(err => console.warn(`[RunAll] Worker kick failed (non-blocking):`, err));
+  // v37: Respond immediately, kick worker in background. triggerWorker
+  // branches on WORKER_MODE env var — inproc (default) or job (Phase 2
+  // Cloud Run Job). Helper logs success/failure internally.
+  triggerWorker('run-all').catch(() => { /* logged in helper */ });
 
   return new Response(JSON.stringify({
     ok: true,

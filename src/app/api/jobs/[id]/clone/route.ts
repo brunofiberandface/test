@@ -5,6 +5,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getJob, listJobs, jobsCol, createShot, updateJobStatus, getActivePrompt, enqueueJob } from '@/lib/firestore';
 import { APP_CONFIG } from '@/lib/config';
+import { triggerWorker } from '@/lib/worker/trigger';
 
 export async function POST(
   req: NextRequest,
@@ -69,10 +70,7 @@ export async function POST(
 
     const response = NextResponse.json({ success: true, jobId: newJobId, jobName: cloneName });
 
-    const port = process.env.PORT || '3000';
-    fetch(`http://localhost:${port}/api/jobs/process-queue`, { method: 'POST' })
-      .then(res => console.log(`[Clone] Worker kick: ${res.status}`))
-      .catch(err => console.warn(`[Clone] Worker kick failed (non-blocking):`, err));
+    triggerWorker('clone').catch(() => { /* logged in helper */ });
 
     return response;
   } catch (error) {

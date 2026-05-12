@@ -15,6 +15,7 @@ interface Job {
   focusDesignNumber?: string;
   focusDesignName?: string;
   focusCategory?: string;
+  focusFitModelFrontUrl?: string;
   modelName?: string;
   modelId?: string;
   createdAt: string;
@@ -23,7 +24,9 @@ interface Job {
   archived?: boolean;
   queuePosition?: number;
   approvedCount?: number;
+  doneCount?: number;
   totalShots?: number;
+  approvedShots?: Array<{ shotId: string; shotType: string; imageUrl?: string }>;
 }
 
 interface QueueState {
@@ -66,6 +69,139 @@ function formatDate(isoString: string | undefined): string {
   }
 }
 
+/**
+ * Lightweight in-dashboard preview of a job — fetches the job's shots and
+ * focus front 0° image, renders them in a centered modal so the user can
+ * peek without leaving the dashboard. Bruno 2026-05-07: opening every job
+ * in a new tab to glance at output is friction.
+ */
+function JobPreviewPopup({ jobId, onClose }: { jobId: string; onClose: () => void }) {
+  const router = useRouter();
+  const [data, setData] = useState<{ job: any; shots: any[] } | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState('');
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch(`/api/jobs/${jobId}`)
+      .then(r => r.json())
+      .then(d => { if (!cancelled) { setData(d); setLoading(false); } })
+      .catch(e => { if (!cancelled) { setErr(String(e)); setLoading(false); } });
+    return () => { cancelled = true; };
+  }, [jobId]);
+
+  // ESC to close
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [onClose]);
+
+  // Stable ordering for the shot grid
+  const SHOT_ORDER = ['M01', 'M02', 'M03', 'M04', 'M05', 'M06'];
+  const sortedShots = (data?.shots || []).slice().sort((a, b) => {
+    const ai = SHOT_ORDER.indexOf(a.shotType || a.type);
+    const bi = SHOT_ORDER.indexOf(b.shotType || b.type);
+    return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
+  });
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-6"
+      onClick={onClose}
+    >
+      <div
+        className="bg-white max-w-5xl w-full max-h-[90vh] overflow-auto"
+        onClick={e => e.stopPropagation()}
+      >
+        {/* Header */}
+        <div className="sticky top-0 bg-white border-b border-neutral-200 px-6 py-4 flex items-center justify-between">
+          <div className="min-w-0 flex-1">
+            <h2 className="text-lg font-bold text-neutral-900 truncate">
+              {data?.job?.jobName || data?.job?.designNumber || jobId}
+            </h2>
+            {data?.job?.focusDesignNumber && (
+              <p className="text-xs text-neutral-500 truncate">
+                {data.job.focusDesignNumber} {data.job.focusDesignName ? `— ${data.job.focusDesignName}` : ''}
+              </p>
+            )}
+          </div>
+          <div className="flex items-center gap-2 flex-shrink-0 ml-4">
+            <button
+              onClick={() => router.push(`/jobs/${jobId}/results`)}
+              className="text-xs px-3 py-1.5 bg-neutral-900 text-white hover:bg-neutral-700 transition-colors"
+            >
+              Open job page
+            </button>
+            <button
+              onClick={onClose}
+              className="text-neutral-400 hover:text-neutral-700 p-1"
+              title="Close (Esc)"
+            >
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
+              </svg>
+            </button>
+          </div>
+        </div>
+
+        {/* Body */}
+        <div className="p-6">
+          {loading && (
+            <div className="flex items-center justify-center py-20">
+              <div className="w-6 h-6 border-2 border-neutral-300 border-t-neutral-900 rounded-full animate-spin" />
+            </div>
+          )}
+          {err && <p className="text-sm text-red-600">{err}</p>}
+          {!loading && !err && data && (
+            <div className="flex gap-6">
+              {/* Original (focus front 0°) */}
+              {data.job.focusFitModelFrontUrl && (
+                <div className="flex-shrink-0">
+                  <div className="w-48 h-64 bg-neutral-100 border border-neutral-200 overflow-hidden">
+                    <img src={data.job.focusFitModelFrontUrl} alt="Original" className="w-full h-full object-contain" />
+                  </div>
+                  <p className="text-xs text-neutral-500 mt-2 text-center uppercase tracking-wider">Original</p>
+                </div>
+              )}
+              {/* Shots grid */}
+              <div className="flex-1 min-w-0">
+                {sortedShots.length === 0 ? (
+                  <p className="text-sm text-neutral-400">No shots yet.</p>
+                ) : (
+                  <div className="grid grid-cols-3 gap-3">
+                    {sortedShots.map((s: any) => {
+                      const url = s.greyMasterUrl || s.imageUrl;
+                      const status = s.status || 'pending';
+                      return (
+                        <div key={s.id || s.shotId} className="border border-neutral-200">
+                          <div className="aspect-[3/4] bg-neutral-100 relative">
+                            {url ? (
+                              <img src={url} alt={s.shotType} className="w-full h-full object-cover" />
+                            ) : (
+                              <div className="w-full h-full flex items-center justify-center text-xs text-neutral-400 capitalize">
+                                {status}
+                              </div>
+                            )}
+                          </div>
+                          <p className="text-[10px] px-2 py-1 text-neutral-600 uppercase tracking-wider">
+                            {s.shotType || s.type}
+                            {s.variant && s.variant !== 'A' ? `-${s.variant}` : ''}
+                          </p>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function DashboardPage() {
   const { data: session, status: authStatus } = useSession();
   const router = useRouter();
@@ -88,6 +224,19 @@ export default function DashboardPage() {
 
   // Action state
   const [cloning, setCloning] = useState<string | null>(null);
+  // Inline job preview popup — show shots without leaving the dashboard.
+  const [previewJobId, setPreviewJobId] = useState<string | null>(null);
+  // Thumbnail lightbox — when user clicks the small original-fit-model
+  // thumbnail in the table, enlarge it to 3× in a centered modal.
+  const [enlargedThumbUrl, setEnlargedThumbUrl] = useState<string | null>(null);
+  // User filter (Bruno 2026-05-07): 'all' | <email>
+  const [creatorFilter, setCreatorFilter] = useState<string>('all');
+  // Additional filters (Bruno 2026-05-12): name (first-2-words substring),
+  // design number (substring), focus slot ('all' | 'top' | 'bottom' | 'shoe').
+  // All four filters combine (AND) with status + creator above.
+  const [nameFilter, setNameFilter] = useState<string>('');
+  const [designFilter, setDesignFilter] = useState<string>('');
+  const [focusFilter, setFocusFilter] = useState<string>('all');
   const [archiveConfirm, setArchiveConfirm] = useState<string | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
@@ -97,6 +246,13 @@ export default function DashboardPage() {
   const initializedRef = useRef(false);
   const refreshRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
+  // Map of modelId → reference image URL — used to render the small model
+  // thumbnail in the MODEL column (next to the name) on each job row. Fetched
+  // once on mount; the model roster doesn't change often enough to warrant a
+  // refresh interval. Falls back gracefully (no thumbnail) when the model has
+  // no `referenceImageUrl` (legacy models that only had `cardImageUrl`).
+  const [modelThumbs, setModelThumbs] = useState<Record<string, string>>({});
+
   useEffect(() => {
     if (authStatus === 'unauthenticated') {
       router.push('/');
@@ -105,6 +261,20 @@ export default function DashboardPage() {
     if (authStatus === 'authenticated') {
       fetchJobs(filter === 'archived');
       fetchQueue();
+      // Fire-and-forget — empty map is safe (cells just render as text).
+      fetch('/api/models')
+        .then(res => res.ok ? res.json() : null)
+        .then(data => {
+          if (!data?.models) return;
+          const map: Record<string, string> = {};
+          for (const m of data.models as Array<{ modelId?: string; id?: string; referenceImageUrl?: string; cardImageUrl?: string }>) {
+            const id = (m.modelId || m.id || '').trim();
+            const url = m.referenceImageUrl || m.cardImageUrl;
+            if (id && url) map[id] = url;
+          }
+          setModelThumbs(map);
+        })
+        .catch(() => { /* non-blocking */ });
       const queueInterval = setInterval(fetchQueue, 10000);
       initializedRef.current = true;
       return () => clearInterval(queueInterval);
@@ -120,7 +290,7 @@ export default function DashboardPage() {
     });
     if (hasActiveJobs && authStatus === 'authenticated') {
       if (!refreshRef.current) {
-        refreshRef.current = setInterval(() => fetchJobs(filter === 'archived'), 15000);
+        refreshRef.current = setInterval(() => fetchJobs(filter === 'archived', true), 15000);
       }
     } else {
       if (refreshRef.current) { clearInterval(refreshRef.current); refreshRef.current = null; }
@@ -149,8 +319,13 @@ export default function DashboardPage() {
     } catch { /* non-blocking */ }
   }
 
-  async function fetchJobs(inclArchived = false) {
-    setLoading(true);
+  async function fetchJobs(inclArchived = false, isBackground = false) {
+    // Only show the spinner on the INITIAL load. Background polls
+    // (every 15s while there are active jobs, or the filter-switch
+    // refetch) keep the existing table on screen so img tags don't
+    // unmount + re-fetch with every poll. Without this, the dashboard
+    // flickers and every thumbnail re-downloads on each poll.
+    if (!isBackground) setLoading(true);
     try {
       const url = inclArchived ? '/api/jobs?includeArchived=true' : '/api/jobs';
       const res = await fetch(url, { headers: { 'x-user-email': session?.user?.email || '' } });
@@ -252,7 +427,7 @@ export default function DashboardPage() {
     { value: 'archived', label: 'Archived' },
   ];
 
-  const filtered = filter === 'archived'
+  const statusFiltered = filter === 'archived'
     ? jobs.filter(j => j.archived === true)
     : filter === 'all'
       ? jobs
@@ -262,6 +437,45 @@ export default function DashboardPage() {
           if (filter === 'generating') return s === 'generating' || s === 'queued' || s === 'uploading';
           return s === filter;
         });
+
+  // Apply user filter on top of status filter
+  const creatorFiltered = creatorFilter === 'all'
+    ? statusFiltered
+    : statusFiltered.filter(j => (j.creatorEmail || '') === creatorFilter);
+
+  // Name filter — matches the search query against only the FIRST TWO WORDS
+  // of each job's jobName (case-insensitive substring). So "kate" / "kate
+  // boyfriend" finds "Kate Boyfriend Jeans 53"; "53" / "jeans" do NOT
+  // (they're past the second word). Empty filter passes everything.
+  const nameQuery = nameFilter.trim().toLowerCase();
+  const nameFiltered = !nameQuery
+    ? creatorFiltered
+    : creatorFiltered.filter(j => {
+        const firstTwo = (j.jobName || '').split(/\s+/).slice(0, 2).join(' ').toLowerCase();
+        return firstTwo.includes(nameQuery);
+      });
+
+  // Design-number filter — case-insensitive substring match against focusDesignNumber.
+  const designQuery = designFilter.trim().toLowerCase();
+  const designFiltered = !designQuery
+    ? nameFiltered
+    : nameFiltered.filter(j => (j.focusDesignNumber || '').toLowerCase().includes(designQuery));
+
+  // Focus-slot filter — matches the wardrobe slot flagged as focus. Job
+  // surfaces this as `focusCategory` ('top' | 'bottom' | 'shoes').
+  const filtered = focusFilter === 'all'
+    ? designFiltered
+    : designFiltered.filter(j => {
+        const cat = (j.focusCategory || '').toLowerCase();
+        if (focusFilter === 'shoe') return cat === 'shoe' || cat === 'shoes';
+        return cat === focusFilter;
+      });
+
+  // List of distinct creator emails across all jobs (for the filter dropdown).
+  // Sorted, deduplicated, empty strings dropped.
+  const creators = Array.from(
+    new Set(jobs.map(j => j.creatorEmail).filter((e): e is string => !!e))
+  ).sort();
 
   const countFor = (filterVal: string) => {
     if (filterVal === 'archived') return archivedCount;
@@ -292,13 +506,17 @@ export default function DashboardPage() {
           <p className="text-sm text-neutral-500 mt-1">{stats.total} active jobs</p>
         </div>
         <div className="flex items-center gap-3">
-          {isAdmin && selected.size > 0 && (
+          {/* Bulk hard-delete bar — admin only, ONLY on the Archived tab.
+              Active rows use individual "Delete" (which archives, not hard-
+              deletes); a bulk archive isn't surfaced yet. If we need one, add
+              a separate "Archive selected" button mirroring this. */}
+          {isAdmin && filter === 'archived' && selected.size > 0 && (
             <div className="flex items-center gap-2">
               <span className="text-sm text-neutral-600">{selected.size} selected</span>
               {!batchDeleteConfirm ? (
                 <button onClick={() => setBatchDeleteConfirm(true)}
                   className="text-xs border border-red-300 px-3 py-1.5 text-red-600 hover:bg-red-50 transition-colors font-medium">
-                  Delete selected
+                  Delete selected (permanent)
                 </button>
               ) : (
                 <div className="flex items-center gap-1.5">
@@ -371,17 +589,76 @@ export default function DashboardPage() {
         </div>
       )}
 
-      {/* Filter tabs */}
-      <div className="flex gap-1.5 mb-4 flex-wrap">
-        {FILTERS.map(f => (
-          <button key={f.value} onClick={() => setFilter(f.value)}
-            className={`px-3 py-1.5 text-xs font-medium transition-colors ${
-              filter === f.value ? 'bg-neutral-900 text-white' : 'border border-neutral-300 text-neutral-500 hover:bg-neutral-50'
-            }`}>
-            {f.label}
-            {f.value !== 'all' && <span className="ml-1.5 opacity-60">{countFor(f.value)}</span>}
+      {/* Filter tabs + user filter */}
+      <div className="flex items-center gap-3 mb-4 flex-wrap">
+        <div className="flex gap-1.5 flex-wrap">
+          {FILTERS.map(f => (
+            <button key={f.value} onClick={() => setFilter(f.value)}
+              className={`px-3 py-1.5 text-xs font-medium transition-colors ${
+                filter === f.value ? 'bg-neutral-900 text-white' : 'border border-neutral-300 text-neutral-500 hover:bg-neutral-50'
+              }`}>
+              {f.label}
+              {f.value !== 'all' && <span className="ml-1.5 opacity-60">{countFor(f.value)}</span>}
+            </button>
+          ))}
+        </div>
+        {creators.length > 0 && (
+          <div className="flex items-center gap-2 ml-auto">
+            <span className="text-xs text-neutral-500 uppercase tracking-wider">Created by</span>
+            <select
+              value={creatorFilter}
+              onChange={(e) => setCreatorFilter(e.target.value)}
+              className="px-2 py-1.5 text-xs border border-neutral-300 bg-white text-neutral-700 hover:border-neutral-400 focus:outline-none focus:border-neutral-900"
+            >
+              <option value="all">All users ({creators.length})</option>
+              {creators.map(c => (
+                <option key={c} value={c}>{c}</option>
+              ))}
+            </select>
+          </div>
+        )}
+      </div>
+
+      {/* Secondary filters (Bruno 2026-05-12): name, design number, focus slot.
+          Combine (AND) with status + creator filters above. */}
+      <div className="flex items-center gap-3 mb-6 flex-wrap">
+        <input
+          type="text"
+          value={nameFilter}
+          onChange={(e) => setNameFilter(e.target.value)}
+          placeholder="Filter by job name (first 2 words)"
+          className="px-3 py-1.5 text-xs border border-neutral-300 bg-white text-neutral-700 placeholder-neutral-400 hover:border-neutral-400 focus:outline-none focus:border-neutral-900 w-64"
+        />
+        <input
+          type="text"
+          value={designFilter}
+          onChange={(e) => setDesignFilter(e.target.value)}
+          placeholder="Filter by design number"
+          className="px-3 py-1.5 text-xs border border-neutral-300 bg-white text-neutral-700 placeholder-neutral-400 hover:border-neutral-400 focus:outline-none focus:border-neutral-900 w-56"
+        />
+        <div className="flex items-center gap-2">
+          <span className="text-xs text-neutral-500 uppercase tracking-wider">Focus</span>
+          <select
+            value={focusFilter}
+            onChange={(e) => setFocusFilter(e.target.value)}
+            className="px-2 py-1.5 text-xs border border-neutral-300 bg-white text-neutral-700 hover:border-neutral-400 focus:outline-none focus:border-neutral-900"
+          >
+            <option value="all">All</option>
+            <option value="top">Top</option>
+            <option value="bottom">Bottom</option>
+            <option value="shoe">Shoes</option>
+          </select>
+        </div>
+        {(nameFilter || designFilter || focusFilter !== 'all') && (
+          <button
+            onClick={() => { setNameFilter(''); setDesignFilter(''); setFocusFilter('all'); }}
+            className="px-3 py-1.5 text-xs text-neutral-500 hover:text-neutral-900 underline"
+            title="Clear name, design, and focus filters"
+          >
+            Clear filters
           </button>
-        ))}
+        )}
+        <span className="text-xs text-neutral-400 ml-auto">{filtered.length} of {statusFiltered.length} jobs match</span>
       </div>
 
       {/* Jobs table */}
@@ -409,10 +686,12 @@ export default function DashboardPage() {
                       className="w-3.5 h-3.5 accent-neutral-900 cursor-pointer" />
                   </th>
                 )}
+                <th className="text-left px-3 py-2.5 text-xs font-medium text-neutral-500 uppercase tracking-wider">Original</th>
                 <th className="text-left px-5 py-2.5 text-xs font-medium text-neutral-500 uppercase tracking-wider">Job Name</th>
                 <th className="text-left px-5 py-2.5 text-xs font-medium text-neutral-500 uppercase tracking-wider">Design</th>
                 <th className="text-left px-5 py-2.5 text-xs font-medium text-neutral-500 uppercase tracking-wider">Category</th>
                 <th className="text-left px-5 py-2.5 text-xs font-medium text-neutral-500 uppercase tracking-wider">Model</th>
+                <th className="text-left px-5 py-2.5 text-xs font-medium text-neutral-500 uppercase tracking-wider">Created by</th>
                 <th className="text-left px-5 py-2.5 text-xs font-medium text-neutral-500 uppercase tracking-wider">Date</th>
                 <th className="text-left px-5 py-2.5 text-xs font-medium text-neutral-500 uppercase tracking-wider">Status</th>
                 <th className="text-left px-5 py-2.5 text-xs font-medium text-neutral-500 uppercase tracking-wider">Actions</th>
@@ -435,7 +714,21 @@ export default function DashboardPage() {
                           className="w-3.5 h-3.5 accent-neutral-900 cursor-pointer" />
                       </td>
                     )}
-                    <td className="px-5 py-3">
+                    <td className="px-3 py-3 align-top">
+                      {job.focusFitModelFrontUrl ? (
+                        <button
+                          type="button"
+                          onClick={e => { e.preventDefault(); e.stopPropagation(); setEnlargedThumbUrl(job.focusFitModelFrontUrl!); }}
+                          className="w-14 h-20 bg-neutral-100 border border-neutral-200 overflow-hidden hover:border-neutral-400 transition-colors cursor-zoom-in block"
+                          title="Click to enlarge"
+                        >
+                          <img src={job.focusFitModelFrontUrl} alt="Original" className="w-full h-full object-contain" loading="lazy" decoding="async" />
+                        </button>
+                      ) : (
+                        <div className="w-14 h-20 bg-neutral-50 border border-neutral-100" />
+                      )}
+                    </td>
+                    <td className="px-5 py-3 align-top">
                       {editingJobId === jobId ? (
                         <input type="text" value={editValue}
                           onChange={e => setEditValue(e.target.value)}
@@ -447,16 +740,38 @@ export default function DashboardPage() {
                           autoFocus
                           className="text-sm font-medium text-neutral-900 border border-neutral-300 px-2 py-1 w-full outline-none focus:border-neutral-500" />
                       ) : (
-                        <div className="flex items-center gap-2 group">
-                          <Link href={`/jobs/${jobId}/results`} className="text-sm font-medium text-neutral-900 hover:underline">
-                            {job.jobName || <span className="text-neutral-400 font-normal italic">Untitled</span>}
-                          </Link>
-                          <button onClick={e => { e.preventDefault(); e.stopPropagation(); setEditingJobId(jobId); setEditValue(job.jobName || ''); }}
-                            className="opacity-0 group-hover:opacity-100 text-neutral-400 hover:text-neutral-600 transition-opacity" title="Edit job name">
-                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                              <path d="M17 3a2.85 2.85 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z" />
-                            </svg>
-                          </button>
+                        <div>
+                          <div className="flex items-center gap-2 group">
+                            <Link href={`/jobs/${jobId}/results`} className="text-sm font-medium text-neutral-900 hover:underline">
+                              {job.jobName || <span className="text-neutral-400 font-normal italic">Untitled</span>}
+                            </Link>
+                            <button onClick={e => { e.preventDefault(); e.stopPropagation(); setEditingJobId(jobId); setEditValue(job.jobName || ''); }}
+                              className="opacity-0 group-hover:opacity-100 text-neutral-400 hover:text-neutral-600 transition-opacity" title="Edit job name">
+                              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                <path d="M17 3a2.85 2.85 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z" />
+                              </svg>
+                            </button>
+                          </div>
+                          {/* Approved deliverable thumbnails — listed under the
+                              job name so the reviewer can see the approved set
+                              grow as they work through the job. */}
+                          {job.approvedShots && job.approvedShots.length > 0 && (
+                            <div className="flex items-center gap-1 mt-1.5 flex-wrap">
+                              {job.approvedShots.map(s => (
+                                s.imageUrl ? (
+                                  <button
+                                    key={s.shotId}
+                                    type="button"
+                                    onClick={e => { e.preventDefault(); e.stopPropagation(); setEnlargedThumbUrl(s.imageUrl!); }}
+                                    className="w-8 h-10 bg-neutral-100 border border-neutral-200 overflow-hidden hover:border-neutral-400 transition-colors block"
+                                    title={`${s.shotType} — click to enlarge`}
+                                  >
+                                    <img src={s.imageUrl} alt={s.shotType} className="w-full h-full object-cover" loading="lazy" decoding="async" />
+                                  </button>
+                                ) : null
+                              ))}
+                            </div>
+                          )}
                         </div>
                       )}
                     </td>
@@ -471,7 +786,28 @@ export default function DashboardPage() {
                       )}
                     </td>
                     <td className="px-5 py-3 text-sm text-neutral-600 capitalize">{job.focusCategory || '—'}</td>
-                    <td className="px-5 py-3 text-sm text-neutral-600">{job.modelName || '—'}</td>
+                    <td className="px-5 py-3 text-sm text-neutral-600">
+                      {(() => {
+                        const thumb = job.modelId ? modelThumbs[job.modelId] : undefined;
+                        const name = job.modelName || job.modelId || '—';
+                        if (!thumb) {
+                          return <span>{name}</span>;
+                        }
+                        return (
+                          <div className="flex items-center gap-2">
+                            <img
+                              src={thumb}
+                              alt={name}
+                              className="w-8 h-12 object-cover bg-neutral-100 border border-neutral-200 flex-shrink-0"
+                              loading="lazy"
+                              decoding="async"
+                            />
+                            <span className="truncate">{name}</span>
+                          </div>
+                        );
+                      })()}
+                    </td>
+                    <td className="px-5 py-3 text-sm text-neutral-600 truncate max-w-[180px]" title={job.creatorEmail || ''}>{job.creatorEmail || '—'}</td>
                     <td className="px-5 py-3 text-sm text-neutral-400">{formatDate(job.updatedAt || job.createdAt)}</td>
                     <td className="px-5 py-3">
                       <span className={`inline-flex text-xs px-2 py-0.5 font-medium ${STATUS_STYLES[statusKey] || STATUS_STYLES.generating}`}>
@@ -479,45 +815,75 @@ export default function DashboardPage() {
                           ? `Queued #${job.queuePosition}`
                           : statusKey === 'review' && job.totalShots
                             ? `In Review ${job.approvedCount ?? 0}/${job.totalShots}`
-                            : STATUS_LABEL[statusKey] || job.status}
+                            : statusKey === 'generating' && job.totalShots
+                              ? `Generating ${job.doneCount ?? 0}/${job.totalShots}`
+                              : STATUS_LABEL[statusKey] || job.status}
                       </span>
                     </td>
                     <td className="px-5 py-3">
                       <div className="flex items-center gap-1.5 flex-wrap">
+                        {/* Eye / Preview — opens an in-dashboard popup with the
+                            job's shots so the user can scan results without
+                            navigating off the dashboard. Bruno 2026-05-07. */}
+                        <button
+                          onClick={(e) => { e.preventDefault(); e.stopPropagation(); setPreviewJobId(jobId); }}
+                          className="text-neutral-400 hover:text-neutral-900 p-1 transition-colors"
+                          title="Preview job"
+                        >
+                          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
+                            <circle cx="12" cy="12" r="3" />
+                          </svg>
+                        </button>
+                        {/* Clone — everyone, on non-archived rows */}
                         {!isArchived && (
                           <button onClick={e => cloneJob(e, jobId)} disabled={cloning === jobId}
                             className="text-xs border border-neutral-300 px-3 py-1 text-neutral-600 hover:bg-neutral-50 disabled:opacity-40 transition-colors">
                             {cloning === jobId ? '...' : 'Clone'}
                           </button>
                         )}
-                        {isAdmin && !isArchived && archiveConfirm !== jobId && deleteConfirm !== jobId && (
+
+                        {/* TIERED DELETE (Bruno 2026-05-12):
+                            • Active row: anyone (admin + user) clicks Delete → archives (soft, recoverable).
+                            • Archived row: admin clicks Delete → hard-deletes (permanent).
+                            • Users have NO action on archived rows.
+                            The Delete label is reused on both states but the consequence
+                            differs by state — confirmation copy distinguishes them.
+                        */}
+
+                        {/* ACTIVE: Delete = move to archive (everyone) */}
+                        {!isArchived && archiveConfirm !== jobId && (
                           <button onClick={() => setArchiveConfirm(jobId)}
-                            className="text-xs border border-neutral-200 px-3 py-1 text-neutral-400 hover:text-neutral-700 hover:border-neutral-400 transition-colors">
-                            Archive
+                            className="text-xs border border-red-200 px-3 py-1 text-red-400 hover:text-red-600 hover:border-red-400 transition-colors">
+                            Delete
                           </button>
                         )}
-                        {isAdmin && !isArchived && archiveConfirm === jobId && (
+                        {!isArchived && archiveConfirm === jobId && (
                           <div className="flex items-center gap-1">
-                            <span className="text-xs text-neutral-600">Sure?</span>
+                            <span className="text-xs text-neutral-600">Move to archive?</span>
                             <button onClick={e => handleArchive(e, jobId, true)}
                               className="text-xs px-2 py-0.5 bg-neutral-900 text-white hover:bg-neutral-700">Yes</button>
                             <button onClick={() => setArchiveConfirm(null)}
                               className="text-xs px-2 py-0.5 border border-neutral-300 text-neutral-600 hover:bg-neutral-50">✕</button>
                           </div>
                         )}
+
+                        {/* ARCHIVED, admin only: Unarchive */}
                         {isAdmin && isArchived && (
                           <button onClick={e => handleArchive(e, jobId, false)}
                             className="text-xs border border-neutral-300 px-3 py-1 text-neutral-500 hover:bg-neutral-50 transition-colors">
                             Unarchive
                           </button>
                         )}
-                        {isAdmin && deleteConfirm !== jobId && (
+
+                        {/* ARCHIVED, admin only: Delete = permanent hard delete */}
+                        {isAdmin && isArchived && deleteConfirm !== jobId && (
                           <button onClick={() => { setDeleteConfirm(jobId); setArchiveConfirm(null); }}
                             className="text-xs border border-red-200 px-3 py-1 text-red-400 hover:text-red-600 hover:border-red-400 transition-colors">
                             Delete
                           </button>
                         )}
-                        {isAdmin && deleteConfirm === jobId && (
+                        {isAdmin && isArchived && deleteConfirm === jobId && (
                           <div className="flex items-center gap-1">
                             <span className="text-xs text-red-600">Permanent!</span>
                             <button onClick={e => handleDeleteSingle(e, jobId)} disabled={deleting}
@@ -535,6 +901,40 @@ export default function DashboardPage() {
               })}
             </tbody>
           </table>
+        </div>
+      )}
+
+      {/* Inline job-preview popup */}
+      {previewJobId && (
+        <JobPreviewPopup jobId={previewJobId} onClose={() => setPreviewJobId(null)} />
+      )}
+
+      {/* Thumbnail lightbox — when a small thumbnail in the table is clicked,
+          enlarge it ~3× in a centered modal. ESC or click-outside closes. */}
+      {enlargedThumbUrl && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-6"
+          onClick={() => setEnlargedThumbUrl(null)}
+          onKeyDown={e => { if (e.key === 'Escape') setEnlargedThumbUrl(null); }}
+          tabIndex={-1}
+        >
+          <div className="bg-white p-2" onClick={e => e.stopPropagation()}>
+            <img
+              src={enlargedThumbUrl}
+              alt="Enlarged thumbnail"
+              className="block max-h-[85vh] w-auto h-auto"
+              style={{ maxWidth: 'min(85vw, 540px)' }}
+            />
+          </div>
+          <button
+            onClick={() => setEnlargedThumbUrl(null)}
+            className="absolute top-4 right-4 text-white/80 hover:text-white p-2"
+            title="Close (Esc)"
+          >
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
+            </svg>
+          </button>
         </div>
       )}
     </Shell>

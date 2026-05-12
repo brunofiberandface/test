@@ -14,6 +14,7 @@ import { runSilhouetteForWardrobe } from '@/lib/pipeline/silhouette';
 import { APP_CONFIG } from '@/lib/config';
 import type { ShotType, JobWardrobe, FitModelAngles } from '@/types';
 import { normalizeWardrobeItem } from '@/lib/wardrobe-compat';
+import { triggerWorker } from '@/lib/worker/trigger';
 
 function getInternalBase(): string {
   const port = process.env.PORT || '3000';
@@ -50,10 +51,12 @@ export async function GET(req: NextRequest) {
     // Enrich jobs with focus item description, category, and model name
     await Promise.all(jobs.map(async (job: any) => {
       try {
-        // Resolve focus wardrobe item
+        // Resolve focus wardrobe item. Fall back to bottom item when no
+        // slot is flagged isFocus — older jobs (pre-focus-picker) didn't
+        // mark any slot, but the bottom is the de-facto hero for those.
         const w = job.wardrobe;
         if (w) {
-          const focusEntry = [w.shoe, w.top, w.bottom].find((slot: any) => slot?.isFocus);
+          const focusEntry = [w.shoe, w.top, w.bottom].find((slot: any) => slot?.isFocus) || w.bottom;
           if (focusEntry?.itemId) {
             const item = await getWardrobeItem(focusEntry.itemId) as any;
             if (item) {
@@ -72,6 +75,20 @@ export async function GET(req: NextRequest) {
               }
               job.focusName = fullName;  // keep full name for backward compat
               job.focusCategory = item.category || '—';
+              // Resolve the focus item's front fit-model photo so the
+              // dashboard can show it as an "Original" thumbnail. Falls
+              // back to the flat-front product image when no fit-model
+              // photo is set. Only set if not already on the job doc
+              // (newer jobs persist focusFitModelFrontUrl at creation).
+              if (!job.focusFitModelFrontUrl) {
+                job.focusFitModelFrontUrl =
+                  item.fitModels?.front
+                  || item.fitModelFrontUrl
+                  || item.thumbnailUrl
+                  || item.flatFrontUrl
+                  || (Array.isArray(item.fitModelUrls) ? item.fitModelUrls[0] : undefined)
+                  || '';
+              }
             }
           }
         }
@@ -82,15 +99,43 @@ export async function GET(req: NextRequest) {
             job.modelName = model.name || job.modelId;
           }
         }
-        // Enrich review jobs with approval counts
-        if (job.status === 'review') {
+        // Enrich jobs with shot counts so the dashboard can show progress
+        // ("Generating 3/6", "In Review 4/6"). Approved shot thumbnails are
+        // surfaced for review/complete jobs only — pending/generating won't
+        // have approved shots, but they will have done shots worth showing
+        // as a progress count.
+        const ENRICHABLE = ['generating', 'queued', 'review', 'complete', 'completed', 'done'];
+        if (ENRICHABLE.includes(job.status)) {
           try {
             const { listShots } = await import('@/lib/firestore');
             const jobId = job.jobId || job.id;
             const shots = await listShots(jobId);
             const approvedCount = shots.filter((s: any) => s.status === 'approved').length;
+            // "Done" for progress purposes = shot has produced an image
+            // (status 'done' OR 'approved'). Reviewers see the count of
+            // shots that successfully rendered.
+            const doneCount = shots.filter((s: any) => s.status === 'done' || s.status === 'approved').length;
             job.approvedCount = approvedCount;
+            job.doneCount = doneCount;
             job.totalShots = shots.length;
+            // Stable shot-type order for the thumbnail list
+            const SHOT_ORDER = ['M01', 'M02', 'M03', 'M04', 'M05', 'M06'];
+            job.approvedShots = shots
+              .filter((s: any) => s.status === 'approved')
+              .map((s: any) => ({
+                shotId: s.shotId || s.id,
+                shotType: s.shotType,
+                // Prefer PLP/PDP variants (smaller files) for the dashboard
+                // thumbnails — full grey/white masters are 4K and slow to
+                // load just to render an 8×10 thumb. Falls back to the master
+                // for older shots that predate the deliverable-format step.
+                imageUrl: s.plpUrl || s.pdpUrl || s.greyMasterUrl || s.imageUrl,
+              }))
+              .sort((a: any, b: any) => {
+                const ai = SHOT_ORDER.indexOf(a.shotType);
+                const bi = SHOT_ORDER.indexOf(b.shotType);
+                return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi);
+              });
           } catch { /* non-blocking */ }
         }
       } catch { /* non-blocking enrichment */ }
@@ -114,6 +159,7 @@ export async function POST(req: NextRequest) {
       wardrobe,  // { shoe: { itemId, isFocus }, top: { itemId, isFocus }, bottom: { itemId, isFocus } }
       stylingNotes,
       provider,  // 'gemini' | 'seedream' — absent falls back to production default ('gemini')
+      m06PoseId,  // optional — id from src/lib/m06-poses.ts; absent falls back to default pose
     } = body;
 
     if (!creatorEmail || !modelId || !wardrobe) {
@@ -170,6 +216,7 @@ export async function POST(req: NextRequest) {
       promptRevisions,
       ...(stylingNotes ? { stylingNotes } : {}),
       ...(provider ? { provider } : {}),
+      ...(m06PoseId ? { m06PoseId } : {}),
     });
 
     console.log(`[Job] Created job ${jobId}`);
@@ -244,10 +291,10 @@ export async function POST(req: NextRequest) {
       position: enqueueResult.position,
     });
 
-    // Fire worker kick AFTER building response — DO NOT AWAIT
-    fetch(`${getInternalBase()}/api/jobs/process-queue`, { method: 'POST' })
-      .then(res => console.log(`[Job] Worker kick: ${res.status}`))
-      .catch(err => console.warn(`[Job] Worker kick failed (non-blocking):`, err));
+    // Fire worker kick AFTER building response — DO NOT AWAIT.
+    // Branches on WORKER_MODE env var: 'inproc' (default) → in-process worker,
+    // 'job' → triggers gstar-worker-job Cloud Run Job.
+    triggerWorker('job-create').catch(() => { /* already logged inside helper */ });
 
     return response;
   } catch (error) {

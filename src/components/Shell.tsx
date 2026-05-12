@@ -14,9 +14,11 @@ const NAV_ITEMS = [
   { href: '/jobs/new', label: 'New Job', roles: ['admin', 'creator'], exact: true },
   { href: '/models', label: 'Models', roles: ['admin', 'creator'] },
   { href: '/wardrobe', label: 'Wardrobe', roles: ['admin', 'creator'] },
+  { href: '/labels', label: 'Labels', roles: ['admin'] },
+  { href: '/qa/shoe-matrix', label: 'QA Matrix', roles: ['admin'] },
+  { href: '/admin/monitoring', label: 'Monitoring', roles: ['admin'] },
   { href: '/prompt-vault', label: 'Prompt Vault', roles: ['admin'] },
   { href: '/admin/users', label: 'Users', roles: ['admin'] },
-  { href: '/admin/learning', label: 'Learning', roles: ['admin'] },
 ];
 
 export default function Shell({ children, user }: ShellProps) {

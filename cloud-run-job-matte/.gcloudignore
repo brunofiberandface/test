@@ -1,0 +1,6 @@
+# Cloud Build upload control for the matte job.
+# Keep the upload tiny — only what the Dockerfile COPYs.
+.gcloudignore
+__pycache__/
+*.pyc
+.DS_Store

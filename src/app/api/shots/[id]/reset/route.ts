@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { shotsCol, jobsCol } from '@/lib/firestore';
+import { shotsCol, jobsCol, enqueueJob } from '@/lib/firestore';
 import { FieldValue } from '@google-cloud/firestore';
 
 /**
@@ -7,6 +7,14 @@ import { FieldValue } from '@google-cloud/firestore';
  *
  * Resets a stuck/failed shot back to 'queued' so run-all can pick it up.
  * Also ensures the parent job is set to 'generating' so run-all triggers.
+ *
+ * 2026-05-10: also re-enqueues the job into the queue/slot system. When a
+ * shot fails, `checkAndFinalizeJob` marks the job 'failed' and calls
+ * `releaseSlot` — removing the job from `system/generationQueue.slots`. A
+ * subsequent reset on a single shot would set status back to 'queued' but
+ * the worker's `getQueueState().slots` would no longer contain this job, so
+ * the rerun would silently never start. `enqueueJob` is idempotent (returns
+ * existing slot if already present) so calling it on an active job is safe.
  */
 export async function POST(
   req: NextRequest,
@@ -46,14 +54,23 @@ export async function POST(
     updateData.useDressedBase = useDressedBase === true ? true : FieldValue.delete();
     await shotsCol.doc(shotId).update(updateData);
 
-    // Ensure parent job is set to generating (so run-all will fire)
+    // Ensure parent job is set to generating + re-enqueue so the worker picks up
     if (shotData.jobId) {
+      const jobId = shotData.jobId as string;
       try {
-        await jobsCol.doc(shotData.jobId as string).update({
+        await jobsCol.doc(jobId).update({
           status: 'generating',
           updatedAt: new Date(),
         });
       } catch { /* non-blocking */ }
+
+      try {
+        const jobDoc = await jobsCol.doc(jobId).get();
+        const jobName = (jobDoc.data()?.jobName as string) || jobId;
+        await enqueueJob(jobId, jobName);
+      } catch (e) {
+        console.warn(`[ShotReset] enqueueJob failed for ${jobId} (non-blocking):`, e);
+      }
     }
 
     return NextResponse.json({ success: true, shotId, status: 'queued' });

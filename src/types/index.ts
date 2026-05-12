@@ -77,6 +77,26 @@ export interface JobWardrobe {
   bottom: { itemId: string; isFocus: boolean };
 }
 
+/**
+ * Slot name of the focus garment in a job's wardrobe. Derived from
+ * `Object.entries(wardrobe).find(([, v]) => v?.isFocus)?.[0]`.
+ *
+ * Used to branch generation logic when the focus is a top vs a bottom — e.g.
+ * skip the Gemini tee-edit pass + let Seedream paint the real focus jacket
+ * directly + crop M01/M02 upper-body when focus = 'top'.
+ */
+export type FocusSlot = 'top' | 'bottom' | 'shoe';
+
+/**
+ * Resolve the focus slot from a wardrobe (returns null if no slot is marked
+ * isFocus — legacy jobs without explicit focus selection).
+ */
+export function getFocusSlot(wardrobe: JobWardrobe | undefined | null): FocusSlot | null {
+  if (!wardrobe) return null;
+  const entry = Object.entries(wardrobe).find(([, v]) => (v as { isFocus?: boolean })?.isFocus);
+  return (entry?.[0] ?? null) as FocusSlot | null;
+}
+
 export interface Job {
   jobId: string;
   jobName: string;
@@ -102,9 +122,20 @@ export interface Job {
     back: string;
   };
 
+  // M06 pose selection — id from src/lib/m06-poses.ts (e.g. 'p07').
+  // Optional for backward compat: jobs created before the pose picker shipped
+  // have this field absent → seedreamM06 falls back to M06_DEFAULT_POSE_ID.
+  m06PoseId?: string;
+
   // M03/M04 anchor URLs (for dependency chain)
   m03AnchorUrl?: string;
   m04AnchorUrl?: string;
+  // Parallel anchors pointing at the white-bg sibling masters of M03/M04, set
+  // by /api/generate when the matte pipeline runs on the parent. M01/M02 use
+  // these to crop a white-bg variant in lockstep with the grey-bg primary.
+  // Absent on jobs that predate the matte pipeline — caller checks before use.
+  m03WhiteAnchorUrl?: string;
+  m04WhiteAnchorUrl?: string;
 
   // Image-generation backend for this job. Absent = 'gemini' (production default).
   provider?: GenerationProvider;
@@ -115,7 +146,7 @@ export interface Job {
 
 // ── Shots ──
 
-export type ShotType = 'M01' | 'M02' | 'M03' | 'M04' | 'M05';
+export type ShotType = 'M01' | 'M02' | 'M03' | 'M04' | 'M05' | 'M06';
 export type ShotStatus = 'pending' | 'queued' | 'generating' | 'done' | 'approved' | 'rejected' | 'failed';
 
 export interface Shot {
@@ -145,6 +176,13 @@ export interface Shot {
   // Per-shot provider override for one-shot reruns (e.g. "Rerun with Seedream").
   // If set, takes precedence over job.provider. Absent = use job.provider (or 'gemini').
   provider?: GenerationProvider;
+  // Backdrop variants (subject-matte pipeline). Set when /api/generate ran the
+  // rembg matte + composite step successfully. greyMasterUrl mirrors imageUrl
+  // for explicit consumption; whiteMasterUrl is the pure-white-bg deliverable.
+  // Absent on shots generated before the matte pipeline shipped, and on shots
+  // where matting failed at runtime.
+  whiteMasterUrl?: string;
+  greyMasterUrl?: string;
 }
 
 // ── Modifications ──

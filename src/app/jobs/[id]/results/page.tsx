@@ -22,6 +22,10 @@ interface ShotData {
   version: number;
   modelId?: string;
   imageUrl?: string;
+  whiteMasterUrl?: string;
+  greyMasterUrl?: string;
+  pdpUrl?: string;
+  plpUrl?: string;
   previousVersions?: PreviousVersion[];
   progressStep?: string;
   progressPct?: number;
@@ -29,6 +33,8 @@ interface ShotData {
   alternativePromptLabel?: string;
   usedDressedBase?: boolean;
   provider?: 'gemini' | 'seedream';
+  teeEditApplied?: boolean;
+  teeEditError?: string;
 }
 
 interface JobData {
@@ -42,6 +48,11 @@ interface JobData {
   modelIds?: string[];
   wardrobeItemIds?: Record<string, string>;
   wardrobeItemNames?: Record<string, string>;
+  /** Which wardrobe slot is flagged isFocus ('top' / 'bottom' / 'shoe'). Set
+   *  by GET /api/jobs/[id]. Used by UI to gate focus-aware features like the
+   *  M05 top camera variant menu. Absent on legacy jobs created before the
+   *  focus picker. */
+  focusSlot?: 'top' | 'bottom' | 'shoe';
 }
 
 const SHOT_LABELS: Record<string, string> = {
@@ -50,7 +61,42 @@ const SHOT_LABELS: Record<string, string> = {
   M03: 'Full Body Front',
   M04: 'Full Body Back',
   M05: 'Dynamic',
+  M06: 'Free Pose',
 };
+
+// Final deliverables to the brand. M03/M04 are intermediates (sources for
+// M01/M02 chest-line crops) and stay hidden behind a "show intermediates"
+// toggle in the UI.
+const DELIVERABLE_SHOT_TYPES = new Set(['M01', 'M02', 'M05', 'M06']);
+const INTERMEDIATE_SHOT_TYPES = new Set(['M03', 'M04']);
+
+/**
+ * Cache-bust GCS image URLs by appending ?t=<updatedAt>. Same shot doc keeps
+ * the same filename across regens (e.g. F10_M03_v1.png is overwritten), so
+ * browsers / GCS edge caches keep serving the stale image. Appending a token
+ * tied to updatedAt forces a fresh fetch on every regen — no UI staleness.
+ * Falls through gracefully if either arg is missing.
+ */
+function bustCache(url?: string, updatedAt?: string): string {
+  if (!url) return '';
+  if (!updatedAt) return url;
+  const sep = url.includes('?') ? '&' : '?';
+  return `${url}${sep}t=${encodeURIComponent(updatedAt)}`;
+}
+
+/**
+ * Pick the correct master URL based on the user's backdrop-toggle preference.
+ * Falls back to the primary imageUrl when the requested variant isn't available
+ * (e.g. white toggle on shots predating the matte pipeline that have no
+ * whiteMasterUrl set on their Firestore doc).
+ */
+function pickMaster(
+  shot: { imageUrl?: string; whiteMasterUrl?: string; greyMasterUrl?: string },
+  variant: 'grey' | 'white',
+): string | undefined {
+  if (variant === 'white') return shot.whiteMasterUrl || shot.imageUrl;
+  return shot.greyMasterUrl || shot.imageUrl;
+}
 
 const SHOT_VARIANT_LABELS: Record<string, Record<string, string>> = {
   M03: { A: 'Full Body Front' },
@@ -352,6 +398,11 @@ export default function ResultsPage() {
   const [loading, setLoading] = useState(true);
   const [lightboxUrl, setLightboxUrl] = useState<string | null>(null);
   const [labelPickerShotId, setLabelPickerShotId] = useState<string | null>(null);
+  const [showIntermediates, setShowIntermediates] = useState(false);
+  // Backdrop variant toggle: 'grey' = brand-spec primary master (imageUrl);
+  // 'white' = pure-white sibling (whiteMasterUrl), if available. Falls back
+  // to imageUrl gracefully for shots predating the matte pipeline.
+  const [bgVariant, setBgVariant] = useState<'grey' | 'white'>('grey');
   const [resettingLabelShotId, setResettingLabelShotId] = useState<string | null>(null);
   const [triggeringShot, setTriggeringShot] = useState<string | null>(null);
   const [queuePosition, setQueuePosition] = useState<number | null>(null);
@@ -412,6 +463,10 @@ export default function ResultsPage() {
           version: s.version || 1,
           modelId: s.modelId as string | undefined,
           imageUrl: s.imageUrl,
+          whiteMasterUrl: s.whiteMasterUrl as string | undefined,
+          greyMasterUrl: s.greyMasterUrl as string | undefined,
+          pdpUrl: s.pdpUrl as string | undefined,
+          plpUrl: s.plpUrl as string | undefined,
           previousVersions: s.previousVersions as PreviousVersion[] | undefined,
           progressStep: s.progressStep as string | undefined,
           progressPct: s.progressPct as number | undefined,
@@ -419,6 +474,8 @@ export default function ResultsPage() {
           alternativePromptLabel: s.alternativePromptLabel as string | undefined,
           usedDressedBase: s.usedDressedBase as boolean | undefined,
           provider: s.provider as 'gemini' | 'seedream' | undefined,
+          teeEditApplied: s.teeEditApplied as boolean | undefined,
+          teeEditError: s.teeEditError as string | undefined,
         }; });
         setShots(mappedShots);
 
@@ -478,6 +535,11 @@ export default function ResultsPage() {
 
   const approveShot = async (shotId: string) => {
     await fetch(`/api/shots/${shotId}/approve`, { method: 'POST' });
+    fetchData();
+  };
+
+  const unapproveShot = async (shotId: string) => {
+    await fetch(`/api/shots/${shotId}/unapprove`, { method: 'POST' });
     fetchData();
   };
 
@@ -547,6 +609,30 @@ export default function ResultsPage() {
     }
   };
 
+  /**
+   * Re-crop M01/M02 from the current parent anchor (m03AnchorUrl / m04AnchorUrl)
+   * without rerunning the parent. Cheap (~2s) — no Seedream / Gemini calls.
+   * Use when the parent shot is good but the crop is stale.
+   */
+  const recropShot = async (shot: ShotData) => {
+    if (shot.type !== 'M01' && shot.type !== 'M02') return;
+    setRerunningShotId(shot.shotId);
+    try {
+      const res = await fetch(`/api/shots/${shot.shotId}/recrop`, { method: 'POST' });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        alert(`Re-crop failed: ${data.error || res.statusText}`);
+        return;
+      }
+      fetchData();
+    } catch (e) {
+      console.error('Re-crop failed:', e);
+      alert(`Re-crop failed: ${String(e)}`);
+    } finally {
+      setRerunningShotId(null);
+    }
+  };
+
   const rerunShot = async (shot: ShotData) => {
     // M01/M02 (cropped shots): rerun full chain M03→M04→M01→M02 with dressed base
     // so foot proportions are corrected in the full-body anchors first
@@ -572,6 +658,54 @@ export default function ResultsPage() {
       fetchData();
     } catch (e) {
       console.error('Rerun failed:', e);
+    } finally {
+      setRerunningShotId(null);
+    }
+  };
+
+  /**
+   * Per-shot rerun forced through Seedream 5.0 Lite (model `seedream-5-0-260128`).
+   * Calls the dedicated endpoint which sets shot.provider='seedream' +
+   * shot.seedreamModel='seedream-5-0-260128', resets to queued, kicks the
+   * worker. Tee-edit auto-skipped (5.0 handles tucked-in tops natively).
+   *
+   * For M01/M02 (waist crops): reruns the M03/M04 anchor instead, since
+   * crops inherit from the anchor — running the crop alone wouldn't pick
+   * up a 5.0 anchor unless the parent was rerun too.
+   */
+  const rerunShotWithSeedream5 = async (shot: ShotData) => {
+    // M01 → rerun M03 with 5.0 (M01 is a crop of M03)
+    // M02 → rerun M04 with 5.0 (M02 is a crop of M04)
+    let targetShotId = shot.shotId;
+    if (shot.type === 'M01' || shot.type === 'M02') {
+      const anchorType = shot.type === 'M01' ? 'M03' : 'M04';
+      const anchor = shots.find(s => s.type === anchorType);
+      if (!anchor) {
+        alert(`Cannot find ${anchorType} anchor to rerun with 5.0`);
+        return;
+      }
+      const ok = window.confirm(
+        `${shot.label} is a crop of ${anchorType}. Rerun ${anchorType} with Seedream 5.0 instead? The crop will pick up the new anchor automatically.`,
+      );
+      if (!ok) return;
+      targetShotId = anchor.shotId;
+    }
+
+    setRerunningShotId(shot.shotId);
+    try {
+      const resp = await fetch(`/api/shots/${targetShotId}/rerun-with-seedream-5`, {
+        method: 'POST',
+      });
+      if (!resp.ok) {
+        const txt = await resp.text();
+        alert(`Rerun failed: ${txt.substring(0, 200)}`);
+        return;
+      }
+      await kickWorker();
+      fetchData();
+    } catch (e) {
+      console.error('Rerun-with-seedream-5 failed:', e);
+      alert(`Rerun failed: ${String(e)}`);
     } finally {
       setRerunningShotId(null);
     }
@@ -763,38 +897,63 @@ export default function ResultsPage() {
   return (
     <Shell user={user}>
       {/* Header */}
-      <div className="flex items-center justify-between mb-6">
-        <div>
-          <h1 className="text-2xl font-bold text-neutral-900">
-            {job?.jobName || job?.designNumber || jobId}
-          </h1>
-          <p className="text-xs text-neutral-400 mt-0.5 mb-1">{job?.designNumber}</p>
-          <p className="text-sm text-neutral-500 mt-1">
-            {approvedCount}/{shots.length} approved
-            {generating && !shots.some(s => s.progressStep) && <span className="text-amber-600 ml-2">Generating...</span>}
-            {lastRunCompleted && !generating && (
-              <span className="text-neutral-400 ml-2">· Last run: {lastRunCompleted}</span>
-            )}
-          </p>
-          {/* Wardrobe items selected for this job */}
-          {job?.wardrobeItemIds && Object.keys(job.wardrobeItemIds).length > 0 && (
-            <div className="flex items-center gap-2 mt-2 flex-wrap">
-              <span className="text-xs text-neutral-400">Outfit:</span>
-              {Object.entries(job.wardrobeItemIds).map(([cat, id]) => (
-                <span key={cat} className="text-xs px-2 py-0.5 bg-neutral-100 text-neutral-600 border border-neutral-200">
-                  {cat}: {job.wardrobeItemNames?.[cat] || id.slice(0, 6)}
-                </span>
-              ))}
+      <div className="flex items-start justify-between mb-6 gap-4">
+        <div className="flex items-start gap-4 flex-1 min-w-0">
+          {/* Original (front 0°) — focus garment fit-model reference, surfaced
+              for direct visual comparison against the AI deliverables. Hidden
+              if the focus item has no fit-model angles configured. */}
+          {(job as any)?.focusFitModelFrontUrl && (
+            <div className="flex-shrink-0">
+              <button
+                type="button"
+                onClick={() => setLightboxUrl((job as any).focusFitModelFrontUrl)}
+                className="w-40 h-56 bg-neutral-100 border border-neutral-200 overflow-hidden hover:border-neutral-400 transition-colors block cursor-zoom-in"
+                title="Click to view original at full size"
+              >
+                <img
+                  src={(job as any).focusFitModelFrontUrl}
+                  alt="Original (front 0°)"
+                  className="w-full h-full object-contain"
+                />
+              </button>
+              <p className="text-[10px] text-neutral-400 mt-1 text-center uppercase tracking-wider">Original</p>
             </div>
           )}
+          <div className="flex-1 min-w-0">
+            <h1 className="text-2xl font-bold text-neutral-900">
+              {job?.jobName || job?.designNumber || jobId}
+            </h1>
+            <p className="text-xs text-neutral-400 mt-0.5 mb-1">{job?.designNumber}</p>
+            <p className="text-sm text-neutral-500 mt-1">
+              {approvedCount}/{shots.length} approved
+              {generating && !shots.some(s => s.progressStep) && <span className="text-amber-600 ml-2">Generating...</span>}
+              {lastRunCompleted && !generating && (
+                <span className="text-neutral-400 ml-2">· Last run: {lastRunCompleted}</span>
+              )}
+            </p>
+            {/* Wardrobe items selected for this job */}
+            {job?.wardrobeItemIds && Object.keys(job.wardrobeItemIds).length > 0 && (
+              <div className="flex items-center gap-2 mt-2 flex-wrap">
+                <span className="text-xs text-neutral-400">Outfit:</span>
+                {Object.entries(job.wardrobeItemIds).map(([cat, id]) => (
+                  <span key={cat} className="text-xs px-2 py-0.5 bg-neutral-100 text-neutral-600 border border-neutral-200">
+                    {cat}: {job.wardrobeItemNames?.[cat] || id.slice(0, 6)}
+                  </span>
+                ))}
+              </div>
+            )}
+          </div>
         </div>
         <div className="flex items-center gap-2">
-          {/* Rerun with Seedream — one-shot override. Previous versions stay restorable. */}
+          {/* Rerun all shots — one-shot override. Previous versions stay restorable.
+              Provider distinction (Seedream / Gemini) hidden from UI per Bruno
+              2026-05-07. Endpoint still calls rerun-with-seedream under the
+              hood since that's the production engine. */}
           {!generating && shots.length > 0 && (
             <button
               onClick={async () => {
                 const ok = window.confirm(
-                  'Rerun all 5 with Seedream. Previous versions stay restorable. Continue?'
+                  'Rerun all shots from scratch. Previous versions stay restorable. Continue?'
                 );
                 if (!ok) return;
                 try {
@@ -812,10 +971,10 @@ export default function ResultsPage() {
                   alert(`Rerun failed: ${String(e)}`);
                 }
               }}
-              className="border border-purple-600 text-purple-700 px-4 py-2.5 text-sm font-medium hover:bg-purple-50 transition-colors"
-              title="Rerun all 5 shots with Seedream 4.5. Previous Gemini versions preserved in version history."
+              className="border border-neutral-400 text-neutral-700 px-4 py-2.5 text-sm font-medium hover:bg-neutral-50 transition-colors"
+              title="Rerun all shots from scratch. Previous versions preserved in version history."
             >
-              Rerun with Seedream
+              Rerun all shots
             </button>
           )}
           {allApproved && (
@@ -910,12 +1069,31 @@ export default function ResultsPage() {
         />
       </div>
 
-      {/* Action bar — Rerun All + Retry Stuck */}
-      <div className="flex items-center justify-end mb-4 gap-3">
-        {shots.some(s => s.status === 'generating' || s.status === 'queued' || s.status === 'failed') && (
-          <>
+      {/* Action bar — Rerun All + Retry Stuck.
+          A shot is "stuck" only if it has actually exceeded a sane upper bound
+          for how long generation should take. Pure 'queued' or 'generating' is
+          NOT stuck — those are normal in-flight states. Bruno 2026-05-07: users
+          were tempted to press Retry while a job was still healthily generating.
+          Threshold: 8 min for generating (V4 wall-time per shot is ~2-3 min, so
+          8 min is well past any healthy outcome), 15 min for queued (queues
+          can stack up but should never park this long). */}
+      {(() => {
+        const STUCK_GENERATING_MS = 8 * 60 * 1000;
+        const STUCK_QUEUED_MS = 15 * 60 * 1000;
+        const now = Date.now();
+        const stuckShots = shots.filter(s => {
+          if (s.status === 'failed') return true;
+          if (!s.updatedAt) return false;
+          const ageMs = now - new Date(s.updatedAt).getTime();
+          if (s.status === 'generating' && ageMs > STUCK_GENERATING_MS) return true;
+          if (s.status === 'queued' && ageMs > STUCK_QUEUED_MS) return true;
+          return false;
+        });
+        if (stuckShots.length === 0) return null;
+        return (
+          <div className="flex items-center justify-end mb-4 gap-3">
             <span className="text-xs text-neutral-500">
-              {shots.filter(s => s.status === 'generating' || s.status === 'queued' || s.status === 'failed').length} stuck/failed
+              {stuckShots.length} stuck/failed
             </span>
             <button
               onClick={retryAllStuck}
@@ -924,8 +1102,10 @@ export default function ResultsPage() {
             >
               {rerunning ? 'Retrying...' : 'Retry All Stuck'}
             </button>
-          </>
-        )}
+          </div>
+        );
+      })()}
+      <div className="flex items-center justify-end mb-4 gap-3">
         {shots.some(s => s.status === 'held') && !generating && (
           <button
             onClick={generateRemainingShots}
@@ -944,11 +1124,61 @@ export default function ResultsPage() {
             {rerunning ? 'Rerunning...' : 'Rerun All Shots'}
           </button>
         )}
+        {/* Deliverable zip downloads — only show if at least one deliverable shot has a pdpUrl/plpUrl */}
+        {shots.some(s => DELIVERABLE_SHOT_TYPES.has(s.type) && s.pdpUrl) && (
+          <a
+            href={`/api/jobs/${jobId}/deliverables-zip?format=pdp`}
+            className="px-4 py-2 text-xs font-medium border border-neutral-900 text-neutral-900 hover:bg-neutral-900 hover:text-white transition-colors"
+            download
+          >
+            Download ECOM PDP (.zip)
+          </a>
+        )}
+        {shots.some(s => DELIVERABLE_SHOT_TYPES.has(s.type) && s.plpUrl) && (
+          <a
+            href={`/api/jobs/${jobId}/deliverables-zip?format=plp`}
+            className="px-4 py-2 text-xs font-medium border border-neutral-900 text-neutral-900 hover:bg-neutral-900 hover:text-white transition-colors"
+            download
+          >
+            Download ECOM PLP (.zip)
+          </a>
+        )}
       </div>
 
-      {/* Shot grid — 4 columns with QC scores */}
-      <div className="grid grid-cols-4 gap-4 mb-8">
-        {shots.map(shot => (
+      {/* Backdrop toggle — switch between brand-grey master (default) and the
+          pure-white sibling. Falls back to grey for shots predating the matte
+          pipeline (no whiteMasterUrl on the doc). */}
+      {shots.some(s => s.whiteMasterUrl) && (
+        <div className="mb-3 flex items-center gap-2">
+          <span className="text-xs font-medium text-neutral-500">Backdrop:</span>
+          <div className="inline-flex border border-neutral-300">
+            <button
+              onClick={() => setBgVariant('grey')}
+              className={`px-3 py-1.5 text-xs font-medium transition-colors ${
+                bgVariant === 'grey' ? 'bg-neutral-900 text-white' : 'bg-white text-neutral-700 hover:bg-neutral-100'
+              }`}
+            >
+              Brand grey
+            </button>
+            <button
+              onClick={() => setBgVariant('white')}
+              className={`px-3 py-1.5 text-xs font-medium transition-colors border-l border-neutral-300 ${
+                bgVariant === 'white' ? 'bg-neutral-900 text-white' : 'bg-white text-neutral-700 hover:bg-neutral-100'
+              }`}
+            >
+              Pure white
+            </button>
+          </div>
+          <span className="text-[10px] text-neutral-400 ml-2">
+            Switches the visible master between #D9DAD2 and #FFFFFF (older shots stay on grey).
+          </span>
+        </div>
+      )}
+
+      {/* Deliverable shots — 4 columns. Intermediates (M03, M04) hidden by
+          default behind a toggle further down. */}
+      <div className="grid grid-cols-4 gap-4 mb-4">
+        {shots.filter(s => DELIVERABLE_SHOT_TYPES.has(s.type)).map(shot => (
           <div
             key={shot.id}
             className={`border bg-white cursor-pointer transition-all ${
@@ -960,8 +1190,9 @@ export default function ResultsPage() {
             }`}
             onClick={() => setSelectedShot(shot)}
             onDoubleClick={() => {
-              if (shot.imageUrl && (shot.status === 'done' || shot.status === 'approved')) {
-                window.open(shot.imageUrl, '_blank');
+              const url = pickMaster(shot, bgVariant);
+              if (url && (shot.status === 'done' || shot.status === 'approved')) {
+                window.open(bustCache(url, shot.updatedAt), '_blank');
               }
             }}
           >
@@ -969,12 +1200,13 @@ export default function ResultsPage() {
             <div className="aspect-[3/4] bg-neutral-100 relative overflow-hidden">
               {shot.imageUrl && (shot.status === 'done' || shot.status === 'approved') && (
                 <img
-                  src={shot.imageUrl}
+                  src={bustCache(pickMaster(shot, bgVariant), shot.updatedAt)}
                   alt={shot.label}
                   className="w-full h-full object-contain"
                   onDoubleClick={(e) => {
                     e.stopPropagation();
-                    if (shot.imageUrl) window.open(shot.imageUrl, '_blank');
+                    const url = pickMaster(shot, bgVariant);
+                    if (url) window.open(bustCache(url, shot.updatedAt), '_blank');
                   }}
                 />
               )}
@@ -1045,19 +1277,91 @@ export default function ResultsPage() {
             </div>
             <div className="p-2">
               <p className="text-xs text-neutral-600">{shot.label}</p>
-              {shot.provider === 'seedream' && (
-                <p className="text-[10px] text-purple-600 font-medium mt-0.5">Seedream</p>
-              )}
+              {/* Provider badge removed (Bruno 2026-05-07) — engine choice is hidden from UI */}
               {shot.alternativePromptLabel && (
                 <p className="text-[10px] text-blue-600 font-medium mt-0.5">{shot.alternativePromptLabel}</p>
               )}
               {shot.usedDressedBase && (
                 <p className="text-[10px] text-emerald-600 font-medium mt-0.5">Dressed Base</p>
               )}
+              {shot.teeEditApplied === false && shot.teeEditError && (
+                <p className="text-[10px] text-amber-700 font-medium mt-0.5" title={`Tee-edit failed: ${shot.teeEditError}`}>
+                  ⚠ Tee-edit skipped — sports bra visible. Rerun to retry.
+                </p>
+              )}
+              {/* Per-shot deliverable download links */}
+              {(shot.pdpUrl || shot.plpUrl) && (
+                <div className="mt-2 pt-2 border-t border-neutral-100 flex gap-2 text-[10px]">
+                  {shot.pdpUrl && (
+                    <a
+                      href={bustCache(shot.pdpUrl, shot.updatedAt)}
+                      target="_blank"
+                      rel="noopener"
+                      onClick={e => e.stopPropagation()}
+                      className="text-neutral-600 hover:text-neutral-900 underline"
+                      download
+                    >
+                      PDP
+                    </a>
+                  )}
+                  {shot.plpUrl && (
+                    <a
+                      href={bustCache(shot.plpUrl, shot.updatedAt)}
+                      target="_blank"
+                      rel="noopener"
+                      onClick={e => e.stopPropagation()}
+                      className="text-neutral-600 hover:text-neutral-900 underline"
+                      download
+                    >
+                      PLP
+                    </a>
+                  )}
+                </div>
+              )}
             </div>
           </div>
         ))}
       </div>
+
+      {/* Intermediates (M03, M04) — collapsed by default. Used as sources for
+          M01/M02 chest-line crops, not delivered to the brand. */}
+      {shots.some(s => INTERMEDIATE_SHOT_TYPES.has(s.type)) && (
+        <div className="mb-8">
+          <button
+            onClick={() => setShowIntermediates(v => !v)}
+            className="w-full text-left px-4 py-2 text-xs font-medium text-neutral-500 hover:text-neutral-900 border border-neutral-200 hover:border-neutral-400 transition-colors flex items-center gap-2"
+          >
+            <span className={`inline-block transition-transform ${showIntermediates ? 'rotate-90' : ''}`}>▸</span>
+            <span>{showIntermediates ? 'Hide' : 'Show'} intermediates (M03, M04)</span>
+            <span className="ml-auto text-[10px] text-neutral-400">
+              Sources for M01/M02 — not part of the deliverable set.
+            </span>
+          </button>
+          {showIntermediates && (
+            <div className="grid grid-cols-4 gap-4 mt-3">
+              {shots.filter(s => INTERMEDIATE_SHOT_TYPES.has(s.type)).map(shot => (
+                <div
+                  key={shot.id}
+                  className={`border bg-white cursor-pointer transition-all ${
+                    selectedShot?.id === shot.id ? 'border-neutral-900 ring-1 ring-neutral-900' : 'border-neutral-200 hover:border-neutral-400'
+                  }`}
+                  onClick={() => setSelectedShot(shot)}
+                >
+                  <div className="aspect-[3/4] bg-neutral-100 relative overflow-hidden">
+                    {shot.imageUrl && (shot.status === 'done' || shot.status === 'approved') && (
+                      <img src={bustCache(pickMaster(shot, bgVariant), shot.updatedAt)} alt={shot.label} className="w-full h-full object-contain" />
+                    )}
+                  </div>
+                  <div className="px-2 py-1.5">
+                    <p className="text-[11px] font-semibold">{shot.type}</p>
+                    <p className="text-[10px] text-neutral-500">{shot.label}</p>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Selected shot detail panel — now with QC scores alongside */}
       {selectedShot && (
@@ -1069,10 +1373,13 @@ export default function ResultsPage() {
                 {selectedShot.imageUrl ? (
                   <>
                     <img
-                      src={selectedShot.imageUrl}
+                      src={bustCache(pickMaster(selectedShot, bgVariant), selectedShot.updatedAt)}
                       alt={selectedShot.label}
                       className="w-full h-auto max-h-[600px] object-contain cursor-zoom-in"
-                      onClick={() => selectedShot.imageUrl && window.open(selectedShot.imageUrl, '_blank')}
+                      onClick={() => {
+                        const url = pickMaster(selectedShot, bgVariant);
+                        if (url) window.open(bustCache(url, selectedShot.updatedAt), '_blank');
+                      }}
                     />
                     <div className="absolute bottom-2 right-2 bg-black/60 text-white text-[10px] px-2 py-1 opacity-0 group-hover:opacity-100 transition-opacity">
                       Click for 4K view
@@ -1169,7 +1476,7 @@ export default function ResultsPage() {
                 </div>
               )}
 
-              {selectedShot.status === 'done' && (
+              {(selectedShot.status === 'done' || selectedShot.status === 'approved') && (
                 <>
                   {/* Version History */}
                   {selectedShot.previousVersions && selectedShot.previousVersions.length > 0 && (
@@ -1182,10 +1489,10 @@ export default function ResultsPage() {
                             className="flex-shrink-0 group text-center"
                           >
                             <img
-                              src={pv.imageUrl}
+                              src={bustCache(pv.imageUrl, pv.createdAt)}
                               alt={`v${pv.version}`}
                               className="w-16 h-20 object-cover object-top border border-neutral-200 group-hover:border-neutral-400 transition-colors cursor-pointer"
-                              onClick={() => window.open(pv.imageUrl, '_blank')}
+                              onClick={() => window.open(bustCache(pv.imageUrl, pv.createdAt), '_blank')}
                             />
                             <p className="text-[9px] text-neutral-400 mt-0.5">v{pv.version}</p>
                             <button
@@ -1201,26 +1508,48 @@ export default function ResultsPage() {
                     </div>
                   )}
 
-                  <div className="flex gap-3">
-                    <button
-                      onClick={() => approveShot(selectedShot.shotId)}
-                      className="bg-neutral-900 text-white px-6 py-2.5 text-sm font-medium hover:bg-neutral-800 transition-colors"
-                    >
-                      Approve Shot
-                    </button>
+                  <div className="flex gap-3 flex-wrap">
+                    {selectedShot.status === 'approved' ? (
+                      <button
+                        onClick={() => unapproveShot(selectedShot.shotId)}
+                        className="border-2 border-neutral-900 text-neutral-900 bg-white px-6 py-2.5 text-sm font-medium hover:bg-neutral-50 transition-colors"
+                      >
+                        Unapprove
+                      </button>
+                    ) : (
+                      <button
+                        onClick={() => approveShot(selectedShot.shotId)}
+                        className="bg-neutral-900 text-white px-6 py-2.5 text-sm font-medium hover:bg-neutral-800 transition-colors"
+                      >
+                        Approve Shot
+                      </button>
+                    )}
+                    {/* M01/M02 get a fast "re-crop from current parent anchor" button — no Seedream gen */}
+                    {(selectedShot.type === 'M01' || selectedShot.type === 'M02') && (
+                      <button
+                        onClick={() => recropShot(selectedShot)}
+                        disabled={rerunningShotId === selectedShot.shotId}
+                        className="border border-emerald-500 bg-emerald-50 px-6 py-2.5 text-sm font-medium text-emerald-700 hover:bg-emerald-100 transition-colors disabled:opacity-50"
+                        title={`Re-pulls the current ${selectedShot.type === 'M01' ? 'M03' : 'M04'} anchor and re-crops this shot. ${selectedShot.type === 'M01' ? 'M03' : 'M04'} is NOT rerun. ~2s.`}
+                      >
+                        {rerunningShotId === selectedShot.shotId ? 'Queueing…' : `Re-crop from ${selectedShot.type === 'M01' ? 'M03' : 'M04'}`}
+                      </button>
+                    )}
                     <button
                       onClick={() => rerunShot(selectedShot)}
                       disabled={rerunningShotId === selectedShot.shotId}
                       className="border border-neutral-300 px-6 py-2.5 text-sm font-medium text-neutral-600 hover:bg-neutral-50 transition-colors disabled:opacity-50"
+                      title={(selectedShot.type === 'M01' || selectedShot.type === 'M02') ? 'Re-runs M03 + M04 + M01 + M02 from scratch. Use this only when the parent anchor needs to change.' : 'Re-runs this shot from scratch.'}
                     >
-                      {rerunningShotId === selectedShot.shotId ? 'Queueing...' : (selectedShot.type === 'M01' || selectedShot.type === 'M02') ? 'Re-run M03→M04→M01→M02' : 'Re-run This Shot'}
+                      {rerunningShotId === selectedShot.shotId ? 'Queueing…' : (selectedShot.type === 'M01' || selectedShot.type === 'M02') ? 'Re-run full chain (M03+M04+M01+M02)' : 'Re-run This Shot'}
                     </button>
                   </div>
 
-                  {/* Info text for M01/M02 chain rerun */}
+                  {/* Info text for M01/M02 button options */}
                   {(selectedShot.type === 'M01' || selectedShot.type === 'M02') && (
-                    <p className="text-[10px] text-neutral-400 -mt-2">
-                      Re-runs full chain with foot correction. M05 stays untouched.
+                    <p className="text-[10px] text-neutral-400 -mt-2 leading-relaxed">
+                      <span className="text-emerald-700 font-medium">Re-crop</span>: fast (~2s), uses current {selectedShot.type === 'M01' ? 'M03' : 'M04'} anchor. Use when {selectedShot.type === 'M01' ? 'M03' : 'M04'} is good but this crop is stale.<br />
+                      <span className="text-neutral-600 font-medium">Re-run full chain</span>: re-generates M03 + M04 + M01 + M02 from scratch. M05 stays untouched.
                     </p>
                   )}
 
@@ -1248,8 +1577,104 @@ export default function ResultsPage() {
                     </div>
                   )}
 
+                  {/* M05 top-focus camera variant menu — top-focus jobs only */}
+                  {selectedShot.type === 'M05' && job?.focusSlot === 'top' && selectedShot.imageUrl && (
+                    <div className="border-t border-neutral-200 pt-4">
+                      <label className="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-2">
+                        Camera angle
+                      </label>
+                      <p className="text-[11px] text-neutral-500 mb-2">
+                        Pick a different shoulder angle. New version saved alongside the current one.
+                      </p>
+                      <div className="flex gap-2">
+                        {[
+                          { id: 'A', label: 'A — Side (90°)' },
+                          { id: 'B', label: 'B — Over-shoulder (135°)' },
+                          { id: 'C', label: 'C — Front 3/4 (45°)' },
+                        ].map(v => (
+                          <button
+                            key={v.id}
+                            onClick={async () => {
+                              try {
+                                const resp = await fetch(`/api/shots/${selectedShot.shotId}/rerun-with-m05-variant`, {
+                                  method: 'POST',
+                                  headers: { 'Content-Type': 'application/json' },
+                                  body: JSON.stringify({ variantId: v.id }),
+                                });
+                                if (resp.ok) {
+                                  // Refetch shots so the UI shows "Generating"
+                                  await fetch(`/api/jobs/${jobId}`).then(r => r.json()).then(d => {
+                                    if (d.shots) setShots(d.shots);
+                                  });
+                                } else {
+                                  const err = await resp.text();
+                                  alert(`Rerun failed: ${err.slice(0, 200)}`);
+                                }
+                              } catch (e) {
+                                alert(`Rerun failed: ${e instanceof Error ? e.message : String(e)}`);
+                              }
+                            }}
+                            className="border border-neutral-300 px-3 py-1.5 text-xs font-medium text-neutral-700 hover:bg-neutral-50 transition-colors"
+                          >
+                            {v.label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* M06 top-focus pose variant menu — top-focus jobs only.
+                      5 stances from "tops women.pdf" slide 2 (POSE TOPS /
+                      RELAXED FEMININE MOVEMENT — STRAIGHT FRONT POSE).
+                      Mirrors the M05 Camera-angle menu above. */}
+                  {selectedShot.type === 'M06' && job?.focusSlot === 'top' && selectedShot.imageUrl && (
+                    <div className="border-t border-neutral-200 pt-4">
+                      <label className="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-2">
+                        Pose variant
+                      </label>
+                      <p className="text-[11px] text-neutral-500 mb-2">
+                        Pick a different stand from the tops-women brief. New version saved alongside the current one.
+                      </p>
+                      <div className="flex flex-wrap gap-2">
+                        {[
+                          { id: 't01', label: 't01 — Hands at sides' },
+                          { id: 't02', label: 't02 — Relaxed asymmetric' },
+                          { id: 't03', label: 't03 — Both hands pockets' },
+                          { id: 't04', label: 't04 — One hand pocket' },
+                          { id: 't05', label: 't05 — Pockets relaxed' },
+                        ].map(p => (
+                          <button
+                            key={p.id}
+                            onClick={async () => {
+                              try {
+                                const resp = await fetch(`/api/shots/${selectedShot.shotId}/rerun-with-m06-top-pose`, {
+                                  method: 'POST',
+                                  headers: { 'Content-Type': 'application/json' },
+                                  body: JSON.stringify({ poseId: p.id }),
+                                });
+                                if (resp.ok) {
+                                  await fetch(`/api/jobs/${jobId}`).then(r => r.json()).then(d => {
+                                    if (d.shots) setShots(d.shots);
+                                  });
+                                } else {
+                                  const err = await resp.text();
+                                  alert(`Rerun failed: ${err.slice(0, 200)}`);
+                                }
+                              } catch (e) {
+                                alert(`Rerun failed: ${e instanceof Error ? e.message : String(e)}`);
+                              }
+                            }}
+                            className="border border-neutral-300 px-3 py-1.5 text-xs font-medium text-neutral-700 hover:bg-neutral-50 transition-colors"
+                          >
+                            {p.label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
                   {/* Leather label manual mapping — M02/M04 only */}
-                  {(selectedShot.type === 'M02' || selectedShot.type === 'M04') && selectedShot.imageUrl && (
+                  {(selectedShot.type === 'M02' || selectedShot.type === 'M04' || selectedShot.type === 'M05') && selectedShot.imageUrl && (
                     <div className="border-t border-neutral-200 pt-4">
                       <label className="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-2">
                         Leather label
@@ -1296,6 +1721,11 @@ export default function ResultsPage() {
                     </div>
                   )}
 
+                  {/* Per-shot "Rerun with Seedream 5.0" section removed (Bruno
+                      2026-05-07) — engine choice hidden from UI. The standard
+                      "Re-run This Shot" button above already handles per-shot
+                      reruns through the production engine. */}
+
                   <div className="border-t border-neutral-200 pt-4">
                     <label className="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-1.5">
                       Modification Instructions (optional)
@@ -1332,8 +1762,8 @@ export default function ResultsPage() {
           </div>
         </div>
       )}
-      {/* Comment Thread */}
-      <CommentThread jobId={jobId} shots={shots} user={user} />
+      {/* Comment Thread temporarily removed — feature not used. Component
+          definition is also removed; restore from git history if needed. */}
 
       {/* 2K Lightbox overlay */}
       {lightboxUrl && (
@@ -1344,12 +1774,12 @@ export default function ResultsPage() {
       {labelPickerShotId && (() => {
         const shot = shots.find(s => s.shotId === labelPickerShotId);
         if (!shot || !shot.imageUrl) return null;
-        if (shot.type !== 'M02' && shot.type !== 'M04') return null;
+        if (shot.type !== 'M02' && shot.type !== 'M04' && shot.type !== 'M05') return null;
         return (
           <LabelCornerPicker
-            imageUrl={shot.imageUrl}
+            imageUrl={bustCache(shot.imageUrl, shot.updatedAt)}
             shotId={shot.shotId}
-            shotType={shot.type as 'M02' | 'M04'}
+            shotType={shot.type as 'M02' | 'M04' | 'M05'}
             onClose={() => setLabelPickerShotId(null)}
             onApplied={() => {
               setLabelPickerShotId(null);

@@ -5,6 +5,8 @@ import { Suspense } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { useSession } from 'next-auth/react';
 import Shell from '@/components/Shell';
+import { parseGarmentDisplay, styleCodeLabel } from '@/lib/garment-display';
+import { M06_POSES, M06_DEFAULT_POSE_ID } from '@/lib/m06-poses';
 
 interface WardrobeItem {
   id: string;
@@ -64,13 +66,19 @@ function NewJobContent() {
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState('');
   const [stylingNotes, setStylingNotes] = useState('');
-  const [provider, setProvider] = useState<'gemini' | 'seedream'>('gemini');
+  // Provider selector removed from UI (Bruno 2026-05-07) — Seedream is the
+  // production engine. Gemini path stays available via the API for any
+  // future backend-only use, but users no longer choose.
+  const provider: 'seedream' = 'seedream';
 
   // Wardrobe selections — one item per slot
   const [selections, setSelections] = useState<Record<SlotKey, string | null>>({
     shoe: null, top: null, bottom: null,
   });
   const [focusSlot, setFocusSlot] = useState<SlotKey | null>(null);
+
+  // M06 pose — defaults to library default. User picks in step 4.
+  const [m06PoseId, setM06PoseId] = useState<string>(M06_DEFAULT_POSE_ID);
 
   // Model selection
   const [selectedModelId, setSelectedModelId] = useState<string | null>(
@@ -140,7 +148,8 @@ function NewJobContent() {
     { n: 1, label: 'Model' },
     { n: 2, label: 'Outfit' },
     { n: 3, label: 'Focus' },
-    { n: 4, label: 'Review' },
+    { n: 4, label: 'Pose' },
+    { n: 5, label: 'Review' },
   ];
 
   return (
@@ -165,7 +174,7 @@ function NewJobContent() {
               >
                 {s.label}
               </span>
-              {s.n < 4 && <div className="w-8 h-px bg-neutral-200 mx-1" />}
+              {s.n < 5 && <div className="w-8 h-px bg-neutral-200 mx-1" />}
             </div>
           ))}
         </div>
@@ -288,7 +297,15 @@ function NewJobContent() {
                             </div>
                             <div className="flex-1 min-w-0">
                               <p className="text-[10px] text-neutral-400 uppercase">{slot.label}</p>
-                              <p className="text-xs font-medium text-neutral-900 truncate">{item.designNumber || item.name}</p>
+                              {(() => {
+                                const d = parseGarmentDisplay(item);
+                                return (
+                                  <>
+                                    <p className="text-xs font-medium text-neutral-900 truncate">{d.designNumber || '—'}</p>
+                                    <p className="text-[10px] text-neutral-500 truncate">{d.designName}</p>
+                                  </>
+                                );
+                              })()}
                             </div>
                             <button
                               type="button"
@@ -358,11 +375,11 @@ function NewJobContent() {
                                 <select
                                   value={activeCode}
                                   onChange={(e) => setSlotStyleCode(prev => ({ ...prev, [slot.key]: e.target.value }))}
-                                  className="px-2 py-1 text-xs border border-neutral-300 bg-white text-neutral-700 hover:border-neutral-400 focus:outline-none focus:border-neutral-900"
+                                  className="px-2 py-1 text-xs border border-neutral-300 bg-white text-neutral-700 hover:border-neutral-400 focus:outline-none focus:border-neutral-900 max-w-[260px]"
                                 >
                                   <option value="all">All ({slotStyleCodes.length})</option>
                                   {slotStyleCodes.map(code => (
-                                    <option key={code} value={code}>{code}</option>
+                                    <option key={code} value={code}>{styleCodeLabel(code, [...allGenderItems, ...allUnisexItems])}</option>
                                   ))}
                                 </select>
                               </div>
@@ -404,7 +421,15 @@ function NewJobContent() {
                                           )}
                                         </div>
                                         <div className="p-1.5">
-                                          <p className="text-xs font-medium text-neutral-900 truncate">{item.designNumber || item.name}</p>
+                                          {(() => {
+                                            const d = parseGarmentDisplay(item);
+                                            return (
+                                              <>
+                                                <p className="text-xs font-medium text-neutral-900 truncate">{d.designNumber || '—'}</p>
+                                                <p className="text-[10px] text-neutral-600 truncate">{d.designName}</p>
+                                              </>
+                                            );
+                                          })()}
                                         </div>
                                       </button>
                                     );
@@ -456,7 +481,15 @@ function NewJobContent() {
                                               </div>
                                             </div>
                                             <div className="p-1.5">
-                                              <p className="text-xs font-medium text-neutral-900 truncate">{item.designNumber || item.name}</p>
+                                              {(() => {
+                                                const d = parseGarmentDisplay(item);
+                                                return (
+                                                  <>
+                                                    <p className="text-xs font-medium text-neutral-900 truncate">{d.designNumber || '—'}</p>
+                                                    <p className="text-[10px] text-neutral-600 truncate">{d.designName}</p>
+                                                  </>
+                                                );
+                                              })()}
                                             </div>
                                           </button>
                                         );
@@ -479,6 +512,15 @@ function NewJobContent() {
                   </div>
                 )}
 
+                {/* Missing-slot warning — Bruno 2026-05-07: jobs were slipping
+                    through with one or more empty slots. Now we name the
+                    missing slot(s) explicitly and block Continue. */}
+                {filledSlots < 3 && (
+                  <div className="border border-red-300 bg-red-50 px-4 py-3 text-sm text-red-700">
+                    <strong>Select an item for every slot.</strong> Missing:{' '}
+                    {SLOTS.filter(s => !selections[s.key]).map(s => s.label).join(', ')}.
+                  </div>
+                )}
                 <div className="flex gap-3">
                   <button onClick={() => setStep(1)} className="border border-neutral-300 px-6 py-2.5 text-sm font-medium text-neutral-600 hover:bg-neutral-50">
                     Back
@@ -488,7 +530,9 @@ function NewJobContent() {
                     disabled={filledSlots < 3}
                     className="bg-neutral-900 text-white px-6 py-2.5 text-sm font-medium hover:bg-neutral-800 transition-colors disabled:opacity-30"
                   >
-                    Continue ({filledSlots}/3 selected)
+                    {filledSlots < 3
+                      ? `Pick ${3 - filledSlots} more to continue`
+                      : 'Continue (3/3 selected)'}
                   </button>
                 </div>
               </div>
@@ -534,7 +578,15 @@ function NewJobContent() {
                       )}
                     </div>
                     <p className="text-xs font-medium text-neutral-500 uppercase tracking-wider">{slot.label}</p>
-                    <p className="text-sm font-medium text-neutral-900 truncate">{item.designNumber || item.name}</p>
+                    {(() => {
+                      const d = parseGarmentDisplay(item);
+                      return (
+                        <>
+                          <p className="text-sm font-medium text-neutral-900 truncate">{d.designNumber || '—'}</p>
+                          <p className="text-xs text-neutral-600 truncate">{d.designName}</p>
+                        </>
+                      );
+                    })()}
                     {isFocus && (
                       <span className="inline-block mt-2 px-2 py-0.5 bg-green-600 text-white text-[10px] uppercase font-medium">
                         Focus
@@ -570,8 +622,66 @@ function NewJobContent() {
           </div>
         )}
 
-        {/* Step 4: Review & Submit */}
+        {/* Step 4: Choose M06 Pose */}
         {step === 4 && (
+          <div className="space-y-6">
+            <div>
+              <h2 className="text-xl font-bold text-neutral-900">Choose M06 Pose</h2>
+              <p className="text-sm text-neutral-500 mt-1">
+                M06 is the editorial / lifestyle shot. Pick the pose archetype below — the AI model will be rendered in this stance for M06. The other shots (M01–M05) are unaffected.
+              </p>
+            </div>
+
+            <div className="grid grid-cols-3 sm:grid-cols-4 lg:grid-cols-6 gap-3">
+              {M06_POSES.filter(p => !p.hidden).map(pose => {
+                const isSelected = m06PoseId === pose.id;
+                return (
+                  <button
+                    key={pose.id}
+                    type="button"
+                    onClick={() => setM06PoseId(pose.id)}
+                    className={`border-2 p-2 text-left transition-all ${
+                      isSelected
+                        ? 'border-green-600 bg-green-50 ring-1 ring-green-600'
+                        : 'border-neutral-200 hover:border-neutral-400'
+                    }`}
+                  >
+                    <div className="bg-neutral-50 overflow-hidden mb-1.5" style={{ height: 200 }}>
+                      <img
+                        src={pose.thumbnailUrl}
+                        alt={pose.label}
+                        className="w-full h-full object-contain"
+                        loading="lazy"
+                      />
+                    </div>
+                    <p className="text-[10px] font-medium text-neutral-400 uppercase tracking-wider">{pose.id.toUpperCase()}</p>
+                    <p className="text-xs font-medium text-neutral-900 leading-tight">{pose.label}</p>
+                    {isSelected && (
+                      <span className="inline-block mt-1 px-1.5 py-0.5 bg-green-600 text-white text-[9px] uppercase font-medium">
+                        Selected
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+
+            <div className="flex gap-3">
+              <button onClick={() => setStep(3)} className="border border-neutral-300 px-6 py-2.5 text-sm font-medium text-neutral-600 hover:bg-neutral-50">
+                Back
+              </button>
+              <button
+                onClick={() => setStep(5)}
+                className="bg-neutral-900 text-white px-6 py-2.5 text-sm font-medium hover:bg-neutral-800 transition-colors"
+              >
+                Continue
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Step 5: Review & Submit */}
+        {step === 5 && (
           <div className="space-y-6">
             <h2 className="text-xl font-bold text-neutral-900">Review & Generate</h2>
 
@@ -594,7 +704,15 @@ function NewJobContent() {
                           {item.thumbnailUrl && <img src={item.thumbnailUrl} alt={item.name} className="w-full h-full object-cover" />}
                         </div>
                         <p className="text-[10px] text-neutral-500 uppercase">{slot.label}</p>
-                        <p className="text-xs font-medium text-neutral-900 truncate">{item.designNumber || item.name}</p>
+                        {(() => {
+                          const d = parseGarmentDisplay(item);
+                          return (
+                            <>
+                              <p className="text-xs font-medium text-neutral-900 truncate">{d.designNumber || '—'}</p>
+                              <p className="text-[10px] text-neutral-600 truncate">{d.designName}</p>
+                            </>
+                          );
+                        })()}
                         {isFocus && <span className="text-[9px] text-green-600 font-medium uppercase">Focus</span>}
                       </div>
                     );
@@ -604,7 +722,16 @@ function NewJobContent() {
 
               <div className="px-5 py-3 flex justify-between">
                 <span className="text-sm text-neutral-500">Shots</span>
-                <span className="text-sm font-medium text-neutral-900">5 shots (M03 → M04 → M01 + M02 → M05)</span>
+                <span className="text-sm font-medium text-neutral-900">6 shots — M03 + M04 + M06 in parallel; M01, M02, M05 follow</span>
+              </div>
+              <div className="px-5 py-3 flex justify-between">
+                <span className="text-sm text-neutral-500">M06 Pose</span>
+                <span className="text-sm font-medium text-neutral-900">
+                  {(() => {
+                    const p = M06_POSES.find(x => x.id === m06PoseId);
+                    return p ? `${p.id.toUpperCase()} — ${p.label}` : '—';
+                  })()}
+                </span>
               </div>
               <div className="px-5 py-3 flex justify-between">
                 <span className="text-sm text-neutral-500">Est. Time</span>
@@ -626,45 +753,8 @@ function NewJobContent() {
               />
             </div>
 
-            {/* Provider selection */}
-            <div>
-              <label className="block text-xs font-medium text-neutral-500 uppercase tracking-wider mb-1.5">
-                Generation engine
-              </label>
-              <div className="flex gap-4">
-                <label className={`flex-1 flex items-start gap-3 border px-4 py-3 cursor-pointer ${provider === 'gemini' ? 'border-neutral-900 bg-neutral-50' : 'border-neutral-300'}`}>
-                  <input
-                    type="radio"
-                    name="provider"
-                    value="gemini"
-                    checked={provider === 'gemini'}
-                    onChange={() => setProvider('gemini')}
-                    className="mt-0.5"
-                  />
-                  <div>
-                    <div className="text-sm font-medium text-neutral-900">Run with Gemini</div>
-                    <div className="text-xs text-neutral-500">Production default — two-phase pipeline with dressed base</div>
-                  </div>
-                </label>
-                <label className={`flex-1 flex items-start gap-3 border px-4 py-3 cursor-pointer ${provider === 'seedream' ? 'border-neutral-900 bg-neutral-50' : 'border-neutral-300'}`}>
-                  <input
-                    type="radio"
-                    name="provider"
-                    value="seedream"
-                    checked={provider === 'seedream'}
-                    onChange={() => setProvider('seedream')}
-                    className="mt-0.5"
-                  />
-                  <div>
-                    <div className="text-sm font-medium text-neutral-900">Run with Seedream 4.5</div>
-                    <div className="text-xs text-neutral-500">BytePlus single-pass — same prompts, no dressed base</div>
-                  </div>
-                </label>
-              </div>
-            </div>
-
             <div className="flex gap-3 flex-wrap">
-              <button onClick={() => setStep(3)} className="border border-neutral-300 px-6 py-2.5 text-sm font-medium text-neutral-600 hover:bg-neutral-50">
+              <button onClick={() => setStep(4)} className="border border-neutral-300 px-6 py-2.5 text-sm font-medium text-neutral-600 hover:bg-neutral-50">
                 Back
               </button>
               <button
@@ -690,6 +780,7 @@ function NewJobContent() {
                         wardrobe,
                         stylingNotes: stylingNotes.trim() || undefined,
                         provider,
+                        m06PoseId,
                       }),
                     });
 

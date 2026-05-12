@@ -27,7 +27,22 @@ Cover ALL of the following in your description:
 
 4. VOLUME & DRAPE: How does the fabric hang? Is it structured or flowing? Does it billow out? Are there folds or creases from excess fabric?
 
-5. HEM-TO-FLOOR RELATIONSHIP: Does the hem touch the floor? Pool on the shoe? Sit above the ankle? Be very specific about what you see in the fit model images.
+5. HEM-TO-GROUND RELATIONSHIP — write this as TWO parts in the same paragraph, clearly labelled.
+
+PART A (observed): The fit model is barefoot or in socks. Describe the hem position in concrete ground-relative terms — exactly what you see in the photos. Use phrasings like:
+  • "ends at the ankle bone with no excess length"
+  • "ends mid-foot, covering the upper foot"
+  • "extends to the floor with visible fabric piling in soft folds"
+  • "extends past the foot with deep fabric pile resting on the ground"
+  • "cuffed/rolled at the ankle, with the cuff sitting at mid-ankle height"
+  • "ends mid-shin or mid-calf, exposing the ankle (cropped style)"
+
+PART B (production translation): In the production render the model wears sneakers, which raise the foot ~3 cm above the floor. State explicitly what the hem-to-ground relationship should be in the production render with shoes — derive it from PART A:
+  • If PART A is floor-length / cascading: the production hem is rendered slightly LONGER than the barefoot reference so the fabric still rests on the floor and pools over the shoes. "In production, the hem extends past the shoes to rest on the floor with visible fabric pooling."
+  • If PART A is cuffed / cropped / above-the-ankle: the hem stays above the shoe regardless of footwear. "In production, the hem stays at the same body-relative position as the barefoot reference — above/around the ankle, with the entire shoe visible below."
+  • If PART A is mid-foot / partial-shoe-cover: the production hem extends slightly more than the barefoot reference so the foot coverage stays similar with shoes added. "In production, the hem covers a similar portion of the foot, adjusted for the added shoe height."
+
+Match the SHAPE exactly from the references; adjust LENGTH only as needed to maintain the observed ground relationship when shoes are on the foot. The fit-model photos are the SOURCE OF TRUTH for SHAPE and FIT, not for absolute hem height with shoes.
 
 6. WAIST FIT: Is the waist fitted, loose, sitting on the hips, or high-waisted?
 
@@ -51,7 +66,22 @@ Cover ALL of the following in your description:
 
 4. VOLUME & DRAPE: How does the fabric hang? Is it structured or flowing? Does it billow out? Are there folds or creases from excess fabric?
 
-5. HEM-TO-FLOOR RELATIONSHIP: Does the hem touch the floor? Pool on the shoe? Sit above the ankle? Be very specific about what you see in the fit model images.
+5. HEM-TO-GROUND RELATIONSHIP — write this as TWO parts in the same paragraph, clearly labelled.
+
+PART A (observed): The fit model is barefoot or in socks. Describe the hem position in concrete ground-relative terms — exactly what you see in the photos. Use phrasings like:
+  • "ends at the ankle bone with no excess length"
+  • "ends mid-foot, covering the upper foot"
+  • "extends to the floor with visible fabric piling in soft folds"
+  • "extends past the foot with deep fabric pile resting on the ground"
+  • "cuffed/rolled at the ankle, with the cuff sitting at mid-ankle height"
+  • "ends mid-shin or mid-calf, exposing the ankle (cropped style)"
+
+PART B (production translation): In the production render the model wears sneakers, which raise the foot ~3 cm above the floor. State explicitly what the hem-to-ground relationship should be in the production render with shoes — derive it from PART A:
+  • If PART A is floor-length / cascading: the production hem is rendered slightly LONGER than the barefoot reference so the fabric still rests on the floor and pools over the shoes. "In production, the hem extends past the shoes to rest on the floor with visible fabric pooling."
+  • If PART A is cuffed / cropped / above-the-ankle: the hem stays above the shoe regardless of footwear. "In production, the hem stays at the same body-relative position as the barefoot reference — above/around the ankle, with the entire shoe visible below."
+  • If PART A is mid-foot / partial-shoe-cover: the production hem extends slightly more than the barefoot reference so the foot coverage stays similar with shoes added. "In production, the hem covers a similar portion of the foot, adjusted for the added shoe height."
+
+Match the SHAPE exactly from the references; adjust LENGTH only as needed to maintain the observed ground relationship when shoes are on the foot. The fit-model photos are the SOURCE OF TRUTH for SHAPE and FIT, not for absolute hem height with shoes.
 
 6. WAIST FIT: Is the waist fitted, loose, sitting on the hips, or high-waisted?
 

@@ -238,6 +238,45 @@ export async function generateImage(params: GenerateImageParams): Promise<Genera
 }
 
 /**
+ * Generate a model card image from text-only description (no identity anchor).
+ *
+ * Used by /api/models/generate-card and the /models/new flow to create the FIRST
+ * reference image for a brand-new model before any photo has been uploaded. Every
+ * existing model in the system was originally created via this path (the endpoint
+ * was deleted in d2cb22c on April 4, 2026 and restored on May 10, 2026 — Bruno's
+ * F999 test surfaced that the v2 architecture had no from-description path).
+ * Returns base64-encoded PNG so the UI can preview before saving.
+ *
+ * 2026-05-10 (post-restore): produces v2-styled output via
+ * MODEL_REF_PROMPT_FRONT_FROM_DESCRIPTION — sports bra (women) / bare torso
+ * (men) + black compression shorts on the seamless infinity cove backdrop,
+ * matching every other model card in the system. Initial restore used the v1
+ * styling from git history but Bruno's first test rendered with a white tank
+ * top instead of the expected black sports bra; the cards in production had
+ * all been regenerated to v2 long ago via `regenerate-refs`. New generation
+ * now matches the existing roster out of the box, no follow-up regenerate needed.
+ */
+export async function generateModelCard(description: string, gender: 'male' | 'female'): Promise<string | null> {
+  // Lazy import to avoid circular dep with model-ref-prompts.ts (which doesn't
+  // import vertex.ts today, but keeps the dependency direction clean if it ever does).
+  const { MODEL_REF_PROMPT_FRONT_FROM_DESCRIPTION } = await import('@/lib/pipeline/model-ref-prompts');
+  const prompt = MODEL_REF_PROMPT_FRONT_FROM_DESCRIPTION(gender, description);
+
+  try {
+    const result = await generateImage({
+      prompt,
+      aspectRatio: '3:4',  // 3:4 prevents head cutoff — 9:16 was too narrow, forcing zoom-in
+      imageSize: '2K',
+    });
+
+    return result.imageData.toString('base64');
+  } catch (error) {
+    console.error('Error generating model card:', error);
+    return null;
+  }
+}
+
+/**
  * Run text analysis via Flash Lite (silhouette analysis, etc.)
  * Returns plain text response.
  */

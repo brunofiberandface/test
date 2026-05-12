@@ -1,7 +1,13 @@
 FROM node:20-slim AS base
 
-# Hybrid leather-label pipeline — needs Python3 + OpenCV (cv2) + numpy
-# in the final runner stage. See src/lib/label-hybrid.ts and scripts/label_hybrid.py.
+# Hybrid leather-label pipeline needs Python3 + cv2 + numpy in the final runner
+# stage. See src/lib/label-hybrid.ts → scripts/label_hybrid.py.
+#
+# Subject-matte pipeline (src/lib/subject-matte.ts) runs OUTSIDE this image —
+# it triggers a separate Cloud Run Job (subject-matte-job) over GCS handoff.
+# That keeps rembg + onnxruntime out of this image (saves ~300MB) and avoids
+# the silent CPU-throttling-during-await hangs documented in LEARNINGS #77/#78.
+# The Job's source lives in cloud-run-job-matte/.
 
 # Install dependencies only
 FROM base AS deps
@@ -34,10 +40,14 @@ WORKDIR /app
 ENV NODE_ENV=production
 ENV PORT=8080
 
-# Python + OpenCV runtime for scripts/label_hybrid.py
-# libgl1 and libglib2.0-0 are the two shared libs opencv-python-headless loads at import
-# libvips42 is needed at runtime because sharp is used in the pipeline (foot-resize,
-# dressed-base-pipeline, image-prep, skin-tone, pocket-detector, wardrobe/image-action)
+# Python + OpenCV + rembg runtime
+#  - scripts/label_hybrid.py needs cv2 + numpy
+#  - scripts/subject_matte.py needs rembg (U²-Net + ONNX) + Pillow + numpy
+# libgl1 + libglib2.0-0 are the shared libs opencv-python-headless loads at import.
+# libvips42 is sharp's native dep (used by foot-resize, dressed-base-pipeline, image-prep).
+# rembg pulls onnxruntime; numba<0.60 + coverage==7.4.4 pins are mandatory — newer
+# coverage breaks the numba/coverage_support module that rembg's onnx pipeline imports.
+# First call to subject_matte.py downloads U²-Net (~170MB) into ~/.u2net at runtime.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         python3 \
@@ -56,7 +66,8 @@ COPY --from=builder /app/public ./public
 COPY --from=builder /app/.next/standalone ./
 COPY --from=builder /app/.next/static ./.next/static
 
-# Copy Python scripts — consumed by src/lib/label-hybrid.ts via child_process.execFile
+# Copy Python scripts — consumed by src/lib/label-hybrid.ts and src/lib/subject-matte.ts
+# via child_process.execFile. .gcloudignore + .dockerignore must NOT exclude scripts/.
 COPY --from=builder /app/scripts ./scripts
 
 EXPOSE 8080

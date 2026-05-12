@@ -14,12 +14,10 @@
  * before writing the new one).
  */
 import { NextRequest } from 'next/server';
+import { FieldValue } from '@google-cloud/firestore';
 import { getJob, listShots, shotsCol, enqueueJob, updateJobStatus } from '@/lib/firestore';
+import { triggerWorker } from '@/lib/worker/trigger';
 
-function getInternalBase(): string {
-  const port = process.env.PORT || '3000';
-  return `http://localhost:${port}`;
-}
 
 export async function POST(
   req: NextRequest,
@@ -46,11 +44,18 @@ export async function POST(
   // Flag every shot for Seedream + reset to pending so the worker picks them up.
   // We intentionally do NOT clear imageUrl — the existing generate route moves
   // the current imageUrl into previousVersions[] on successful rerun.
+  //
+  // CRITICAL: clear `seedreamModel` field with FieldValue.delete() so this rerun
+  // falls back to the global SEEDREAM_MODEL env var default (4.5). Without
+  // this, a shot previously set to 5.0 by the per-shot rerun would stay on 5.0
+  // even after a "Rerun with Seedream 4.5" — the per-shot field wins precedence
+  // over the env var in generate/route.ts.
   const batch = (await import('@/lib/firestore')).db.batch();
   for (const shot of shots) {
     const ref = shotsCol.doc(shot.id);
     batch.update(ref, {
       provider: 'seedream',
+      seedreamModel: FieldValue.delete(),  // force fallback to 4.5 default
       status: 'pending',
       progressStep: '',
       progressPct: 0,
@@ -70,10 +75,7 @@ export async function POST(
   const result = await enqueueJob(jobId, jobName);
   console.log(`[RerunSeedream] Enqueued ${jobName}: slot=${result.slot}, position=${result.position}`);
 
-  // Respond-then-fire kick pattern — see jobs/route.ts comments.
-  fetch(`${getInternalBase()}/api/jobs/process-queue`, { method: 'POST' })
-    .then(res => console.log(`[RerunSeedream] Worker kick: ${res.status}`))
-    .catch(err => console.warn(`[RerunSeedream] Worker kick failed (non-blocking):`, err));
+  triggerWorker('rerun-seedream').catch(() => { /* logged in helper */ });
 
   return new Response(JSON.stringify({
     ok: true,

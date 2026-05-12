@@ -14,7 +14,36 @@
  */
 
 const BYTEPLUS_URL = 'https://ark.ap-southeast.bytepluses.com/api/v3/images/generations';
-const MODEL = 'seedream-4-5-251128';
+
+/**
+ * Default Seedream model. Falls back to 4.5 if SEEDREAM_MODEL env var is unset.
+ *
+ * Set the env var in Cloud Run to flip the global default without a code
+ * deploy. Recognised values:
+ *   - seedream-4-5-251128  (Seedream 4.5, current production default)
+ *   - seedream-5-0-260128  (Seedream 5.0 Lite — released Feb 2026; cheaper at
+ *                           $0.035/image, slightly slower ~100s vs ~50s,
+ *                           handles tucked-in tops natively so the tee-edit
+ *                           pass can be skipped — see seedream-tee-edit.ts)
+ *
+ * Per-call override: pass `model` on SeedreamGenerateParams. Useful for A/B
+ * testing or rerun-with-different-model from the UI.
+ */
+const DEFAULT_MODEL = process.env.SEEDREAM_MODEL || 'seedream-4-5-251128';
+export const SEEDREAM_MODEL_4_5 = 'seedream-4-5-251128';
+export const SEEDREAM_MODEL_5_0 = 'seedream-5-0-260128';
+
+/** Helper: returns true when the given (or default) model is the 5.0 Lite
+ *  family. Callers use this to skip the tee-edit pipeline + the
+ *  rewriteTopForSeedream override, since 5.0 handles tucked-in tops natively. */
+export function isSeedream5(model?: string): boolean {
+  return (model || DEFAULT_MODEL).startsWith('seedream-5-');
+}
+
+/** Returns the model that will be used given an optional override. */
+export function resolveSeedreamModel(override?: string): string {
+  return override || DEFAULT_MODEL;
+}
 
 // Generation can take 40-70s in production. Give it 3 minutes total.
 const REQUEST_TIMEOUT_MS = 180_000;
@@ -34,7 +63,7 @@ export interface SeedreamReferenceImage {
 export interface SeedreamGenerateParams {
   prompt: string;
   referenceImages: SeedreamReferenceImage[];
-  aspectRatio: '9:16' | '3:4';
+  aspectRatio: '9:16' | '3:4' | '1:1';
   /**
    * Optional explicit size override, e.g. '2592x3456' for high-res M03/M04.
    * If omitted, the default from aspectToSize() is used.
@@ -42,31 +71,40 @@ export interface SeedreamGenerateParams {
    */
   size?: string;
   apiKey?: string;
+  /**
+   * Optional per-call model override. Defaults to the SEEDREAM_MODEL env var,
+   * which itself defaults to 'seedream-4-5-251128'. Use SEEDREAM_MODEL_5_0
+   * (= 'seedream-5-0-260128') to call Seedream 5.0 Lite.
+   */
+  model?: string;
 }
 
 export interface SeedreamGenerateResult {
   imageData: Buffer;
   mimeType: string;
+  /** The model that actually produced this image (resolved from override or env var). */
+  model: string;
 }
 
 /**
- * Map our two aspect ratios to BytePlus size strings.
- * Both ~2K so fidelity matches the Gemini 2K target.
+ * Map our supported aspect ratios to BytePlus size strings. ~2K each so
+ * Seedream native quality stays in spec; downstream pipelines (e.g. the 1:1
+ * 4000×4000 square upscale in /api/generate) handle final delivery sizes.
  *
  * BytePlus requires a minimum of 3,686,400 pixels (verified empirically from
- * their 400 error — "image size must be at least 3686400 pixels"). Earlier
- * 3:4 = 1440x1920 (2.77M pixels) was rejected. 1728x2304 = 3.98M pixels,
- * exact 3:4 aspect, safely above the floor.
+ * their 400 error — "image size must be at least 3686400 pixels"). All of the
+ * sizes below are safely above the floor.
  */
-function aspectToSize(aspect: '9:16' | '3:4'): string {
+function aspectToSize(aspect: '9:16' | '3:4' | '1:1'): string {
   switch (aspect) {
     case '9:16': return '1472x2624'; // 3.86M pixels
     case '3:4':  return '1728x2304'; // 3.98M pixels
+    case '1:1':  return '2048x2048'; // 4.19M pixels — square native
   }
 }
 
 export async function generateSeedreamImage(params: SeedreamGenerateParams): Promise<SeedreamGenerateResult> {
-  const { prompt, referenceImages, aspectRatio, size: sizeOverride, apiKey: paramKey } = params;
+  const { prompt, referenceImages, aspectRatio, size: sizeOverride, apiKey: paramKey, model: modelOverride } = params;
 
   const apiKey = paramKey || process.env.BYTEPLUS_API_KEY;
   if (!apiKey) {
@@ -81,16 +119,30 @@ export async function generateSeedreamImage(params: SeedreamGenerateParams): Pro
     throw new Error(`Seedream supports max 10 reference images, got ${referenceImages.length}`);
   }
 
+  const resolvedModel = resolveSeedreamModel(modelOverride);
+
+  // Path B (2026-05-10 experiment): prepend a "Reference image inventory" block
+  // to the prompt so the per-ref label scoping ACTUALLY reaches Seedream.
+  // Previously labels were logging-only (BytePlus accepts only `image: [urls]`).
+  // Discovery: labels-don't-reach-Seedream was the architecture from day one
+  // (April 22 commit). Phase B / M05 layering / expression / shoe-size scoping
+  // deploys (May 8–10) were no-ops because of this. Testing whether labels
+  // injected into the prompt body restore their intended effect.
+  const inventory = referenceImages
+    .map((r, i) => `Image ${i + 1}: ${r.label}`)
+    .join('\n');
+  const promptWithInventory = `REFERENCE IMAGE INVENTORY (these are the images sent with this request, in slot order — use the descriptions to know what each image is for):\n${inventory}\n\n---\n\n${prompt}`;
+
   const body = {
-    model: MODEL,
-    prompt,
+    model: resolvedModel,
+    prompt: promptWithInventory,
     image: referenceImages.map(r => r.url),
     size: sizeOverride || aspectToSize(aspectRatio),
     response_format: 'url' as const,
     watermark: false,
   };
 
-  console.log(`[Seedream] Generating: refs=${referenceImages.length}, size=${body.size}, key=...${apiKey.slice(-4)}`);
+  console.log(`[Seedream] Generating: model=${resolvedModel}, refs=${referenceImages.length}, size=${body.size}, key=...${apiKey.slice(-4)}`);
 
   let lastError: unknown = null;
 
@@ -161,9 +213,9 @@ export async function generateSeedreamImage(params: SeedreamGenerateParams): Pro
       const imageData = Buffer.from(arrayBuffer);
       const mimeType = imgResponse.headers.get('content-type') || 'image/png';
 
-      console.log(`[Seedream] Image downloaded: ${imageData.length} bytes, ${mimeType}`);
+      console.log(`[Seedream] Image downloaded: ${imageData.length} bytes, ${mimeType}, model=${resolvedModel}`);
 
-      return { imageData, mimeType };
+      return { imageData, mimeType, model: resolvedModel };
 
     } catch (error) {
       lastError = error;

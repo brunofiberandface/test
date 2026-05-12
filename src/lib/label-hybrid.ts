@@ -360,3 +360,86 @@ export async function applyHybridLabel(
     });
   }
 }
+
+// ─── Passthrough composite ────────────────────────────────────────────────
+
+/**
+ * Warp + blend a pre-rendered leather label photo onto a target image.
+ *
+ * Use this when the wardrobe item has a `leatherLabelImageUrl` (an actual
+ * photo of the leather back-patch) but no three-tier `labelStyles` /
+ * `labelColorways` entries. Skips the material+template+emboss synthesis
+ * entirely — the photo IS the label, we just warp it into the quad and
+ * blend with the existing soft-edge feather + luminance match + drop shadow
+ * (same treatment as the woven Originals patch, since visually it's the
+ * same problem: drop a finished label onto a finished shot).
+ *
+ * Inputs:
+ *   imageBuffer — the target shot
+ *   corners     — the 4 destination corners (TL/TR/BR/BL) in pixel coords
+ *   labelImageUrl — public URL of the leather label JPEG/PNG
+ *
+ * Output: Buffer (PNG) of the composited shot.
+ *
+ * Note: 8-point midpoints supplied by the picker are silently ignored in
+ * this path — the woven/passthrough warp is 4-point only. If the user
+ * needs 8-point precision, fall back to the three-tier synthesis path.
+ */
+export async function applyPassthroughLabel(
+  imageBuffer: Buffer,
+  corners: LabelCorners,
+  labelImageUrl: string,
+): Promise<Buffer> {
+  if (!(await isPythonAvailable())) {
+    throw new Error('python + OpenCV not available on this runtime');
+  }
+
+  const sharp = (await import('sharp')).default;
+  const meta = await sharp(imageBuffer).metadata();
+  const imgWidth = meta.width || 0;
+  const imgHeight = meta.height || 0;
+  if (!imgWidth || !imgHeight) {
+    throw new Error('could not read target image dimensions');
+  }
+  validateCorners(corners, imgWidth, imgHeight);
+
+  const tempDir = await makeTempDir();
+  try {
+    const targetPath = path.join(tempDir, 'target.png');
+    const labelPath = path.join(tempDir, 'label.jpg');
+    const outputPath = path.join(tempDir, 'out.png');
+    const argsPath = path.join(tempDir, 'args.json');
+
+    await writeFile(targetPath, imageBuffer);
+    await downloadToFile(labelImageUrl, labelPath);
+
+    const args = {
+      mode: 'passthrough',
+      target_image: targetPath,
+      label_image: labelPath,
+      quad: [
+        { x: corners.tl[0], y: corners.tl[1] },
+        { x: corners.tr[0], y: corners.tr[1] },
+        { x: corners.br[0], y: corners.br[1] },
+        { x: corners.bl[0], y: corners.bl[1] },
+      ],
+      output: outputPath,
+    };
+    await writeFile(argsPath, JSON.stringify(args));
+
+    const result = await runPython(argsPath);
+    if (!result.ok) {
+      throw new Error(`python passthrough reported failure: ${JSON.stringify(result)}`);
+    }
+
+    const composited = await readFile(outputPath);
+    console.log(
+      `[LabelHybrid passthrough] composited ${composited.length} bytes (was ${imageBuffer.length}) from ${labelImageUrl}`,
+    );
+    return composited;
+  } finally {
+    rm(tempDir, { recursive: true, force: true }).catch(() => {
+      // best-effort cleanup
+    });
+  }
+}

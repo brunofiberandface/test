@@ -3,6 +3,7 @@
 import { useEffect, useState, useCallback } from 'react';
 import { useSession } from 'next-auth/react';
 import Shell from '@/components/Shell';
+import { parseGarmentDisplay, styleCodeLabel } from '@/lib/garment-display';
 
 type WardrobeCategory = 'shoes' | 'top' | 'bottom';
 
@@ -44,6 +45,19 @@ interface WardrobeItem {
   thumbnailUrl: string;
   openShoes?: boolean;
   hasHeels?: boolean;
+  /** Computed server-side for category=bottom items only. True when the
+   *  item has either a leatherLabelTemplateId or a three-tier labelStyles
+   *  config — meaning the warp tool will work. Undefined for non-bottoms. */
+  labelReady?: boolean;
+  leatherLabelTemplateId?: string;
+  pocketLabelTemplateId?: string;
+}
+
+interface LabelAsset {
+  id: string;
+  type: 'leather' | 'pocket';
+  displayName: string;
+  imageUrl: string;
 }
 
 const GENDER_OPTIONS: { value: WardrobeGender; label: string }[] = [
@@ -95,6 +109,11 @@ export default function WardrobePage() {
   const [editFlatFrontPreview, setEditFlatFrontPreview] = useState<string | null>(null);
   const [editFlatBackFile, setEditFlatBackFile] = useState<File | null>(null);
   const [editFlatBackPreview, setEditFlatBackPreview] = useState<string | null>(null);
+
+  // Label-template selection (bottoms only). Empty string means "(none)" → backend deletes the field.
+  const [editLeatherLabelId, setEditLeatherLabelId] = useState<string>('');
+  const [editPocketLabelId, setEditPocketLabelId] = useState<string>('');
+  const [labelAssets, setLabelAssets] = useState<LabelAsset[]>([]);
 
   // Add form state
   const [itemType, setItemType] = useState<'focus' | 'styling'>('focus');
@@ -153,6 +172,16 @@ export default function WardrobePage() {
 
   useEffect(() => { fetchItems(); }, [fetchItems]);
 
+  // Load label-asset library once on mount. Used by the bottom-item edit panel.
+  useEffect(() => {
+    let cancelled = false;
+    fetch('/api/label-assets')
+      .then(r => r.json())
+      .then(d => { if (!cancelled) setLabelAssets(d.items || []); })
+      .catch(() => { /* non-fatal — dropdowns just stay empty */ });
+    return () => { cancelled = true; };
+  }, []);
+
   // Reset style-code filter whenever category changes — style codes are
   // category-scoped (bottoms have their own codes, tops have theirs).
   useEffect(() => { setFilterStyleCode('all'); }, [filterCategory]);
@@ -200,6 +229,8 @@ export default function WardrobePage() {
     setEditFlatFrontPreview(null);
     setEditFlatBackFile(null);
     setEditFlatBackPreview(null);
+    setEditLeatherLabelId(item.leatherLabelTemplateId || '');
+    setEditPocketLabelId(item.pocketLabelTemplateId || '');
     setDeleteConfirm(false);
   }
 
@@ -224,6 +255,11 @@ export default function WardrobePage() {
       };
       if (flatFrontBase64) patchBody.flatFrontBase64 = flatFrontBase64;
       if (flatBackBase64) patchBody.flatBackBase64 = flatBackBase64;
+      // Label-template selection — only relevant for bottoms. Empty string → backend deletes the field.
+      if (editCategory === 'bottom') {
+        patchBody.leatherLabelTemplateId = editLeatherLabelId;
+        patchBody.pocketLabelTemplateId = editPocketLabelId;
+      }
 
       const res = await fetch(`/api/wardrobe/${selectedItem.wardrobeId || selectedItem.id}`, {
         method: 'PATCH',
@@ -237,6 +273,15 @@ export default function WardrobePage() {
           gender: editGender, openShoes: editOpenShoes, hasHeels: editHasHeels,
           ...(data.flatFrontUrl ? { flatFrontUrl: data.flatFrontUrl } : {}),
           ...(data.flatBackUrl ? { flatBackUrl: data.flatBackUrl } : {}),
+          ...(editCategory === 'bottom' ? {
+            leatherLabelTemplateId: editLeatherLabelId || undefined,
+            pocketLabelTemplateId: editPocketLabelId || undefined,
+            // Recompute badge optimistically — server logic considers leather only OR
+            // a three-tier labelStyles config. We only know leather state here, so this
+            // may underestimate (won't flip a three-tier-only item from amber to green
+            // until next list refresh — minor).
+            labelReady: !!editLeatherLabelId || selectedItem.labelReady,
+          } : {}),
         } as any;
         setSelectedItem(updated);
         setItems(prev => prev.map(i => (i.id === selectedItem.id ? updated : i)));
@@ -642,7 +687,7 @@ export default function WardrobePage() {
               >
                 <option value="all">All styles ({availableStyleCodes.length})</option>
                 {availableStyleCodes.map(code => (
-                  <option key={code} value={code}>{code}</option>
+                  <option key={code} value={code}>{styleCodeLabel(code, itemsAfterGender)}</option>
                 ))}
               </select>
             </div>
@@ -665,7 +710,12 @@ export default function WardrobePage() {
               className="bg-white border border-neutral-200 overflow-hidden group cursor-pointer hover:border-neutral-400 hover:shadow-sm transition-all">
               <div className="aspect-square bg-neutral-100 relative">
                 {item.thumbnailUrl ? (
-                  <img src={item.thumbnailUrl} alt={item.name} className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-200" />
+                  // object-contain (not object-cover) so the full garment fits in
+                  // the tile — the fit-model angle photos are 3:4 portrait, so
+                  // a square crop with object-cover hid the waistband and ankle
+                  // (style/cut became unreadable per Bruno 2026-05-07). Letter-
+                  // boxing on the sides is fine; bg-neutral-100 keeps it clean.
+                  <img src={item.thumbnailUrl} alt={item.name} className="w-full h-full object-contain group-hover:scale-105 transition-transform duration-200" />
                 ) : (
                   <div className="w-full h-full flex items-center justify-center text-neutral-300 text-sm">No image</div>
                 )}
@@ -679,10 +729,40 @@ export default function WardrobePage() {
                     {countFitImages(item)} angles
                   </span>
                 )}
+                {/* Label-readiness badge — only on bottoms. Green = warp tool
+                    will work (templateId set OR three-tier config exists);
+                    amber = needs setup before warp. */}
+                {item.category === 'bottom' && item.labelReady !== undefined && (
+                  <span
+                    className={
+                      item.labelReady
+                        ? 'absolute bottom-2 left-2 px-2 py-0.5 bg-emerald-600 text-white text-[10px] font-medium uppercase tracking-wide'
+                        : 'absolute bottom-2 left-2 px-2 py-0.5 bg-amber-500 text-white text-[10px] font-medium uppercase tracking-wide'
+                    }
+                    title={
+                      item.labelReady
+                        ? 'Leather label is mapped — warp tool will work for this garment'
+                        : 'Leather label NOT mapped — open this garment and run label-setup before generating'
+                    }
+                  >
+                    {item.labelReady ? 'Label ✓' : 'Label needed'}
+                  </span>
+                )}
               </div>
               <div className="p-3">
-                <h3 className="text-sm font-medium text-neutral-900 truncate">{item.designNumber || item.name}</h3>
-                <p className="text-xs text-neutral-500 mt-1 line-clamp-2">{item.description}</p>
+                {/* Two-line identity: design number on top, design name on second
+                    line. Replaces the old "designNumber + truncated description"
+                    treatment per Bruno 2026-05-07 — name beats description for
+                    quick scanning. */}
+                {(() => {
+                  const d = parseGarmentDisplay(item);
+                  return (
+                    <>
+                      <h3 className="text-sm font-medium text-neutral-900 truncate">{d.designNumber || '—'}</h3>
+                      <p className="text-xs text-neutral-700 mt-0.5 truncate">{d.designName}</p>
+                    </>
+                  );
+                })()}
               </div>
             </div>
           ))}
@@ -799,6 +879,60 @@ export default function WardrobePage() {
                     </div>
                   </>)}
                 </div>
+
+                {/* Labels — bottoms only. Pulls from labelAssets library. */}
+                {editCategory === 'bottom' && (
+                  <div>
+                    <div className="flex items-baseline justify-between mb-1">
+                      <label className="block text-xs font-medium text-neutral-500 uppercase tracking-wider">Labels</label>
+                      <a href="/labels" className="text-xs text-neutral-500 hover:text-neutral-900 underline">Manage library →</a>
+                    </div>
+                    <div className="grid grid-cols-2 gap-3">
+                      <div>
+                        <p className="text-[11px] text-neutral-500 mb-1">Leather (waistband)</p>
+                        <select
+                          value={editLeatherLabelId}
+                          onChange={(e) => setEditLeatherLabelId(e.target.value)}
+                          className="w-full border border-neutral-300 px-2 py-1.5 text-sm focus:outline-none focus:border-neutral-900"
+                        >
+                          <option value="">(none)</option>
+                          {labelAssets.filter(a => a.type === 'leather').map(a => (
+                            <option key={a.id} value={a.id}>{a.displayName}</option>
+                          ))}
+                        </select>
+                        {editLeatherLabelId && (() => {
+                          const asset = labelAssets.find(a => a.id === editLeatherLabelId);
+                          return asset ? (
+                            <div className="mt-2 border border-neutral-200 p-1 inline-block bg-[linear-gradient(45deg,#f3f3f3_25%,transparent_25%,transparent_75%,#f3f3f3_75%,#f3f3f3),linear-gradient(45deg,#f3f3f3_25%,transparent_25%,transparent_75%,#f3f3f3_75%,#f3f3f3)] bg-[length:12px_12px] bg-[position:0_0,6px_6px]">
+                              <img src={asset.imageUrl} alt={asset.displayName} className="h-16 w-auto" />
+                            </div>
+                          ) : null;
+                        })()}
+                      </div>
+                      <div>
+                        <p className="text-[11px] text-neutral-500 mb-1">Pocket (back patch)</p>
+                        <select
+                          value={editPocketLabelId}
+                          onChange={(e) => setEditPocketLabelId(e.target.value)}
+                          className="w-full border border-neutral-300 px-2 py-1.5 text-sm focus:outline-none focus:border-neutral-900"
+                        >
+                          <option value="">(none)</option>
+                          {labelAssets.filter(a => a.type === 'pocket').map(a => (
+                            <option key={a.id} value={a.id}>{a.displayName}</option>
+                          ))}
+                        </select>
+                        {editPocketLabelId && (() => {
+                          const asset = labelAssets.find(a => a.id === editPocketLabelId);
+                          return asset ? (
+                            <div className="mt-2 border border-neutral-200 p-1 inline-block bg-[linear-gradient(45deg,#f3f3f3_25%,transparent_25%,transparent_75%,#f3f3f3_75%,#f3f3f3),linear-gradient(45deg,#f3f3f3_25%,transparent_25%,transparent_75%,#f3f3f3_75%,#f3f3f3)] bg-[length:12px_12px] bg-[position:0_0,6px_6px]">
+                              <img src={asset.imageUrl} alt={asset.displayName} className="h-16 w-auto" />
+                            </div>
+                          ) : null;
+                        })()}
+                      </div>
+                    </div>
+                  </div>
+                )}
 
                 <div>
                   <div className="flex items-center justify-between mb-1">

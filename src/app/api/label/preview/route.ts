@@ -33,12 +33,50 @@ import { tmpdir } from 'os';
 import path from 'path';
 import {
   resolveLabelRenderConfig,
+  resolveLabelAssetUrls,
   shotsCol,
   getJob,
   getWardrobeItem,
 } from '@/lib/firestore';
 import { resolveAssetUrl } from '@/lib/label-render';
 import { styleAndColorwayOf } from '@/lib/design-number';
+
+/**
+ * Stream the leather-label JPEG sitting on the wardrobe doc as the picker
+ * preview. Used when no three-tier labelStyles/labelColorways config exists
+ * for this style — the wardrobe-uploaded photo IS the label, no synthesis.
+ *
+ * The picker only needs an image of the right aspect to overlay + drag, so
+ * we just relay the bytes (or transcode if it's something exotic).
+ */
+async function streamLeatherLabelPreview(
+  leatherLabelImageUrl: string,
+): Promise<Response> {
+  const res = await fetch(leatherLabelImageUrl);
+  if (!res.ok) {
+    return NextResponse.json(
+      {
+        error: `failed to fetch leatherLabelImageUrl: ${res.status} ${res.statusText}`,
+      },
+      { status: 502 },
+    );
+  }
+  const buf = Buffer.from(await res.arrayBuffer());
+  // Pass through whatever content-type the upstream gave us — typically
+  // image/jpeg for the back-label photos. Picker creates an Image() from a
+  // blob URL, which works for JPEG/PNG/WebP equally.
+  const contentType = res.headers.get('Content-Type') || 'image/jpeg';
+  return new Response(new Uint8Array(buf), {
+    status: 200,
+    headers: {
+      'Content-Type': contentType,
+      // Short cache — leatherLabelImageUrl can be re-uploaded by the user.
+      // GCS object URL stays stable so this is mostly belt-and-braces.
+      'Cache-Control': 'public, max-age=300',
+      'X-Label-Source': 'leatherLabelImageUrl',
+    },
+  });
+}
 
 const execFileAsync = promisify(execFile);
 const PYTHON_SCRIPT = path.resolve(process.cwd(), 'scripts/label_hybrid.py');
@@ -90,6 +128,13 @@ export async function GET(req: NextRequest) {
     const width = Math.max(64, Math.min(1024, parseInt(sp.get('w') || '512', 10) || 512));
     const height = Math.max(48, Math.min(1024, parseInt(sp.get('h') || '340', 10) || 340));
 
+    // Captured during the shot→focusItem hop so we can fall back to the
+    // photo-based leather label asset when no three-tier config exists for
+    // this style. Resolved through resolveLabelAssetUrls() — prefers the
+    // labelAssets template lookup, falls back to legacy leatherLabelImageUrl.
+    // Stays null on the style+colorway code path.
+    let focusItemLeatherUrl: string | null = null;
+
     // Resolve style/colorway via shot → job → focus wardrobe item, if asked.
     // The picker usually only knows the shot ID, so this saves it an extra
     // round-trip.
@@ -113,7 +158,12 @@ export async function GET(req: NextRequest) {
         );
       }
       const focusItem = (await getWardrobeItem(focusSlot[1].itemId)) as
-        | { designNumber?: string }
+        | {
+            designNumber?: string;
+            leatherLabelImageUrl?: string;
+            leatherLabelTemplateId?: string;
+            pocketLabelTemplateId?: string;
+          }
         | null;
       if (!focusItem?.designNumber) {
         return NextResponse.json(
@@ -121,6 +171,9 @@ export async function GET(req: NextRequest) {
           { status: 400 },
         );
       }
+      // Stash for the three-tier-fallback path below.
+      const labelUrls = await resolveLabelAssetUrls(focusItem);
+      focusItemLeatherUrl = labelUrls.leatherUrl;
       const codes = styleAndColorwayOf(focusItem.designNumber);
       if (!codes) {
         return NextResponse.json(
@@ -141,8 +194,22 @@ export async function GET(req: NextRequest) {
 
     const render = await resolveLabelRenderConfig(styleCode, colorwayCode);
     if (!render) {
+      // FALLBACK PATH — no three-tier (labelStyles + labelColorways) config
+      // for this style. resolveLabelAssetUrls already preferred the
+      // labelAssets template (alpha-masked PNG) and fell back to legacy
+      // leatherLabelImageUrl. If either resolved, serve it directly. The
+      // picker shows the photo, the user drags the 4 corners, the apply
+      // route warps the same photo onto the shot.
+      if (focusItemLeatherUrl) {
+        console.log(
+          `[LabelPreview] no three-tier config for ${styleCode}/${colorwayCode} — serving label asset ${focusItemLeatherUrl}`,
+        );
+        return await streamLeatherLabelPreview(focusItemLeatherUrl);
+      }
       return NextResponse.json(
-        { error: `no three-tier label config for ${styleCode}/${colorwayCode}` },
+        {
+          error: `no three-tier label config for ${styleCode}/${colorwayCode} and no leather label asset on the wardrobe item — set leatherLabelTemplateId or upload a leatherLabelImageUrl, or run label-setup`,
+        },
         { status: 404 },
       );
     }

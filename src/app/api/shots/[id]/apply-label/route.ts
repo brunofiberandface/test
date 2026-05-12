@@ -41,6 +41,7 @@ import {
   getJob,
   getWardrobeItem,
   resolveLabelRenderConfig,
+  resolveLabelAssetUrls,
 } from '@/lib/firestore';
 import {
   uploadGeneratedImage,
@@ -48,6 +49,7 @@ import {
 } from '@/lib/gcs';
 import {
   applyHybridLabel,
+  applyPassthroughLabel,
   applyWovenLabel,
   type LabelCorners,
   type LabelHybridConfig,
@@ -196,9 +198,9 @@ export async function POST(
     }
     const shot = shotDoc.data()!;
     const shotType = shot.shotType || shot.type;
-    if (shotType !== 'M02' && shotType !== 'M04') {
+    if (shotType !== 'M02' && shotType !== 'M04' && shotType !== 'M05') {
       return NextResponse.json(
-        { error: `Label apply only supported for M02 and M04, not ${shotType}` },
+        { error: `Label apply only supported for M02, M04, and M05, not ${shotType}` },
         { status: 400 },
       );
     }
@@ -245,17 +247,23 @@ export async function POST(
 
     // ── 4. Build the LabelHybridConfig + pixel label corners.
     //      Three paths, diverging only in how we determine the label corners
-    //      in output-image pixel space.
-    let hybridConfig: LabelHybridConfig;
+    //      in output-image pixel space. The v3 path additionally has a
+    //      passthrough fallback when no three-tier config exists for the
+    //      style — uses the wardrobe-uploaded leatherLabelImageUrl directly.
+    let hybridConfig: LabelHybridConfig | null = null;
     let pixelCorners: LabelCorners;
     let pathUsed:
       | 'v3-direct-label'
       | 'v3-direct-label-8pt'
+      | 'v3-passthrough'
       | 'v2-pocket-homography'
       | 'v1-direct-label';
+    let passthroughLabelUrl: string | null = null;
 
     if (hasLabelPath) {
-      // ── v3 path: direct label corners, three-tier render config ──
+      // ── v3 path: direct label corners ──
+      // Tries three-tier synthesis first; falls back to leatherLabelImageUrl
+      // passthrough if no three-tier config exists for this style.
 
       const codes = styleAndColorwayOf(focusItem.designNumber);
       if (!codes) {
@@ -270,14 +278,6 @@ export async function POST(
         codes.styleCode,
         codes.colorwayCode,
       );
-      if (!renderConfig) {
-        return NextResponse.json(
-          {
-            error: `No three-tier label config for ${codes.styleCode}/${codes.colorwayCode}. Run label-setup on the wardrobe item first.`,
-          },
-          { status: 400 },
-        );
-      }
 
       const normalizedLabel = parseCorners(body.labelCorners, 'labelCorners');
       const normalizedMids = parseOptionalMidpoints(
@@ -306,14 +306,39 @@ export async function POST(
         if (normalizedMids.bm) pixelCorners.bm = toPx(normalizedMids.bm);
         if (normalizedMids.lm) pixelCorners.lm = toPx(normalizedMids.lm);
       }
-      hybridConfig = renderConfigToHybridConfig(renderConfig);
-      pathUsed = hasAnyMid ? 'v3-direct-label-8pt' : 'v3-direct-label';
 
-      console.log(
-        `[ApplyLabel ${pathUsed}] shot=${id} type=${shotType} size=${imgW}x${imgH} ` +
-          `style=${codes.styleCode}/${codes.colorwayCode} ` +
-          `label=${JSON.stringify(pixelCorners)}`,
-      );
+      if (renderConfig) {
+        hybridConfig = renderConfigToHybridConfig(renderConfig);
+        pathUsed = hasAnyMid ? 'v3-direct-label-8pt' : 'v3-direct-label';
+        console.log(
+          `[ApplyLabel ${pathUsed}] shot=${id} type=${shotType} size=${imgW}x${imgH} ` +
+            `style=${codes.styleCode}/${codes.colorwayCode} ` +
+            `label=${JSON.stringify(pixelCorners)}`,
+        );
+      } else {
+        // No three-tier config — try the photo-based labelAssets template
+        // first (alpha-masked PNG), fall back to legacy leatherLabelImageUrl.
+        // 8-point midpoints are silently ignored in passthrough (woven path
+        // is 4-point only) — the picker user gets corner control either way.
+        const labelUrls = await resolveLabelAssetUrls(focusItem);
+        if (labelUrls.leatherUrl) {
+          passthroughLabelUrl = labelUrls.leatherUrl;
+          pathUsed = 'v3-passthrough';
+          console.log(
+            `[ApplyLabel ${pathUsed}] shot=${id} type=${shotType} size=${imgW}x${imgH} ` +
+              `style=${codes.styleCode}/${codes.colorwayCode} ` +
+              `label=${JSON.stringify(pixelCorners)} ` +
+              `leatherUrl=${passthroughLabelUrl}`,
+          );
+        } else {
+          return NextResponse.json(
+            {
+              error: `No three-tier label config for ${codes.styleCode}/${codes.colorwayCode} and no leather label asset on the wardrobe item. Set leatherLabelTemplateId, upload a leatherLabelImageUrl, or run label-setup.`,
+            },
+            { status: 400 },
+          );
+        }
+      }
     } else if (hasPocketPath) {
       // ── v2 path: homography from wardrobe-pocket → output-pocket, warp label ──
 
@@ -405,13 +430,39 @@ export async function POST(
     }
 
     // ── 5. Run the leather label composite
-    let composited = await applyHybridLabel(
-      sourceBuffer,
-      pixelCorners,
-      hybridConfig,
-    );
+    //      Two branches:
+    //        - passthrough: no three-tier config, warp the wardrobe-uploaded
+    //          leather label JPEG directly onto the shot
+    //        - hybrid synthesis: legacy three-tier path (template + material +
+    //          base color + emboss), produces a synthetic deboss
+    let composited: Buffer;
+    if (passthroughLabelUrl) {
+      composited = await applyPassthroughLabel(
+        sourceBuffer,
+        pixelCorners,
+        passthroughLabelUrl,
+      );
+    } else if (hybridConfig) {
+      composited = await applyHybridLabel(
+        sourceBuffer,
+        pixelCorners,
+        hybridConfig,
+      );
+    } else {
+      // Defensive: should be unreachable — every branch above either sets
+      // hybridConfig, sets passthroughLabelUrl, or returns early.
+      return NextResponse.json(
+        { error: 'internal: neither hybridConfig nor passthroughLabelUrl resolved' },
+        { status: 500 },
+      );
+    }
 
     // ── 5b. Optional: pocket label (woven Originals patch) in same pass
+    //
+    // Source priority for the pocket asset:
+    //   1. Explicit body.wovenLabelFile (caller override — kept for back-compat)
+    //   2. Wardrobe pocketLabelTemplateId → labelAssets/{id}.imageUrl
+    //   3. Default: 'originals-label-gold-woven.png' shipped in /public
     if (body?.pocketLabelCorners) {
       const pocketNorm = parseCorners(body.pocketLabelCorners, 'pocketLabelCorners');
       const toPxPocket = (p: NormalizedCorner): [number, number] => [
@@ -424,9 +475,15 @@ export async function POST(
         br: toPxPocket(pocketNorm.br),
         bl: toPxPocket(pocketNorm.bl),
       };
-      const wovenFile = body.wovenLabelFile || 'originals-label-gold-woven.png';
-      console.log(`[ApplyLabel] also applying pocket label: ${wovenFile} corners=${JSON.stringify(pocketPixels)}`);
-      composited = await applyWovenLabel(composited, pocketPixels, wovenFile);
+      let wovenAsset: string;
+      if (body.wovenLabelFile) {
+        wovenAsset = body.wovenLabelFile;
+      } else {
+        const labelUrls = await resolveLabelAssetUrls(focusItem);
+        wovenAsset = labelUrls.pocketUrl || 'originals-label-gold-woven.png';
+      }
+      console.log(`[ApplyLabel] also applying pocket label: ${wovenAsset} corners=${JSON.stringify(pocketPixels)}`);
+      composited = await applyWovenLabel(composited, pocketPixels, wovenAsset);
     }
 
     // ── 6. Upload with new version number
