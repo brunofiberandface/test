@@ -642,7 +642,12 @@ const QUEUE_DOC = db.collection('system').doc('generationQueue');
 // Each shot uses 1 of each key. With MAX_SLOTS=6, up to ~6 concurrent shots can
 // run (still capped by key pool at 9). Bruno's complaint: 20-shot rerun "takes
 // forever" with MAX_SLOTS=2. 6 should ~3x throughput.
-const MAX_SLOTS = 6;
+// 2026-05-12: bumped 6 → 10. Key pool grew to 15 Gemini × 15 BytePlus, but
+// inflight was capping around 4-6 shots because 6 active jobs × ~1-2
+// eligible shots each (after dep-chain filter) wasn't enough to saturate
+// the 15-key ceiling. 10 active jobs × ~1-2 eligible = 10-20 candidates,
+// still capped at 15 → expect ~10-12 in flight steady-state.
+const MAX_SLOTS = 10;
 
 export interface QueueEntry {
   jobId: string;
