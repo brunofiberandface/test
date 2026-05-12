@@ -7,10 +7,14 @@ import { listModels, createModel } from '@/lib/firestore';
 import { uploadModelCardImage } from '@/lib/gcs';
 import { triggerCelebrityCheck } from '@/lib/celebrity-check';
 
-// GET /api/models — list all active models
+// GET /api/models — list models
+//
+// By default returns only active models (used by job-creation dropdowns).
+// Pass ?includeArchived=1 to include archived models too (admin views).
 export async function GET(req: NextRequest) {
   try {
-    const models = await listModels(true);
+    const includeArchived = req.nextUrl.searchParams.get('includeArchived') === '1';
+    const models = await listModels(!includeArchived);
     return NextResponse.json({ models });
   } catch (error) {
     console.error('Error listing models:', error);

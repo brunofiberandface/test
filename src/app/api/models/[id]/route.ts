@@ -76,7 +76,21 @@ export async function PATCH(
   }
 }
 
-// DELETE /api/models/:id
+// DELETE /api/models/:id — soft-delete (archive)
+//
+// 2026-05-12: changed from hard-delete (docRef.delete()) to archive
+// (active=false + archivedAt timestamp). A hard-delete left dangling
+// references in jobs/shots that pointed to the deleted modelId — every
+// shot for the missing model failed with "Model reference image not found"
+// (F8 and F10 incident, 9 hourly failures + 2 stuck slots).
+//
+// Soft-delete keeps the doc in Firestore so:
+//   - Job records with that modelId still resolve (UI can show the name)
+//   - Admin can restore a wrongly-archived model
+//   - Audit history (createdAt, celebrityCheck, etc.) is preserved
+//
+// listModels(activeOnly=true) already filters archived out of dropdowns
+// for new jobs — no UI change needed.
 export async function DELETE(
   _req: NextRequest,
   { params }: { params: Promise<{ id: string }> }
@@ -91,10 +105,14 @@ export async function DELETE(
       return NextResponse.json({ error: 'Model not found' }, { status: 404 });
     }
 
-    await docRef.delete();
-    return NextResponse.json({ success: true });
+    await docRef.update({
+      active: false,
+      archivedAt: new Date(),
+      updatedAt: new Date(),
+    });
+    return NextResponse.json({ success: true, archived: true });
   } catch (error) {
-    console.error('Error deleting model:', error);
-    return NextResponse.json({ error: 'Failed to delete model' }, { status: 500 });
+    console.error('Error archiving model:', error);
+    return NextResponse.json({ error: 'Failed to archive model' }, { status: 500 });
   }
 }
