@@ -1,29 +1,39 @@
 #!/usr/bin/env bash
 # Deploy gstar-ai-studio to Cloud Run with mandatory git commit + push.
 # Adopted 2026-05-12 after a 3-week stretch of uncommitted deploys made the
-# git history useless for recovery (LEARNING note: "Backup discipline").
+# git history useless for recovery (see LEARNINGS: "Backup discipline").
+#
+# Handles BOTH repos at every deploy:
+#   1. gstar-docs  (workspace .md notes, sibling dir at ../) — commit + push
+#   2. gstar-studio (this dir, app source) — commit + push, deploy, tag
+#
+# Bruno's policy (2026-05-12): "every deploy should be backed up, dont think
+# more then that is needed". So backup is only at the deploy moment, not on a
+# timer. Both repos pushed in one shot.
 #
 # Behaviour:
-#   1. If working tree is dirty, prompt for a commit message, stage all, commit, push.
-#   2. Capture HEAD SHA after commit.
-#   3. Run `gcloud run deploy ...` with the canonical mandatory flags.
-#   4. On success, parse the new revision name from gcloud output and tag the
-#      commit `rev/<revision-name>` + push the tag. Future `git checkout rev/...`
-#      gives you the source state of any specific Cloud Run revision.
+#   1. Commit + push the docs repo if dirty (no prompt, auto-message — the
+#      docs are append-only LEARNINGS / BUGS / DEPLOYMENT_LOG; commit message
+#      is "docs: snapshot before deploy <SHA>").
+#   2. Commit + push the app repo if dirty (prompt for message OR -m flag).
+#   3. gcloud run deploy with the canonical mandatory flags.
+#   4. On success, tag the app commit `rev/<revision-name>` + push the tag.
+#   5. (Optional) tag the docs commit too, same tag name (audit trail across
+#      repos).
 #
 # Usage:
-#   ./deploy.sh                      # interactive — prompts for commit msg if dirty
-#   ./deploy.sh -m "fix: foo"        # non-interactive commit message
+#   ./deploy.sh                      # interactive — prompts for app commit msg if dirty
+#   ./deploy.sh -m "fix: foo"        # non-interactive app commit message
 #   ./deploy.sh --skip-tag           # deploy + commit but don't tag (rare)
 #
 # Hard rules baked in:
 #   --cpu=2 --memory=2Gi             # required for parallel worker (LEARNING)
-#   --timeout=900                    # 15 min request timeout (matte/two-pass shots)
+#   --timeout=900                    # 15 min request timeout
 #   --region=europe-west1
 #   --project=gstar-ai-studio
 #   --allow-unauthenticated          # NextAuth handles auth at the app layer
 #
-# Refuses to deploy if `git push` fails — better to surface the network/auth
+# Refuses to deploy if any `git push` fails — better to surface the network/auth
 # issue than ship a deploy whose source state isn't backed up.
 
 set -euo pipefail
@@ -33,7 +43,10 @@ REGION=europe-west1
 PROJECT=gstar-ai-studio
 GCLOUD=/Users/bdheedene/google-cloud-sdk/bin/gcloud
 
-cd "$(dirname "$0")"
+APP_DIR="$(cd "$(dirname "$0")" && pwd)"
+DOCS_DIR="$(cd "$APP_DIR/.." && pwd)"  # workspace dir, parent of gstar-studio
+
+cd "$APP_DIR"
 
 # ── Parse args ──────────────────────────────────────────────────────────────
 commit_msg=""
@@ -43,31 +56,61 @@ while [[ $# -gt 0 ]]; do
     -m|--message)  commit_msg="$2"; shift 2 ;;
     --skip-tag)    skip_tag=1; shift ;;
     -h|--help)
-      sed -n '1,30p' "$0"; exit 0 ;;
+      sed -n '1,40p' "$0"; exit 0 ;;
     *)
       echo "Unknown arg: $1" >&2; exit 1 ;;
   esac
 done
 
-# ── Pre-flight: commit any uncommitted work ─────────────────────────────────
-if ! git diff-index --quiet HEAD -- 2>/dev/null || [[ -n "$(git ls-files --others --exclude-standard)" ]]; then
-  echo "📝 Working tree is dirty — committing before deploy."
-  echo ""
-  echo "Staged changes (after .gitignore filtering):"
-  git add -A
-  git diff --cached --stat | tail -20
-  echo ""
-
-  # Quick safety scan — refuse to commit if obvious secrets are staged
+# Reusable: safety scan for secret-looking paths in staged files.
+# Refuses to commit if any obvious secret pattern is staged.
+check_no_secrets_staged() {
+  local label="$1"
   if git diff --cached --name-only | grep -qiE "(^|/)\.env($|\.)|sa_key\.json|client_secret.*\.json|service-account.*\.json|\.pem$|\.key$|__pycache__"; then
-    echo "❌ ABORTING — staged files include possible secrets:" >&2
+    echo "❌ ABORTING ($label) — staged files include possible secrets:" >&2
     git diff --cached --name-only | grep -iE "(^|/)\.env($|\.)|sa_key\.json|client_secret.*\.json|service-account.*\.json|\.pem$|\.key$|__pycache__" >&2
     echo "Update .gitignore + unstage these before deploying." >&2
     exit 1
   fi
+}
+
+# ── 1. Docs repo: commit + push if dirty (auto-message) ─────────────────────
+echo "📚 Checking docs repo at $DOCS_DIR…"
+pushd "$DOCS_DIR" > /dev/null
+if git rev-parse --git-dir > /dev/null 2>&1; then
+  if ! git diff-index --quiet HEAD -- 2>/dev/null || [[ -n "$(git ls-files --others --exclude-standard)" ]]; then
+    git add -A
+    check_no_secrets_staged "docs"
+    docs_msg="docs: snapshot before app deploy"
+    git commit -m "$docs_msg" > /dev/null
+    docs_sha=$(git rev-parse --short HEAD)
+    echo "   📝 Committed $docs_sha — pushing…"
+    git push origin HEAD > /dev/null
+    echo "   ✓ Docs pushed."
+  else
+    docs_sha=$(git rev-parse --short HEAD)
+    echo "   ✓ Docs clean ($docs_sha)."
+  fi
+else
+  echo "   ⚠️  $DOCS_DIR is not a git repo — skipping docs backup."
+  docs_sha=""
+fi
+popd > /dev/null
+
+# ── 2. App repo: commit + push if dirty (prompt for message) ───────────────
+echo ""
+echo "💻 Checking app repo at $APP_DIR…"
+if ! git diff-index --quiet HEAD -- 2>/dev/null || [[ -n "$(git ls-files --others --exclude-standard)" ]]; then
+  echo "   📝 Working tree dirty — committing before deploy."
+  echo ""
+  git add -A
+  echo "   Staged changes (after .gitignore filtering):"
+  git diff --cached --stat | sed 's/^/   /' | tail -20
+  echo ""
+  check_no_secrets_staged "app"
 
   if [[ -z "$commit_msg" ]]; then
-    echo "Enter commit message (one line, or blank for editor):"
+    echo "   Enter commit message (one line, or blank for editor):"
     read -r commit_msg
   fi
 
@@ -77,19 +120,18 @@ if ! git diff-index --quiet HEAD -- 2>/dev/null || [[ -n "$(git ls-files --other
     git commit -m "$commit_msg"
   fi
 
-  echo "📤 Pushing to origin..."
+  echo "   📤 Pushing to origin…"
   git push origin HEAD
 else
-  echo "✓ Working tree clean — proceeding with current commit."
+  echo "   ✓ Working tree clean — proceeding with current commit."
 fi
 
-# ── Capture SHA + run deploy ────────────────────────────────────────────────
+# ── 3. Run gcloud deploy ────────────────────────────────────────────────────
 sha=$(git rev-parse --short HEAD)
 echo ""
-echo "🚀 Deploying $SERVICE from $sha to Cloud Run..."
+echo "🚀 Deploying $SERVICE from $sha to Cloud Run…"
 echo ""
 
-# Run deploy and tee output so we can parse the revision name afterward.
 deploy_log=$(mktemp)
 trap 'rm -f "$deploy_log"' EXIT
 
@@ -116,21 +158,39 @@ fi
 echo ""
 echo "✓ Deployed revision: $revision"
 
-# ── Tag commit + push tag ───────────────────────────────────────────────────
+# ── 4. Tag the app commit + (optionally) the docs commit ────────────────────
 if [[ "$skip_tag" -eq 1 ]]; then
   echo "ℹ️  --skip-tag set; not tagging."
   exit 0
 fi
 
 tag="rev/$revision"
+
+# App repo tag
 if git rev-parse "$tag" >/dev/null 2>&1; then
-  echo "ℹ️  Tag $tag already exists (?!) — leaving it alone."
+  echo "ℹ️  App tag $tag already exists — leaving it alone."
 else
-  git tag "$tag" "$sha" -m "Cloud Run revision $revision deployed from $sha"
-  git push origin "$tag"
-  echo "🏷️  Tagged $sha as $tag and pushed."
+  git tag "$tag" "$sha" -m "Cloud Run revision $revision deployed from app SHA $sha"
+  git push origin "$tag" > /dev/null
+  echo "🏷️  App: tagged $sha as $tag and pushed."
+fi
+
+# Docs repo tag (same tag name on the docs SHA — audit-trail link)
+if [[ -n "$docs_sha" ]]; then
+  pushd "$DOCS_DIR" > /dev/null
+  if git rev-parse "$tag" >/dev/null 2>&1; then
+    echo "ℹ️  Docs tag $tag already exists — leaving it alone."
+  else
+    git tag "$tag" "$docs_sha" -m "Workspace docs state at Cloud Run deploy $revision (docs SHA $docs_sha)"
+    git push origin "$tag" > /dev/null
+    echo "🏷️  Docs: tagged $docs_sha as $tag and pushed."
+  fi
+  popd > /dev/null
 fi
 
 echo ""
-echo "Done. To check out the source state of this revision later:"
-echo "  git checkout $tag"
+echo "Done. To check out the full state of this revision later:"
+echo "  (app)  git -C \"$APP_DIR\" checkout $tag"
+if [[ -n "$docs_sha" ]]; then
+  echo "  (docs) git -C \"$DOCS_DIR\" checkout $tag"
+fi
