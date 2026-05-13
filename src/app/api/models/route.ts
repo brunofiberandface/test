@@ -58,6 +58,22 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    // 2026-05-13: auto-generate the back-view reference right after creation.
+    // Previously this was a manual step in /models/[id] UI — Bruno requested it
+    // happen automatically so every new model is render-ready (M02/M04 paths
+    // need backReferenceImageUrl). Fire-and-forget, mirrors the celebrity
+    // check pattern. Errors are logged but don't fail the create.
+    if (finalImageUrl) {
+      const baseUrl = process.env.INTERNAL_BASE_URL || `http://localhost:${process.env.PORT || 3000}`;
+      fetch(`${baseUrl}/api/models/generate-back`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ modelId: trimmedId }),
+      })
+        .then(r => console.log(`[Models] Back view trigger for ${trimmedId} → HTTP ${r.status}`))
+        .catch(err => console.error(`[Models] Back view trigger failed for ${trimmedId}:`, err));
+    }
+
     return NextResponse.json({ success: true, modelId: trimmedId });
   } catch (error) {
     console.error('Error creating model:', error);
