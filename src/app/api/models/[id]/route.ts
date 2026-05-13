@@ -110,6 +110,19 @@ export async function DELETE(
       archivedAt: new Date(),
       updatedAt: new Date(),
     });
+
+    // Fire-and-forget reconcile of the QA shoe×model matrix so any cells
+    // referencing this model get archived immediately. Reconcile-only — no
+    // Seedream calls, fast Firestore-only pass.
+    const baseUrl = process.env.INTERNAL_BASE_URL || `http://localhost:${process.env.PORT || '3000'}`;
+    fetch(`${baseUrl}/api/qa/shoe-matrix/sync`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ reconcileOnly: true }),
+    })
+      .then(res => console.log(`[Models DELETE] matrix reconcile kick: ${res.status}`))
+      .catch(err => console.warn('[Models DELETE] matrix reconcile failed (non-blocking):', err));
+
     return NextResponse.json({ success: true, archived: true });
   } catch (error) {
     console.error('Error archiving model:', error);

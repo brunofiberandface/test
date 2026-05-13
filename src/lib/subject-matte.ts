@@ -141,6 +141,34 @@ export async function addGroundingShadowGemini(
     });
     const ms = Date.now() - t0;
     console.log(`[GroundingShadow:${mode}] ok in ${ms}ms (${result.imageData.length} bytes)`);
+
+    // ── 2026-05-13 fix: snap near-white pixels to pure #FFFFFF (white only) ──
+    // Gemini-3-pro-image-preview occasionally repaints the entire backdrop to
+    // its "studio white" interpretation (~#E5E1E1) instead of preserving the
+    // pure #FFFFFF that came out of the Cloud Run Job's Python composite.
+    // Caught 2026-05-13 on Judee Low Waist Loose Jeans 53 (backdrop=#E5E1E1,
+    // 30 units off white). Comparable shots (Raw denim kick jacket, Midge,
+    // LOUX) rendered at #FDFDFD/#FEFEFE — so it's intermittent Gemini drift,
+    // not systemic.
+    //
+    // Fix: post-Gemini, walk all pixels and snap any pixel with all three
+    // channels > THRESHOLD (240) to exact (255,255,255). Preserves the
+    // contact + cast shadow Gemini added (those darker pixels stay below
+    // threshold), and forces deterministic pure-white backdrop everywhere
+    // else. Cheap: ~50-100ms via sharp.
+    if (mode === 'white') {
+      try {
+        const snapped = await snapNearWhiteToPure(result.imageData);
+        const totalMs = Date.now() - t0;
+        console.log(`[GroundingShadow:white] snap-to-white done (+${totalMs - ms}ms, total ${totalMs}ms)`);
+        return { buffer: snapped, ok: true, ms: totalMs };
+      } catch (snapErr) {
+        // Snap is non-blocking — fall back to Gemini's output if sharp fails.
+        console.error(`[GroundingShadow:white] snap-to-white FAILED (non-blocking, keeping Gemini output):`,
+          snapErr instanceof Error ? snapErr.message : snapErr);
+      }
+    }
+
     return { buffer: result.imageData, ok: true, ms };
   } catch (err) {
     const ms = Date.now() - t0;
@@ -148,6 +176,86 @@ export async function addGroundingShadowGemini(
       err instanceof Error ? err.message : err);
     return { buffer, ok: false, ms };
   }
+}
+
+/**
+ * Adaptive snap-to-white: detects the actual backdrop color from the image
+ * corners, then snaps every pixel within TOL of that detected color to exact
+ * (255, 255, 255). Preserves the subject and shadow regions (which have
+ * sufficiently different colors).
+ *
+ * Why adaptive: a simple "pixels brighter than 240 → snap" misses the
+ * 2026-05-13 Judee case where Gemini drifted the entire backdrop to
+ * #E5E1E1 (229, 225, 225) — all three channels below 240, so nothing
+ * snapped. By sampling the corners first, we identify the actual drift
+ * target (whatever Gemini rendered as "the studio white") and snap that
+ * specific color range to pure white. Subject/shadow regions stay
+ * untouched because their colors fall outside the detected backdrop
+ * tolerance.
+ *
+ * Safety guards:
+ *  - If the detected backdrop is already ≥250 across all channels → return
+ *    unchanged (no drift to correct).
+ *  - If the detected backdrop is <200 across all channels → return unchanged
+ *    (subject is in the corner; can't safely identify backdrop).
+ *
+ * TOL = 15: empirically wide enough to catch JPEG-like compression noise
+ * and Gemini's slight per-region variation while narrow enough not to grab
+ * light clothing or pale skin.
+ */
+async function snapNearWhiteToPure(buffer: Buffer): Promise<Buffer> {
+  const sharp = (await import('sharp')).default;
+  const TOL = 15;
+
+  const image = sharp(buffer);
+  const meta = await image.metadata();
+  const { width: w, height: h } = meta;
+  if (!w || !h) throw new Error('snapNearWhiteToPure: missing image dimensions');
+
+  const { data, info } = await image.ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+  const channels = info.channels;
+
+  // Detect backdrop color from a 100×100 top-left sample. M03/M04/M06 are
+  // 3:4 portrait full-body with the subject vertically centered — the top
+  // corners are reliably backdrop.
+  const sampleSize = 100;
+  let sumR = 0, sumG = 0, sumB = 0, n = 0;
+  for (let y = 0; y < sampleSize && y < h; y++) {
+    for (let x = 0; x < sampleSize && x < w; x++) {
+      const i = (y * w + x) * channels;
+      sumR += data[i];
+      sumG += data[i + 1];
+      sumB += data[i + 2];
+      n++;
+    }
+  }
+  const bgR = sumR / n;
+  const bgG = sumG / n;
+  const bgB = sumB / n;
+
+  // No drift detected — already pure-white-ish.
+  if (bgR >= 250 && bgG >= 250 && bgB >= 250) {
+    return buffer;
+  }
+  // Sample doesn't look like backdrop — bail rather than mangle the image.
+  if (bgR < 200 || bgG < 200 || bgB < 200) {
+    return buffer;
+  }
+
+  // Snap all pixels within ±TOL of detected backdrop to pure white.
+  for (let i = 0; i < data.length; i += channels) {
+    if (
+      Math.abs(data[i]     - bgR) <= TOL &&
+      Math.abs(data[i + 1] - bgG) <= TOL &&
+      Math.abs(data[i + 2] - bgB) <= TOL
+    ) {
+      data[i]     = 255;
+      data[i + 1] = 255;
+      data[i + 2] = 255;
+      // alpha (i+3) left alone
+    }
+  }
+  return sharp(data, { raw: { width: w, height: h, channels } }).png().toBuffer();
 }
 
 interface JobOperation {

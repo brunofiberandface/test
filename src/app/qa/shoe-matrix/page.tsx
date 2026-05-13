@@ -30,6 +30,22 @@ interface MatrixCell {
   errorMessage?: string;
 }
 
+interface SyncResult {
+  reconciled: {
+    archivedCells: number;
+    unarchivedCells: number;
+    createdPending: number;
+    skippedNewModels: number;
+  };
+  rendered: {
+    attempted: number;
+    succeeded: number;
+    failed: number;
+    skippedOverBudget: number;
+  };
+  durationMs: number;
+}
+
 export default function ShoeMatrixPage() {
   const [shoes, setShoes] = useState<WardrobeShoe[]>([]);
   const [models, setModels] = useState<ModelLite[]>([]);
@@ -37,6 +53,8 @@ export default function ShoeMatrixPage() {
   const [cells, setCells] = useState<MatrixCell[]>([]);
   const [loading, setLoading] = useState(true);
   const [renderingCells, setRenderingCells] = useState<Set<string>>(new Set());
+  const [syncing, setSyncing] = useState(false);
+  const [lastSync, setLastSync] = useState<SyncResult | null>(null);
 
   const fetchShoes = useCallback(async () => {
     const res = await fetch('/api/wardrobe?category=shoes');
@@ -114,6 +132,44 @@ export default function ShoeMatrixPage() {
     }
   }
 
+  /**
+   * Sync the entire matrix: reconcile (archive orphaned cells from removed
+   * models, create pending cells for new active models > 1h old, un-archive
+   * resurrected cells) + render any pending/failed cells within the budget.
+   *
+   * Server-side render budget is ~13min. Long backlogs may need multiple syncs.
+   *
+   * Pass `forceRerender: true` to flip every existing `done` cell back to
+   * pending first (used when the underlying prompt changes and you want the
+   * whole matrix re-baselined).
+   */
+  async function syncEverything(forceRerender = false) {
+    if (syncing) return;
+    const msg = forceRerender
+      ? 'Re-render the ENTIRE matrix from scratch (overwrites every existing render)? Long backlog — may need several syncs to finish. Continue?'
+      : 'Sync the full matrix: archive removed-model cells, render every missing shoe×model combo. Server processes up to ~13min of renders per call (re-run after if more remain). Continue?';
+    if (!confirm(msg)) return;
+    setSyncing(true);
+    try {
+      const res = await fetch('/api/qa/shoe-matrix/sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ forceRerender }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        alert(`Sync failed: ${data.error || res.statusText}`);
+        return;
+      }
+      const result: SyncResult = await res.json();
+      setLastSync(result);
+      // Reload cells for the currently selected shoe so the UI reflects new state.
+      if (selectedShoeId) fetchCells(selectedShoeId);
+    } finally {
+      setSyncing(false);
+    }
+  }
+
   async function toggleBlock(modelId: string, currentlyBlocked: boolean) {
     if (!selectedShoeId) return;
     const id = `${selectedShoeId}_${modelId}`;
@@ -145,11 +201,55 @@ export default function ShoeMatrixPage() {
   return (
     <Shell>
       <div className="p-6 max-w-7xl mx-auto">
-        <h1 className="text-2xl font-bold text-neutral-900 mb-2">QA — Shoe × Model Matrix</h1>
-        <p className="text-sm text-neutral-600 mb-6">
-          Pre-render each model wearing each shoe (basics + shoes, no jeans) to verify shoe scale and fit per
-          combination. Block bad combos so the new-job wizard warns when picking them.
-        </p>
+        <div className="flex items-start justify-between mb-2 gap-4">
+          <div>
+            <h1 className="text-2xl font-bold text-neutral-900 mb-2">QA — Shoe × Model Matrix</h1>
+            <p className="text-sm text-neutral-600">
+              Pre-render each model wearing each shoe (basics + shoes, no jeans) to verify shoe scale and fit per
+              combination. Block bad combos so the new-job wizard warns when picking them.
+            </p>
+          </div>
+          <div className="flex gap-2">
+            <button
+              onClick={() => syncEverything(false)}
+              disabled={syncing}
+              className="bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed text-white px-4 py-2 rounded text-sm font-medium whitespace-nowrap"
+              title="Reconcile matrix against active shoes/models, then render every missing cell. Models younger than 1h are skipped (buffer for misclicks)."
+            >
+              {syncing ? 'Syncing…' : 'Sync everything'}
+            </button>
+            <button
+              onClick={() => syncEverything(true)}
+              disabled={syncing}
+              className="bg-red-600 hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed text-white px-4 py-2 rounded text-sm font-medium whitespace-nowrap"
+              title="Wipe every existing rendered cell back to pending and re-render the whole matrix. Use after a prompt change."
+            >
+              Re-render all
+            </button>
+          </div>
+        </div>
+
+        {lastSync && (
+          <div className="mb-6 mt-4 px-4 py-3 bg-indigo-50 border border-indigo-200 rounded text-xs">
+            <div className="font-medium text-indigo-900 mb-1">
+              Last sync completed in {(lastSync.durationMs / 1000).toFixed(1)}s
+            </div>
+            <div className="text-indigo-800 space-x-3">
+              <span>Reconciled: <strong>{lastSync.reconciled.archivedCells}</strong> archived</span>
+              <span><strong>{lastSync.reconciled.unarchivedCells}</strong> unarchived</span>
+              <span><strong>{lastSync.reconciled.createdPending}</strong> new pending</span>
+              <span><strong>{lastSync.reconciled.skippedNewModels}</strong> models still in 1h buffer</span>
+              <span>·</span>
+              <span>Rendered: <strong>{lastSync.rendered.succeeded}</strong>/{lastSync.rendered.attempted} ok</span>
+              {lastSync.rendered.failed > 0 && <span className="text-red-700"><strong>{lastSync.rendered.failed}</strong> failed</span>}
+              {lastSync.rendered.skippedOverBudget > 0 && (
+                <span className="text-amber-700">
+                  <strong>{lastSync.rendered.skippedOverBudget}</strong> over budget — re-run to continue
+                </span>
+              )}
+            </div>
+          </div>
+        )}
 
         {loading && <div className="text-neutral-500">Loading…</div>}
 
