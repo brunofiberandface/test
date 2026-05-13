@@ -3,9 +3,10 @@
  * Models have a single 4K reference image (no more generated model cards).
  */
 import { NextRequest, NextResponse } from 'next/server';
-import { listModels, createModel } from '@/lib/firestore';
+import { listModels, createModel, updateModel } from '@/lib/firestore';
 import { uploadModelCardImage } from '@/lib/gcs';
 import { triggerCelebrityCheck } from '@/lib/celebrity-check';
+import { makeWhiteBgRef } from '@/lib/pipeline/model-whitebg';
 
 // GET /api/models — list models
 //
@@ -51,27 +52,53 @@ export async function POST(req: NextRequest) {
       createdBy,
     });
 
-    // Fire-and-forget celebrity check on the reference image
+    // Fire-and-forget celebrity check on the original reference image
+    // (runs in parallel with the white-bg + back-view pipeline below)
     if (finalImageUrl) {
       triggerCelebrityCheck(trimmedId, finalImageUrl).catch(err =>
         console.error(`[Models] Celebrity check fire failed for ${trimmedId}:`, err)
       );
     }
 
-    // 2026-05-13: auto-generate the back-view reference right after creation.
-    // Previously this was a manual step in /models/[id] UI — Bruno requested it
-    // happen automatically so every new model is render-ready (M02/M04 paths
-    // need backReferenceImageUrl). Fire-and-forget, mirrors the celebrity
-    // check pattern. Errors are logged but don't fail the create.
+    // 2026-05-13: post-creation pipeline (Bruno: "process all other models
+    // that don't have a white background, and that step needs to happen at
+    // model creation" + "always generate back view as well, this is now
+    // manual"). Runs async in the background — the user-facing create
+    // response returns immediately. Sequence matters:
+    //
+    //   1. Matte the uploaded front reference to pure-white-bg (rembg + sharp,
+    //      $0 cost). Updates referenceImageUrl to the clean version.
+    //   2. Trigger back-view generation — uses the new white-bg
+    //      referenceImageUrl as the identity source, so back view inherits
+    //      the clean backdrop too.
+    //
+    // Both steps fire-and-forget; failures are logged but don't fail the
+    // user's create call. The manual /models/[id] regenerate button stays
+    // as a re-run fallback.
     if (finalImageUrl) {
-      const baseUrl = process.env.INTERNAL_BASE_URL || `http://localhost:${process.env.PORT || 3000}`;
-      fetch(`${baseUrl}/api/models/generate-back`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ modelId: trimmedId }),
-      })
-        .then(r => console.log(`[Models] Back view trigger for ${trimmedId} → HTTP ${r.status}`))
-        .catch(err => console.error(`[Models] Back view trigger failed for ${trimmedId}:`, err));
+      (async () => {
+        try {
+          console.log(`[Models] Starting post-create pipeline for ${trimmedId}…`);
+          // Step 1: matte to white-bg, update referenceImageUrl
+          const whiteRefUrl = await makeWhiteBgRef(finalImageUrl, trimmedId, 'front');
+          await updateModel(trimmedId, {
+            referenceImageUrl: whiteRefUrl,
+            originalReferenceImageUrl: finalImageUrl.split('?')[0],
+          });
+          console.log(`[Models] ${trimmedId} referenceImageUrl now white-bg`);
+
+          // Step 2: trigger back-view (reads the updated white-bg front)
+          const baseUrl = process.env.INTERNAL_BASE_URL || `http://localhost:${process.env.PORT || 3000}`;
+          const r = await fetch(`${baseUrl}/api/models/generate-back`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ modelId: trimmedId }),
+          });
+          console.log(`[Models] Back view trigger for ${trimmedId} → HTTP ${r.status}`);
+        } catch (err) {
+          console.error(`[Models] Post-create pipeline failed for ${trimmedId}:`, err);
+        }
+      })();
     }
 
     return NextResponse.json({ success: true, modelId: trimmedId });

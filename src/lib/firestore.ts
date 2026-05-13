@@ -162,6 +162,7 @@ export async function updateModel(modelId: string, data: Partial<{
   description: string;
   referenceImageUrl: string;
   backReferenceImageUrl: string;
+  originalReferenceImageUrl: string;  // pre-matte original (rollback)
   active: boolean;
 }>) {
   await modelsCol.doc(modelId).update({ ...data, updatedAt: new Date() });
