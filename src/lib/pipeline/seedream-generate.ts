@@ -769,10 +769,38 @@ async function seedreamM05(ctx: SeedreamGenerationContext, prompt: LoadedPrompt)
   const labelUrls = await resolveLabelAssetUrls(item);
 
   // Build prompt — use the loaded promptVault prompt (rev 33) as-is.
-  const finalPrompt = await buildPrompt(
+  let finalPrompt = await buildPrompt(
     prompt,
     ctx.wardrobe, ctx.modelId, item, 'back', ctx.silhouette, false, 'M05', ctx.model, ctx.focusSlot,
   );
+
+  // 2026-05-13 FIX: append a no-bare-skin guard. The vault prompt says "a
+  // thin slice of the tucked top is visible … no more than 10-15%" — that's
+  // permissive (upper bound), not mandatory. When Seedream drifts, it goes
+  // to 0% and renders bare back / nude upper torso (Bruno caught on
+  // j7RnJwgHfCTfEzgTXjpI, intermittent).
+  //
+  // Important: this guard does NOT change framing, crop, camera, or pocket
+  // hero proportions — those stay as defined by the vault prompt (back-right
+  // pocket 40-50% of frame, upper-thigh bottom edge, upper body / shoulders
+  // / head out of frame). The ONLY change is what fills the small space
+  // above the waistband at the top edge: it must be the tucked-top's fabric
+  // hem (same thin sliver the vault already allows), NEVER bare skin.
+  finalPrompt += `
+
+═══ MANDATORY — NO BARE SKIN ABOVE THE WAISTBAND ═══
+This guard does NOT change the framing, crop, camera position, or pocket-hero proportions described above — those stay exactly as specified. The hero is still the back-right pocket; the bottom of frame is still upper-to-mid-thigh; upper body / shoulders / head are still out of frame. The ONLY thing this section locks down is what's rendered in the small region above the waistband at the top edge of the frame.
+
+In that region, the visible content MUST be the fabric hem of the tucked-in top — same thin sliver the framing already allows — NOT bare skin. The model is wearing a tucked-in top throughout this shot; treat the top as long enough to reach below the waistband and be tucked in, so the only thing visible above the waistband (within the existing crop) is the top's fabric.
+
+DO NOT zoom out, reframe, or include more of the top to satisfy this — keep the same tight crop. Just ensure the small slice above the waistband is fabric, not skin.
+
+FAILURE MODES — ABSOLUTELY WRONG:
+- bare back, bare upper torso, bare shoulders, or any nudity in the small region above the waistband.
+- the model rendered topless or without any garment above the waistband.
+- bare skin visible at the top of the frame instead of the tucked top's fabric.
+- a gap of bare skin between the top's hem and the waistband.
+- zooming out or reframing to fit more of the top — keep the same crop, just swap skin for fabric in the same region.`;
 
   const tagSegments: string[] = [];
   if (modelBackRefAdded) tagSegments.push('+MODEL_BACK');

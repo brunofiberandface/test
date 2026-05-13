@@ -213,6 +213,24 @@ export async function generateM06WithGemini(ctx: GeminiM06Context): Promise<Gemi
     label: `IMAGE 2 — MODEL IDENTITY (the ONLY identity source). The rendered model is the SAME PERSON as in IMAGE 2 — exact same skin tone, exact same complexion depth, exact same hair color and length, exact same hair texture, exact same facial features. The pose in IMAGE 2 is NOT the target pose; pose comes from IMAGE 1 (or the text description if IMAGE 1 is omitted).`,
   });
 
+  // Slot 1B: identity head crop — added 2026-05-13. Bottom-focus M06 was
+  // drifting on skin tone (Bruno caught j7RnJwgHfCTfEzgTXjpI rendering with
+  // skin not matching the model). Top-focus M06 already had this anchor and
+  // didn't show the drift — mirror it for bottom-focus. The head crop forces
+  // Gemini to fuse facial features + skin tone at exactly the resolution
+  // identity is recovered from, instead of relying solely on the full body
+  // card where the face is a small portion and skin signal gets diluted.
+  try {
+    const headCropBuf = await buildIdentityHeadCrop(modelImg.buffer);
+    refs.push({
+      buffer: headCropBuf,
+      mimeType: 'image/png',
+      label: `IMAGE 2B — IDENTITY ANCHOR (head + shoulders crop, same person as IMAGE 2). Cropped tight on the face + hair + neckline so the identity and SKIN TONE signal is unambiguous. The rendered model's FACE must match IMAGE 2B: same eye shape, same nose, same lip shape, same jawline. The rendered model's SKIN TONE must match IMAGE 2B exactly: same undertone, same depth, no shift toward editorial warmth, no shift toward paler/darker. The rendered model's HAIR must match IMAGE 2B exactly: same color, same length, same parting, same texture.`,
+    });
+  } catch (e) {
+    console.warn(`[GeminiM06] identity head crop failed (non-blocking):`, (e as Error).message);
+  }
+
   // Slot 2: garment flat front
   if (bottomFlat) {
     const flatImg = await fetchAsBuffer(bottomFlat);
@@ -241,8 +259,8 @@ FULL-BODY composition with HEADROOM. The ENTIRE model is visible inside the fram
 
 If the chosen pose would cause cropping, ZOOM OUT — make the model smaller within the frame rather than crop any part of the body.
 
-═══ IDENTITY (from IMAGE 2 ONLY) ═══
-The rendered model is the SAME PERSON as in IMAGE 2 — a ${modelGender} model with these specific attributes${modelDescription ? `: ${modelDescription.split('\n')[0].slice(0, 280)}` : ''}. Exact same skin tone, complexion depth, hair color, hair length, hair texture, facial features, body proportions, and ${modelGender === 'male' ? 'facial-hair / beard pattern' : 'face structure'}. The model in IMAGE 1 (if present) is a DIFFERENT person whose pose is being copied — the rendered model's identity does NOT take ANY attributes from IMAGE 1. If IMAGE 1's model has lighter skin, different hair, different ethnicity, or a different gender, the rendered model still has IMAGE 2's exact identity. The rendered model is ${modelGender.toUpperCase()} — never invent a different gender.
+═══ IDENTITY (from IMAGE 2 + IMAGE 2B ONLY) ═══
+The rendered model is the SAME PERSON as in IMAGE 2 and IMAGE 2B — a ${modelGender} model with these specific attributes${modelDescription ? `: ${modelDescription.split('\n')[0].slice(0, 280)}` : ''}. Exact same skin tone with the SAME undertone and depth as IMAGE 2B (do NOT shift toward editorial warmth, do NOT shift paler or darker), exact same complexion, exact same hair color, hair length, and hair texture, exact same facial features, body proportions, and ${modelGender === 'male' ? 'facial-hair / beard pattern' : 'face structure'}. The model in IMAGE 1 (if present) is a DIFFERENT person whose pose is being copied — the rendered model's identity does NOT take ANY attributes from IMAGE 1. If IMAGE 1's model has lighter skin, different hair, different ethnicity, or a different gender, the rendered model still has IMAGE 2 + IMAGE 2B's exact identity. The rendered model is ${modelGender.toUpperCase()} — never invent a different gender.
 
 ═══ POSE (from IMAGE 1 / text description) ═══
 The model in the rendered output is in EXACTLY the body pose specified below. Specifically:
@@ -298,7 +316,7 @@ ${wardrobeShoeDescription
 Backdrop: clean light-grey studio sweep, no scuffs, no texture, no marks. Floor: continuous extension of the backdrop with a faint contact shadow under the feet.
 
 ═══ FAILURE MODES TO AVOID ═══
-- WRONG: rendering a different model identity than IMAGE 2.
+- WRONG: rendering a different model identity than IMAGE 2 + IMAGE 2B (any face, skin tone, or hair mismatch — skin tone in particular must match IMAGE 2B exactly).
 - WRONG: mirroring the hands.
 - WRONG: rendering hands in front pockets when the spec says hidden behind the body.
 - WRONG: rendering the head facing forward when the spec says the head turns back.
@@ -311,7 +329,7 @@ Backdrop: clean light-grey studio sweep, no scuffs, no texture, no marks. Floor:
 - WRONG: hem treatment differing from IMAGE 3 / the description above. If a rolled / cuffed hem is shown or described, the rendered jeans have a rolled hem.
 - WRONG: rendering the jeans from IMAGE 1 (POSE REFERENCE) instead of IMAGE 3. IMAGE 1's bottoms are NEVER the target.
 
-The pose MUST match the spec. The identity MUST match IMAGE 2 (${modelGender} model). The top MUST be ${wardrobeTopDescription ? 'the top described in the TOP section above' : 'a plain black sports bra'}. The jeans MUST match IMAGE 3 + FIT MODEL ANGLES${wardrobeBottomDescription ? ' + the description above' : ''} (wash, hem treatment, fit, hardware — all literal, no editorial drift). The footwear MUST be ${wardrobeShoeDescription ? 'the footwear described in the FOOTWEAR section above' : 'appropriate simple shoes'}. These are non-negotiable.`;
+The pose MUST match the spec. The identity MUST match IMAGE 2 + IMAGE 2B (${modelGender} model, exact skin tone). The top MUST be ${wardrobeTopDescription ? 'the top described in the TOP section above' : 'a plain black sports bra'}. The jeans MUST match IMAGE 3 + FIT MODEL ANGLES${wardrobeBottomDescription ? ' + the description above' : ''} (wash, hem treatment, fit, hardware — all literal, no editorial drift). The footwear MUST be ${wardrobeShoeDescription ? 'the footwear described in the FOOTWEAR section above' : 'appropriate simple shoes'}. These are non-negotiable.`;
 
   console.log(`[GeminiM06] Calling Gemini-3-pro-image-preview (${refs.length} refs, pose=${pose.id})...`);
   const t0 = Date.now();
