@@ -119,23 +119,30 @@ async function refFromUrl(url: string, label: string): Promise<SeedreamReference
 }
 
 /**
- * M05 SMART-CROP HELPER (added 2026-05-11 with Track A).
+ * SMART-CROP HELPER (originally M05-only 2026-05-11, generalized 2026-05-13).
  *
  * Downloads `sourceUrl`, crops to vertical band [fromPct, toPct], uploads to
  * GCS at a content-addressed path, returns the cropped URL. Re-uses an
  * existing cropped object if already cached.
  *
- * Why: M05 framing was being dominated by the full-body model card + fit-model
+ * Why: ref framing was being dominated by the full-body model card + fit-model
  * refs (visual evidence > text instructions per LEARNING #89). Cropping these
- * refs to just the hip/buttock zone BEFORE Seedream sees them aligns the
+ * refs to just the relevant zone BEFORE Seedream sees them aligns the
  * visual + text signals — Seedream renders tight when refs are tight.
  *
- * Per-ref crops (validated against H6Is/F9):
- *   MODEL CARD BACK     → vertical 5-30%  (head/shoulders only — skin tone,
+ * Per-ref crops in production:
+ *   MODEL CARD FRONT    → vertical 0-30%  (M03 head/shoulders identity anchor
+ *                                          — counters fit-model identity bleed
+ *                                          when 3 fit-model angles outvote the
+ *                                          single full-body model card)
+ *   MODEL CARD BACK     → vertical 5-30%  (M05 head/shoulders — skin tone,
  *                                          NO compression-shorts styling)
- *   FIT MODEL BACK 45°  → vertical 25-60% (hip/buttock — garment + framing)
+ *   FIT MODEL BACK 45°  → vertical 25-60% (M05 hip/buttock — garment + framing)
  *
- * Cache: GCS path m05-cropped-refs/{sha1(sourceUrl|from|to)}.jpg
+ * Cache: GCS path cropped-refs/{sha1(sourceUrl|from|to)}.jpg. Renamed from
+ * m05-cropped-refs/ on 2026-05-13 when M03 started using the same helper —
+ * existing M05 cache entries remain valid under the old path; new entries go
+ * to the unified path. Both paths are read-only references by Seedream.
  */
 async function cropAndCacheRef(
   sourceUrl: string,
@@ -148,7 +155,7 @@ async function cropAndCacheRef(
 
   const clean = sourceUrl.split('?')[0];
   const key = crypto.createHash('sha1').update(`${clean}|${fromPct}|${toPct}`).digest('hex');
-  const gcsPath = `m05-cropped-refs/${key}.jpg`;
+  const gcsPath = `cropped-refs/${key}.jpg`;
   const publicUrl = `https://storage.googleapis.com/gstar-ai-studio-assets/${gcsPath}`;
 
   const storage = new Storage();
@@ -429,6 +436,21 @@ async function seedreamM03(ctx: SeedreamGenerationContext, prompt: LoadedPrompt)
   refs.push(await refFromUrl(STUDIO_BACKDROP_URL, STUDIO_BACKDROP_LABEL));
   refs.push(await refFromUrl(modelRefUrl, 'MODEL CARD (FRONT) — canonical, exclusive source of truth for the model\'s identity. Match the model shown in this card identically: every facial feature (eye shape, eye color, nose, mouth, brow shape), the natural facial expression and presence as captured here, skin tone with undertone, freckle pattern, hair color and texture, body proportions. The face and expression in this card are exactly correct — preserve them precisely when the model\'s face is rendered. Lighting on the rendered model is neutral — do not transfer warm key lighting from any other reference. STANCE, FOOT POSITION, HIP TILT, WEIGHT DISTRIBUTION, AND BODY POSE are NOT taken from this card — those come from the FIT MODEL angles. Do not copy the contrapposto, single-leg-weight, or any asymmetric stance shown in this card image.'));
 
+  // 2026-05-13 FIX: head-crop identity anchor. M03 was occasionally drifting
+  // to a different model identity (Bruno caught on 90e5Z1nFR1XwS7BZyG6a)
+  // because the 3 fit-model angle refs (each with their own face) can
+  // outvote the single full-body MODEL CARD (FRONT) ref. Cropping the front
+  // card to head+shoulders gives Seedream an extra identity signal at face
+  // resolution — same pattern that fixed M06 skin drift today (top-focus
+  // 2026-05-12, bottom-focus 2026-05-13). cropAndCacheRef writes to GCS at
+  // a content-addressed path so it's a one-time cost per model.
+  try {
+    const headCropUrl = await cropAndCacheRef(modelRefUrl, 0.0, 0.30);
+    refs.push(await refFromUrl(headCropUrl, 'MODEL CARD (FRONT) — HEAD AND SHOULDERS CROP. Identity anchor: face features, hair color/length/texture, skin tone with undertone, freckles. Same person as MODEL CARD (FRONT) full-body ref above — this crop reinforces the identity at face resolution so it can\'t be diluted by the fit-model angles below. STANCE, POSE, GARMENTS are NOT taken from this crop.'));
+  } catch (e) {
+    console.warn(`[Seedream M03] head-crop identity anchor skipped (non-blocking):`, (e as Error).message);
+  }
+
   if (ctx.focusSlot === 'top') {
     // FOCUS — top garment refs. Without these, Seedream has no visual anchor
     // for the focus jacket and renders the hem / sleeves / closures from
@@ -443,13 +465,17 @@ async function seedreamM03(ctx: SeedreamGenerationContext, prompt: LoadedPrompt)
     for (let i = 0; i < topAnglesToInclude.length; i++) {
       refs.push(await refFromUrl(topAnglesToInclude[i], `FOCUS TOP FIT MODEL FRONT ANGLE ${i + 1} — focus garment on a fit model. Use ONLY for the focus top's fit, drape, hem behaviour, sleeve length and how the top sits on the body. SKIN TONE, COMPLEXION, IDENTITY, BACKDROP, FLOOR, and any garments worn below the waist are NOT taken from this image.`));
     }
-    // Styling bottom — full visual ref set (flat + 3 angles) so jeans wash
-    // and fit are anchored visually, matching what bottom-focus jobs get.
-    // M03 has plenty of headroom: 1 backdrop + 1 model + 4 top + 4 bottom = 10
-    // refs at the BytePlus limit, so we keep all 4 bottom refs.
+    // Styling bottom — flat + 2 angles (reduced from 3 on 2026-05-13 to make
+    // room for the head-crop identity anchor without overflowing the
+    // BytePlus 10-ref limit). Budget now:
+    //   1 backdrop + 1 model + 1 head crop + 4 top + 3 bottom = 10. Exactly
+    // at the limit. Dropping the 3rd styling-bottom angle is the right
+    // trade: the bottom is NOT the focus in top-focus jobs (it's supporting
+    // context), so 2 angles + 1 flat is enough for fit/drape/wash reference.
     refs.push(await refFromUrl(bottomFlat, 'STYLING BOTTOM FLAT — the styling bottom (pants/jeans) for color, wash, fabric, fit. Not the focus garment — render accurately in support of the focus top, no extra detail or invented hardware.'));
-    for (let i = 0; i < bottomAngles.length; i++) {
-      refs.push(await refFromUrl(bottomAngles[i], `STYLING BOTTOM FIT MODEL FRONT ANGLE ${i + 1} — the styling bottom (pants/jeans) on a fit model for fit, drape, length, wash. SKIN TONE, COMPLEXION, IDENTITY, BACKDROP, KEY-LIGHT COLOR, and the top half of the outfit are NOT taken from this image.`));
+    const stylingBottomAnglesTopFocus = bottomAngles.slice(0, 2);
+    for (let i = 0; i < stylingBottomAnglesTopFocus.length; i++) {
+      refs.push(await refFromUrl(stylingBottomAnglesTopFocus[i], `STYLING BOTTOM FIT MODEL FRONT ANGLE ${i + 1} — the styling bottom (pants/jeans) on a fit model for fit, drape, length, wash. SKIN TONE, COMPLEXION, IDENTITY, BACKDROP, KEY-LIGHT COLOR, and the top half of the outfit are NOT taken from this image.`));
     }
   } else {
     // BOTTOM-FOCUS (default) — bottom is the hero, full ref set.

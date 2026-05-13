@@ -32,6 +32,7 @@ import type { JobWardrobe, FocusSlot } from '@/types';
 import { getM06Pose, type M06Pose } from '@/lib/m06-poses';
 import { getM06TopPose, pickM06TopPose, type M06TopPose } from '@/lib/m06-top-poses';
 import { generateImage, type ReferenceImage } from '@/lib/vertex';
+import { buildIdentityHeadCrop } from './identity-head-crop';
 
 /** Inlined from seedream-generate.ts:getFocusGarmentUrls — pulls bottom-item
  *  flat front + 3 fit-model front angles. M06 always uses bottom (jeans). */
@@ -364,21 +365,9 @@ The pose MUST match the spec. The identity MUST match IMAGE 2 + IMAGE 2B (${mode
 // rerun-with-m06-top-pose (parallel to the M05 variant rerun endpoint).
 // ═══════════════════════════════════════════════════════════════════════════
 
-/** Head-crop a model card to head-and-shoulders. Used as IMAGE 2B identity
- *  anchor when no pre-cropped identity ref is stored on the model doc. Fast
- *  in-process crop via sharp — no GCS roundtrip, no extra storage. */
-async function buildIdentityHeadCrop(modelCardBuffer: Buffer): Promise<Buffer> {
-  // Lazy import — sharp is already a hard dep for image processing elsewhere
-  const sharp = (await import('sharp')).default;
-  const meta = await sharp(modelCardBuffer).metadata();
-  const w = meta.width || 1792;
-  const h = meta.height || 2400;
-  // Top 30% vertically × center 60% horizontally — head + shoulders only.
-  const cropW = Math.floor(w * 0.6);
-  const cropH = Math.floor(h * 0.30);
-  const left = Math.floor((w - cropW) / 2);
-  return sharp(modelCardBuffer).extract({ left, top: 0, width: cropW, height: cropH }).png().toBuffer();
-}
+// buildIdentityHeadCrop now lives in src/lib/pipeline/identity-head-crop.ts —
+// shared between M06 (Gemini) and M03 (Seedream) where the same head-crop
+// identity anchor solves identical face/skin drift modes.
 
 async function generateM06TopFocusWithGemini(ctx: GeminiM06Context): Promise<GeminiM06Result> {
   // Resolve pose: explicit override > random pick
