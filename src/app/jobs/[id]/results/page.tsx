@@ -1274,9 +1274,14 @@ export default function ResultsPage() {
                 <span className="text-xs text-white font-medium">
                   {shot.type}{shot.variant !== 'A' ? `-${shot.variant}` : ''}
                 </span>
-                {shot.version > 1 && (
-                  <span className="text-xs text-neutral-400">v{shot.version}</span>
-                )}
+                <span className="flex items-center gap-2">
+                  {shot.version > 1 && (
+                    <span className="text-xs text-neutral-400">v{shot.version}</span>
+                  )}
+                  {job?.jobNumber != null && (
+                    <span className="text-xs text-neutral-300 font-medium">#{job.jobNumber}</span>
+                  )}
+                </span>
               </div>
             </div>
             <div className="p-2">
@@ -1357,7 +1362,12 @@ export default function ResultsPage() {
                     )}
                   </div>
                   <div className="px-2 py-1.5">
-                    <p className="text-[11px] font-semibold">{shot.type}</p>
+                    <div className="flex justify-between items-center">
+                      <p className="text-[11px] font-semibold">{shot.type}</p>
+                      {job?.jobNumber != null && (
+                        <p className="text-[11px] text-neutral-400 font-medium">#{job.jobNumber}</p>
+                      )}
+                    </div>
                     <p className="text-[10px] text-neutral-500">{shot.label}</p>
                   </div>
                 </div>
