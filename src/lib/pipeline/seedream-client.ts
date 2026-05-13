@@ -87,19 +87,28 @@ export interface SeedreamGenerateResult {
 }
 
 /**
- * Map our supported aspect ratios to BytePlus size strings. ~2K each so
- * Seedream native quality stays in spec; downstream pipelines (e.g. the 1:1
- * 4000×4000 square upscale in /api/generate) handle final delivery sizes.
+ * Map our supported aspect ratios to BytePlus size strings.
  *
- * BytePlus requires a minimum of 3,686,400 pixels (verified empirically from
- * their 400 error — "image size must be at least 3686400 pixels"). All of the
- * sizes below are safely above the floor.
+ * 2026-05-13: bumped from 2K to 4K native output across all aspects.
+ * Seedream 4.5 supports up to 4096×4096 (verified empirically + documented
+ * at the official BytePlus / WaveSpeedAI / AIML docs). Cost is FLAT per call
+ * regardless of resolution ($0.04/image), so 4K is a 4× pixel gain for free.
+ * Generation time goes up modestly: ~25s for non-square 4K vs ~14s for 2K,
+ * and ~48s for square 4K vs ~24s for square 2K.
+ *
+ * Why this matters: M01/M02 pants source resolution goes from ~1300×1300
+ * (cropped from M03 then lanczos-upscaled, washed out) to native 4K. AI
+ * super-resolution was unable to recover detail that wasn't there in the
+ * source — generating at 4K native is the only real fix.
+ *
+ * BytePlus minimum is 3,686,400 pixels (verified empirically). All sizes
+ * below are at the 4K cap.
  */
 function aspectToSize(aspect: '9:16' | '3:4' | '1:1'): string {
   switch (aspect) {
-    case '9:16': return '1472x2624'; // 3.86M pixels
-    case '3:4':  return '1728x2304'; // 3.98M pixels
-    case '1:1':  return '2048x2048'; // 4.19M pixels — square native
+    case '9:16': return '2304x4096'; // 9.44M pixels (was 1472x2624 = 3.86M)
+    case '3:4':  return '3072x4096'; // 12.58M pixels (was 1728x2304 = 3.98M)
+    case '1:1':  return '4096x4096'; // 16.78M pixels (was 2048x2048 = 4.19M)
   }
 }
 
