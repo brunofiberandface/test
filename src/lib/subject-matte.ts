@@ -114,12 +114,26 @@ Only change: add the subtle contact + barely-there leftward lean described above
 const GROUNDING_ASPECT = '3:4';
 const GROUNDING_SIZE = '4K';
 
+/** Retry config for transient Gemini errors (503/429). 2026-05-13 fix —
+ *  Kate Boyfriend Jeans 62 shipped shadow-less because all 5 grounding-shadow
+ *  calls 503'd on first attempt. Procedural shadow in the matte job is also
+ *  re-enabled (see produceBackdropVariants) so failing Gemini still leaves a
+ *  soft shadow under the feet; this retry layer further reduces the chance
+ *  the Gemini-enhanced shadow is missing. */
+const GROUNDING_MAX_ATTEMPTS = 3;
+const GROUNDING_RETRY_DELAYS_MS = [5_000, 15_000];
+
+function isTransientGeminiError(msg: string): boolean {
+  return /\b(503|429|UNAVAILABLE|RESOURCE_EXHAUSTED|deadline|timeout)\b/i.test(msg);
+}
+
 /**
- * Run a Gemini grounding-shadow pass on a no-shadow backdrop variant.
+ * Run a Gemini grounding-shadow pass on a backdrop variant.
  *
- * Falls back to the input buffer (returns it unchanged) on any Gemini error —
- * never throws. The shot still completes; the variant just looks "floating"
- * but is otherwise valid.
+ * Retries up to 3 times on transient 503/429 errors with exponential backoff.
+ * Falls back to the input buffer (returns it unchanged) only after all retries
+ * are exhausted — never throws. The shot still completes; with procedural
+ * shadow re-enabled in the matte job, the fallback still has a soft shadow.
  */
 export async function addGroundingShadowGemini(
   buffer: Buffer,
@@ -127,55 +141,85 @@ export async function addGroundingShadowGemini(
 ): Promise<{ buffer: Buffer; ok: boolean; ms: number }> {
   const t0 = Date.now();
   const prompt = mode === 'grey' ? GROUNDING_PROMPT_GREY : GROUNDING_PROMPT_WHITE;
-  try {
-    const result = await generateImage({
-      prompt,
-      referenceImages: [{
-        buffer,
-        mimeType: 'image/png',
-        label: 'SOURCE — no-shadow matted composite. Subject and backdrop must be preserved exactly.',
-      }],
-      aspectRatio: GROUNDING_ASPECT,
-      imageSize: GROUNDING_SIZE,
-      model: 'gemini-3-pro-image-preview',
-    });
-    const ms = Date.now() - t0;
-    console.log(`[GroundingShadow:${mode}] ok in ${ms}ms (${result.imageData.length} bytes)`);
-
-    // ── 2026-05-13 fix: snap near-white pixels to pure #FFFFFF (white only) ──
-    // Gemini-3-pro-image-preview occasionally repaints the entire backdrop to
-    // its "studio white" interpretation (~#E5E1E1) instead of preserving the
-    // pure #FFFFFF that came out of the Cloud Run Job's Python composite.
-    // Caught 2026-05-13 on Judee Low Waist Loose Jeans 53 (backdrop=#E5E1E1,
-    // 30 units off white). Comparable shots (Raw denim kick jacket, Midge,
-    // LOUX) rendered at #FDFDFD/#FEFEFE — so it's intermittent Gemini drift,
-    // not systemic.
-    //
-    // Fix: post-Gemini, walk all pixels and snap any pixel with all three
-    // channels > THRESHOLD (240) to exact (255,255,255). Preserves the
-    // contact + cast shadow Gemini added (those darker pixels stay below
-    // threshold), and forces deterministic pure-white backdrop everywhere
-    // else. Cheap: ~50-100ms via sharp.
-    if (mode === 'white') {
-      try {
-        const snapped = await snapNearWhiteToPure(result.imageData);
-        const totalMs = Date.now() - t0;
-        console.log(`[GroundingShadow:white] snap-to-white done (+${totalMs - ms}ms, total ${totalMs}ms)`);
-        return { buffer: snapped, ok: true, ms: totalMs };
-      } catch (snapErr) {
-        // Snap is non-blocking — fall back to Gemini's output if sharp fails.
-        console.error(`[GroundingShadow:white] snap-to-white FAILED (non-blocking, keeping Gemini output):`,
-          snapErr instanceof Error ? snapErr.message : snapErr);
+  let lastErr: unknown = null;
+  for (let attempt = 1; attempt <= GROUNDING_MAX_ATTEMPTS; attempt++) {
+    try {
+      const result = await generateImage({
+        prompt,
+        referenceImages: [{
+          buffer,
+          mimeType: 'image/png',
+          label: 'SOURCE — preserve subject and backdrop exactly; add only the grounding shadow under the feet.',
+        }],
+        aspectRatio: GROUNDING_ASPECT,
+        imageSize: GROUNDING_SIZE,
+        model: 'gemini-3-pro-image-preview',
+      });
+      const ms = Date.now() - t0;
+      if (attempt > 1) {
+        console.log(`[GroundingShadow:${mode}] ok in ${ms}ms after ${attempt} attempts (${result.imageData.length} bytes)`);
+      } else {
+        console.log(`[GroundingShadow:${mode}] ok in ${ms}ms (${result.imageData.length} bytes)`);
       }
+      return await postProcessGroundingResult(result.imageData, mode, t0, ms);
+    } catch (err) {
+      lastErr = err;
+      const msg = err instanceof Error ? err.message : String(err);
+      const transient = isTransientGeminiError(msg);
+      if (!transient || attempt === GROUNDING_MAX_ATTEMPTS) {
+        const ms = Date.now() - t0;
+        console.error(`[GroundingShadow:${mode}] FAILED in ${ms}ms after ${attempt} attempt(s) — falling back to no-shadow input:`,
+          msg);
+        return { buffer, ok: false, ms };
+      }
+      const delay = GROUNDING_RETRY_DELAYS_MS[attempt - 1] ?? 15_000;
+      console.warn(`[GroundingShadow:${mode}] attempt ${attempt} transient error (${msg.slice(0, 80)}…), retrying in ${delay / 1000}s`);
+      await new Promise(r => setTimeout(r, delay));
     }
-
-    return { buffer: result.imageData, ok: true, ms };
-  } catch (err) {
-    const ms = Date.now() - t0;
-    console.error(`[GroundingShadow:${mode}] FAILED in ${ms}ms — falling back to no-shadow input:`,
-      err instanceof Error ? err.message : err);
-    return { buffer, ok: false, ms };
   }
+  // Unreachable but keeps TS happy
+  return { buffer, ok: false, ms: Date.now() - t0 };
+}
+
+/**
+ * Post-process a successful Gemini grounding output. Handles the
+ * snap-to-white step for `mode='white'`. Extracted so the retry loop above
+ * can call it cleanly on success without duplicating the snap logic.
+ */
+async function postProcessGroundingResult(
+  imageData: Buffer,
+  mode: 'grey' | 'white',
+  t0: number,
+  ms: number,
+): Promise<{ buffer: Buffer; ok: boolean; ms: number }> {
+  // ── 2026-05-13 fix: snap near-white pixels to pure #FFFFFF (white only) ──
+  // Gemini-3-pro-image-preview occasionally repaints the entire backdrop to
+  // its "studio white" interpretation (~#E5E1E1) instead of preserving the
+  // pure #FFFFFF that came out of the Cloud Run Job's Python composite.
+  // Caught 2026-05-13 on Judee Low Waist Loose Jeans 53 (backdrop=#E5E1E1,
+  // 30 units off white). Comparable shots (Raw denim kick jacket, Midge,
+  // LOUX) rendered at #FDFDFD/#FEFEFE — so it's intermittent Gemini drift,
+  // not systemic.
+  //
+  // Fix: post-Gemini, walk all pixels and snap any pixel with all three
+  // channels > THRESHOLD (240) to exact (255,255,255). Preserves the
+  // contact + cast shadow Gemini added (those darker pixels stay below
+  // threshold), and forces deterministic pure-white backdrop everywhere
+  // else. Cheap: ~50-100ms via sharp.
+  if (mode === 'white') {
+    try {
+      const snapped = await snapNearWhiteToPure(imageData);
+      const totalMs = Date.now() - t0;
+      console.log(`[GroundingShadow:white] snap-to-white done (+${totalMs - ms}ms, total ${totalMs}ms)`);
+      return { buffer: snapped, ok: true, ms: totalMs };
+    } catch (snapErr) {
+      // Snap is non-blocking — fall back to Gemini's output if sharp fails.
+      console.error(`[GroundingShadow:white] snap-to-white FAILED (non-blocking, keeping Gemini output):`,
+        snapErr instanceof Error ? snapErr.message : snapErr);
+    }
+  }
+
+  return { buffer: imageData, ok: true, ms };
 }
 
 /**
@@ -205,7 +249,6 @@ export async function addGroundingShadowGemini(
  */
 async function snapNearWhiteToPure(buffer: Buffer): Promise<Buffer> {
   const sharp = (await import('sharp')).default;
-  const TOL = 15;
 
   const image = sharp(buffer);
   const meta = await image.metadata();
@@ -233,16 +276,25 @@ async function snapNearWhiteToPure(buffer: Buffer): Promise<Buffer> {
   const bgG = sumG / n;
   const bgB = sumB / n;
 
-  // No drift detected — already pure-white-ish.
-  if (bgR >= 250 && bgG >= 250 && bgB >= 250) {
-    return buffer;
-  }
   // Sample doesn't look like backdrop — bail rather than mangle the image.
   if (bgR < 200 || bgG < 200 || bgB < 200) {
+    console.log(`[SnapWhite] backdrop sample too dark (${bgR.toFixed(0)},${bgG.toFixed(0)},${bgB.toFixed(0)}) — leaving image unchanged`);
     return buffer;
   }
 
+  // Adaptive TOL: scale with detected drift from pure white.
+  //   • Near-white outputs (bg ≥250): use small TOL (5) so we snap JPEG noise
+  //     but PRESERVE the genuine grounding shadow Gemini added.
+  //   • Drifted outputs (bg in 200..249): use larger TOL proportional to
+  //     drift — the shadow on a drifted output is itself drifted, and we
+  //     accept losing the soft cast to get a clean pure-white backdrop.
+  const minChan = Math.min(bgR, bgG, bgB);
+  const drift = 255 - minChan;
+  const TOL = Math.max(5, Math.min(20, Math.round(drift)));
+  console.log(`[SnapWhite] backdrop=(${bgR.toFixed(0)},${bgG.toFixed(0)},${bgB.toFixed(0)}) drift=${drift.toFixed(0)} TOL=${TOL}`);
+
   // Snap all pixels within ±TOL of detected backdrop to pure white.
+  let snapped = 0;
   for (let i = 0; i < data.length; i += channels) {
     if (
       Math.abs(data[i]     - bgR) <= TOL &&
@@ -253,8 +305,10 @@ async function snapNearWhiteToPure(buffer: Buffer): Promise<Buffer> {
       data[i + 1] = 255;
       data[i + 2] = 255;
       // alpha (i+3) left alone
+      snapped++;
     }
   }
+  console.log(`[SnapWhite] snapped ${snapped} pixels (${(snapped / (w * h) * 100).toFixed(1)}%)`);
   return sharp(data, { raw: { width: w, height: h, channels } }).png().toBuffer();
 }
 
@@ -313,9 +367,16 @@ export async function produceBackdropVariants(
               { name: 'SRC_GCS_URL',       value: `gs://${BUCKET}/${srcKey}` },
               { name: 'DST_WHITE_GCS_URL', value: `gs://${BUCKET}/${whiteKey}` },
               { name: 'DST_GREY_GCS_URL',  value: `gs://${BUCKET}/${greyKey}` },
-              // ALWAYS disable the Job's procedural shadow — Gemini owns the
-              // grounding-shadow pass now (V4). The Job only does the matte.
-              { name: 'DISABLE_SHADOW',    value: '1' },
+              // 2026-05-13: procedural shadow RE-ENABLED as the floor. V4 had
+              // disabled it because the Gemini grounding-shadow pass produced
+              // higher-quality shadows. But when Gemini 503s (Kate Boyfriend
+              // Jeans 62 incident — 5 of 7 grounding calls failed), the shot
+              // shipped shadow-less. Procedural baseline guarantees every shot
+              // has at least a soft contact + heel shadow under the feet; the
+              // Gemini grounding pass still runs on top to refine quality
+              // when it's available.
+              // (Set DISABLE_SHADOW=1 only for identity reference image
+              // mattes — see model-whitebg.ts.)
             ],
           }],
         },
