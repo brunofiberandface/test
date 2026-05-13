@@ -163,6 +163,25 @@ export async function generateM06WithGemini(ctx: GeminiM06Context): Promise<Gemi
   }
   console.log(`[GeminiM06] wardrobe shoe: ${wardrobeShoeDescription ? `"${wardrobeShoeDescription.slice(0, 60)}..."` : '(none — heels fallback)'}`);
 
+  // 2026-05-13 FIX: pull wardrobe.bottom DESCRIPTION too. Bruno caught Kate
+  // Boyfriend Jeans drifting on M06 (no rolled hem, magenta sheen on the
+  // denim) — the bottom-focus path was sending only image refs without the
+  // text reinforcement that the top-focus path uses for its hero garment.
+  // Gemini's editorial-pose context overrides garment fidelity when there's
+  // no explicit textual anchor. Same fallback chain as top-focus + shoe.
+  const bottomConfig = ctx.wardrobe['bottom' as keyof JobWardrobe];
+  let wardrobeBottomDescription = '';
+  if (bottomConfig?.itemId) {
+    const bottomItem = await getWardrobeItem(bottomConfig.itemId) as any;
+    if (bottomItem) {
+      wardrobeBottomDescription = bottomItem.bottomDescription
+        || bottomItem.description
+        || bottomItem.name
+        || '';
+    }
+  }
+  console.log(`[GeminiM06] wardrobe bottom: ${wardrobeBottomDescription ? `"${wardrobeBottomDescription.slice(0, 60)}..."` : '(image-only)'}`);
+
   // 2026-05-12 FIX: surface model gender + identity description so Gemini
   // doesn't drift to a generic Caucasian editorial face on male / non-default
   // models. Bruno caught M6 (East Asian male "Gao") rendering as a
@@ -244,8 +263,17 @@ The model in the rendered output is in EXACTLY the body pose specified below. Sp
 Pose archetype: ${pose.label}
 ${pose.description}
 
-═══ GARMENT (from IMAGE 3 + FIT MODEL ANGLES) ═══
-The model wears the jeans shown in IMAGE 3 (GARMENT FLAT) — same color, wash, fabric, fit. The garment's drape and silhouette match the FIT MODEL ANGLES.
+═══ JEANS — THE HERO GARMENT (from IMAGE 3 + FIT MODEL ANGLES) ═══
+The model wears the jeans shown in IMAGE 3 (GARMENT FLAT) and the FIT MODEL ANGLES. These are the focal garment in this shot — render them with MAXIMUM fidelity.
+
+${wardrobeBottomDescription ? `Jeans description (reinforcement, treat as authoritative): ${wardrobeBottomDescription}\n\n` : ''}Match the jeans EXACTLY:
+- Color and wash: the precise tone, contrast, and fading pattern shown in IMAGE 3. NO magenta / red / pink sheen, NO editorial color cast, NO glossy fashion-photography wash drift. The denim is matte, the wash is true to IMAGE 3.
+- Hem treatment: if the description above or IMAGE 3 shows a ROLLED hem (cuffed at the ankle), the rendered jeans have a ROLLED HEM — not a clean unrolled hem, not a raw hem, not a frayed hem. If the description shows a cropped raw hem, render that. Match the hem treatment LITERALLY from IMAGE 3 and the description.
+- Fit profile: silhouette, leg opening, rise, and break exactly as shown in the FIT MODEL ANGLES.
+- Hardware: button fly vs zip fly, rivet count and placement, coin-pocket presence, back-pocket shape and arc stitching, brand patch position — all as shown in IMAGE 3.
+- Fabric finish: matte cotton denim, natural weave texture. NO satin sheen, NO leather-look, NO patent shine.
+
+CRITICAL — the jeans in IMAGE 1 (POSE REFERENCE) are NOT the target jeans. IGNORE the bottom garment in IMAGE 1 completely (different wash, different cut, different model). The rendered model's jeans are EXCLUSIVELY the garment in IMAGE 3 + FIT MODEL ANGLES + the description above.
 
 ${wardrobeTopDescription
   ? `═══ TOP — MANDATORY (from wardrobe) ═══
@@ -279,8 +307,11 @@ Backdrop: clean light-grey studio sweep, no scuffs, no texture, no marks. Floor:
 - WRONG: barefoot.
 - WRONG: any part of the head, hair, scalp, or hairstyle being cut off, cropped, or touching the top edge of the frame. The head MUST sit at least 8% below the top edge with clear background visible above it.
 - WRONG: heels or feet cut off, cropped, or touching the bottom edge. There MUST be clear floor visible below the heels.
+- WRONG: jeans wash drifting from IMAGE 3 — no magenta / red / pink sheen, no glossy editorial cast on the denim. The denim is MATTE with the EXACT wash shown in IMAGE 3.
+- WRONG: hem treatment differing from IMAGE 3 / the description above. If a rolled / cuffed hem is shown or described, the rendered jeans have a rolled hem.
+- WRONG: rendering the jeans from IMAGE 1 (POSE REFERENCE) instead of IMAGE 3. IMAGE 1's bottoms are NEVER the target.
 
-The pose MUST match the spec. The identity MUST match IMAGE 2 (${modelGender} model). The top MUST be ${wardrobeTopDescription ? 'the top described in the TOP section above' : 'a plain black sports bra'}. The footwear MUST be ${wardrobeShoeDescription ? 'the footwear described in the FOOTWEAR section above' : 'appropriate simple shoes'}. These are non-negotiable.`;
+The pose MUST match the spec. The identity MUST match IMAGE 2 (${modelGender} model). The top MUST be ${wardrobeTopDescription ? 'the top described in the TOP section above' : 'a plain black sports bra'}. The jeans MUST match IMAGE 3 + FIT MODEL ANGLES${wardrobeBottomDescription ? ' + the description above' : ''} (wash, hem treatment, fit, hardware — all literal, no editorial drift). The footwear MUST be ${wardrobeShoeDescription ? 'the footwear described in the FOOTWEAR section above' : 'appropriate simple shoes'}. These are non-negotiable.`;
 
   console.log(`[GeminiM06] Calling Gemini-3-pro-image-preview (${refs.length} refs, pose=${pose.id})...`);
   const t0 = Date.now();
