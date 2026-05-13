@@ -183,6 +183,21 @@ export interface Shot {
   // where matting failed at runtime.
   whiteMasterUrl?: string;
   greyMasterUrl?: string;
+  /**
+   * Pipeline-stage debug URLs (added 2026-05-13). Each key is a stage name
+   * (seedream / teeedit / shoeedit / label / upscaled / matte-grey /
+   * matte-white / final), each value is a GCS URL of that stage's
+   * intermediate buffer. Stages that didn't run for this shot are absent.
+   *
+   * Populated by saveStage() in src/lib/pipeline/stage-recorder.ts. Used by
+   * the results page "Stages" debug viewer to identify which step in the
+   * pipeline introduces an artifact (paintbrush look, blur, color shift).
+   * Absent on shots generated before this shipped.
+   */
+  pipelineStages?: Partial<Record<
+    'pass1' | 'seedream' | 'teeedit' | 'shoeedit' | 'label' | 'upscaled' | 'matte-grey' | 'matte-white' | 'final',
+    string
+  >>;
 }
 
 // ── Modifications ──

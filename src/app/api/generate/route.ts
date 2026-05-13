@@ -16,6 +16,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { updateShot, getJob, updateJob, shotsCol, listShots, updateJobStatus } from '@/lib/firestore';
 import { uploadGeneratedImage } from '@/lib/gcs';
+import { saveStage, type PipelineStage } from '@/lib/pipeline/stage-recorder';
 import { generateShot, generateM03WithDressedBase, generateM04WithDressedBase, getDressedBaseInputs, type GenerationContext } from '@/lib/pipeline/generate';
 import { generateSeedreamShot, type SeedreamGenerationContext } from '@/lib/pipeline/seedream-generate';
 import { applyTeeEdit, needsTeeEdit } from '@/lib/pipeline/seedream-tee-edit';
@@ -98,6 +99,21 @@ export async function POST(req: NextRequest) {
     // Recorded on the shot doc so reruns / tee-edit / future audit can tell
     // which Seedream model produced this image. Only set when provider === 'seedream'.
     let usedSeedreamModel: string | undefined;
+    // Pipeline-stage debug URLs — populated as each stage runs and written
+    // to the shot doc so the UI can show a "Stages" gallery for inspection.
+    // Each value is a GCS URL of that stage's intermediate image.
+    const pipelineStages: Partial<Record<PipelineStage, string>> = {};
+    const recordStage = async (stage: PipelineStage, buf: Buffer) => {
+      const url = await saveStage({
+        jobName: job.jobName || job.jobId,
+        modelId: job.modelId,
+        shotType: shotType as string,
+        version: body.version || 1,
+        stage,
+        buffer: buf,
+      });
+      if (url) pipelineStages[stage] = url;
+    };
     // Tee-edit status — written to shot doc so the UI can show a visible
     // warning when the sports-bra→real-tee Gemini step silently failed and
     // the user is looking at a sports-bra image they didn't realize was wrong.
@@ -143,6 +159,13 @@ export async function POST(req: NextRequest) {
       console.log(`[Generate] ${shotType} Seedream generated (${result.imageData.length} bytes, model=${usedModel})`);
       finalImageData = result.imageData;
 
+      // M04 two-pass: bubble Pass 1 URL into the gallery. Two-pass already
+      // wrote Pass 1 to GCS for Pass 2 to reference by URL; we just record
+      // the URL on pipelineStages here (no duplicate upload).
+      if (result.pass1Url) {
+        pipelineStages['pass1'] = result.pass1Url;
+      }
+
       // ── Gemini tee-edit: replace sports bra with real top (M01-M04 only) ──
       // Seedream 4.5 renders with a sports bra to avoid body seam artifacts.
       // Gemini then paints the real top using the flat image + Opus description.
@@ -150,22 +173,8 @@ export async function POST(req: NextRequest) {
       if (needsTeeEdit(shotType as ShotType, usedModel, focusSlot)) {
         await reportProgress('Painting real top (Gemini)', 45);
 
-        // DEBUG: save Seedream intermediate to GCS so we can diff pre/post Gemini.
-        // Lets us prove whether Gemini tee-edit is distorting shoes/hem or if
-        // Seedream already was. Non-blocking — a GCS hiccup must not fail the shot.
-        try {
-          const dbgVersion = body.version || 1;
-          const dbgJobName = job.jobName || job.jobId;
-          const dbgFilename = `${job.modelId}_${shotType}_v${dbgVersion}_preteeedit.png`;
-          const dbgUrl = await uploadGeneratedImage(
-            `${dbgJobName}/debug`,
-            dbgFilename,
-            finalImageData
-          );
-          console.log(`[Generate] ${shotType} Seedream intermediate saved: ${dbgUrl}`);
-        } catch (e) {
-          console.log(`[Generate] ${shotType} debug save failed (non-blocking): ${e}`);
-        }
+        // Save Seedream pre-tee-edit intermediate to GCS for inspection.
+        await recordStage('seedream', finalImageData);
 
         const teeResult = await applyTeeEdit({
           sourceImage: finalImageData,
@@ -178,6 +187,7 @@ export async function POST(req: NextRequest) {
           console.log(`[Generate] ${shotType} tee-edit applied (${teeResult.imageData.length} bytes)`);
           finalImageData = teeResult.imageData;
           teeEditApplied = true;
+          await recordStage('teeedit', finalImageData);
         } else {
           if (teeResult.error) {
             console.error(`[Generate] ${shotType} tee-edit FAILED after retries (Gemini error): ${teeResult.error}`);
@@ -205,6 +215,7 @@ export async function POST(req: NextRequest) {
           if (shoeResult.edited) {
             console.log(`[Generate] ${shotType} shoe-edit applied (${shoeResult.imageData.length} bytes)`);
             finalImageData = shoeResult.imageData;
+            await recordStage('shoeedit', finalImageData);
           } else if (shoeResult.error) {
             console.error(`[Generate] ${shotType} shoe-edit FAILED after retries: ${shoeResult.error}`);
           } else {
@@ -268,6 +279,7 @@ export async function POST(req: NextRequest) {
         shotType: shotType as ShotType,
         job,
       });
+      await recordStage('label', finalImageData);
     }
 
     // ── Square upscale to 4000×4000 (G-Star brand spec) ─────────────────────
@@ -292,6 +304,7 @@ export async function POST(req: NextRequest) {
           .png()
           .toBuffer();
         console.log(`[Generate] ${shotType} upscaled ${w}x${h} → 4000x4000 (lanczos3)`);
+        await recordStage('upscaled', finalImageData);
       }
     }
 
@@ -339,6 +352,9 @@ export async function POST(req: NextRequest) {
             // version history) work off the cleaned/composited version.
             finalImageData = variants.greyBuffer;
             console.log(`[Generate] ${shotType} backdrop variants ready (white=${(variants.whiteBuffer.length/1024).toFixed(0)}KB grey=${(variants.greyBuffer.length/1024).toFixed(0)}KB)`);
+            // Save both matte variants for stage-gallery inspection.
+            await recordStage('matte-grey', variants.greyBuffer);
+            await recordStage('matte-white', variants.whiteBuffer);
           } else {
             console.log(`[Generate] ${shotType} subject matte unavailable — keeping raw Seedream master`);
           }
@@ -392,6 +408,10 @@ export async function POST(req: NextRequest) {
     const filename = `${job.modelId}_${shotType}_v${version}.png`;
     const jobName = job.jobName || job.jobId;
     const imageUrl = await uploadGeneratedImage(jobName, filename, finalImageData);
+    // Mirror as the 'final' stage so the gallery has a stable last URL even
+    // when the primary imageUrl gets rewritten by later regens. Same file
+    // contents, separate path under {jobName}/debug.
+    pipelineStages['final'] = imageUrl;
     // When matting succeeded, this primary upload IS the grey master.
     // greyMasterUrl is derived inline at the Firestore-write site below.
 
@@ -476,6 +496,12 @@ export async function POST(req: NextRequest) {
       // Tee-edit observability (only meaningful when shot type runs tee-edit)
       ...(teeEditApplied !== undefined ? { teeEditApplied } : {}),
       ...(teeEditError ? { teeEditError } : {}),
+      // Pipeline-stage gallery URLs (added 2026-05-13 for paintbrush-look
+      // diagnostic on TjgTqmQwR0SFy6XrxM95). Each key is a stage name
+      // (seedream / teeedit / shoeedit / label / upscaled / matte-grey /
+      // matte-white / final), each value is a GCS URL of that stage's
+      // intermediate. Stages that didn't run for this shot are absent.
+      ...(Object.keys(pipelineStages).length ? { pipelineStages } : {}),
     });
 
     // Check if all shots done → move job to 'review'

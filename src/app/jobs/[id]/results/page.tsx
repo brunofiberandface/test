@@ -35,7 +35,25 @@ interface ShotData {
   provider?: 'gemini' | 'seedream';
   teeEditApplied?: boolean;
   teeEditError?: string;
+  /** Pipeline-stage debug URLs (M03/M04 mostly). Used by the "Stages" viewer. */
+  pipelineStages?: Partial<Record<
+    'pass1' | 'seedream' | 'teeedit' | 'shoeedit' | 'label' | 'upscaled' | 'matte-grey' | 'matte-white' | 'final',
+    string
+  >>;
 }
+
+// Display order + human labels for the pipeline-stage viewer.
+const STAGE_ORDER: Array<{ key: 'pass1' | 'seedream' | 'teeedit' | 'shoeedit' | 'label' | 'upscaled' | 'matte-grey' | 'matte-white' | 'final'; label: string; desc: string }> = [
+  { key: 'pass1',       label: '1. Pass 1',        desc: 'M04 only — model + sports bra + briefs + shoes, no jeans yet (Seedream)' },
+  { key: 'seedream',    label: '2. Seedream',      desc: 'Raw Seedream final-pass output, before any Gemini editing' },
+  { key: 'teeedit',     label: '3. Tee-edit',      desc: 'Real top painted over the sports-bra placeholder (Gemini)' },
+  { key: 'shoeedit',    label: '4. Shoe-edit',     desc: 'Shoes repositioned under the hem, M04 only (Gemini)' },
+  { key: 'label',       label: '5. Label',         desc: 'Leather brand patch composited, M02/M04 only' },
+  { key: 'upscaled',    label: '6. 4K upscale',    desc: '4000×4000 square via sharp lanczos3' },
+  { key: 'matte-grey',  label: '7. Matte (grey)',  desc: 'rembg subject matte + grounding shadow on grey backdrop' },
+  { key: 'matte-white', label: '7b. Matte (white)', desc: 'Same matte, composited onto pure-white backdrop' },
+  { key: 'final',       label: '8. Final',         desc: 'Saved master (same content as imageUrl)' },
+];
 
 interface JobData {
   designNumber: string;
@@ -405,6 +423,7 @@ export default function ResultsPage() {
   // to imageUrl gracefully for shots predating the matte pipeline.
   const [bgVariant, setBgVariant] = useState<'grey' | 'white'>('grey');
   const [resettingLabelShotId, setResettingLabelShotId] = useState<string | null>(null);
+  const [stagesShotId, setStagesShotId] = useState<string | null>(null);  // open stage-gallery modal for this shot
   const [triggeringShot, setTriggeringShot] = useState<string | null>(null);
   const [queuePosition, setQueuePosition] = useState<number | null>(null);
   const [queueActiveJob, setQueueActiveJob] = useState<string | null>(null);
@@ -477,6 +496,7 @@ export default function ResultsPage() {
           provider: s.provider as 'gemini' | 'seedream' | undefined,
           teeEditApplied: s.teeEditApplied as boolean | undefined,
           teeEditError: s.teeEditError as string | undefined,
+          pipelineStages: s.pipelineStages as ShotData['pipelineStages'],
         }; });
         setShots(mappedShots);
 
@@ -1557,6 +1577,15 @@ export default function ResultsPage() {
                     >
                       {rerunningShotId === selectedShot.shotId ? 'Queueing…' : (selectedShot.type === 'M01' || selectedShot.type === 'M02') ? 'Re-run full chain (M03+M04+M01+M02)' : 'Re-run This Shot'}
                     </button>
+                    {selectedShot.pipelineStages && Object.keys(selectedShot.pipelineStages).length > 0 && (
+                      <button
+                        onClick={() => setStagesShotId(selectedShot.shotId)}
+                        className="border border-neutral-300 px-6 py-2.5 text-sm font-medium text-neutral-600 hover:bg-neutral-50 transition-colors"
+                        title="Inspect every intermediate image in the pipeline (Seedream → tee-edit → shoe-edit → label → upscale → matte → final)"
+                      >
+                        Pipeline stages ({Object.keys(selectedShot.pipelineStages).length})
+                      </button>
+                    )}
                   </div>
 
                   {/* Info text for M01/M02 button options */}
@@ -1783,6 +1812,61 @@ export default function ResultsPage() {
       {lightboxUrl && (
         <Lightbox imageUrl={lightboxUrl} onClose={() => setLightboxUrl(null)} />
       )}
+
+      {/* Pipeline-stage gallery overlay. Renders every intermediate buffer that
+          stage-recorder.ts wrote during this shot's last render. Used for
+          diagnosing visual artifacts ("paintbrush look", color shift, blur)
+          by comparing adjacent stages to find the offending step. */}
+      {stagesShotId && (() => {
+        const shot = shots.find(s => s.shotId === stagesShotId);
+        if (!shot || !shot.pipelineStages) return null;
+        return (
+          <div
+            className="fixed inset-0 bg-black/80 z-50 flex flex-col p-6 overflow-auto"
+            onClick={() => setStagesShotId(null)}
+          >
+            <div className="max-w-7xl mx-auto w-full" onClick={e => e.stopPropagation()}>
+              <div className="flex items-center justify-between mb-4 sticky top-0 bg-black/80 -mx-2 px-2 py-2 z-10">
+                <h2 className="text-white text-lg font-bold">
+                  Pipeline stages — {shot.type} (v{shot.version})
+                </h2>
+                <button
+                  onClick={() => setStagesShotId(null)}
+                  className="text-white text-sm border border-white/40 px-3 py-1 hover:bg-white/10"
+                >
+                  Close
+                </button>
+              </div>
+              <p className="text-white/60 text-xs mb-4">
+                Each tile is the output of one pipeline stage. Stages that didn&apos;t run for this shot type are hidden. Click any tile to open it at full resolution in a new tab. Compare adjacent stages to spot where an artifact is introduced.
+              </p>
+              <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
+                {STAGE_ORDER.map(stage => {
+                  const url = shot.pipelineStages?.[stage.key];
+                  if (!url) return null;
+                  return (
+                    <div key={stage.key} className="bg-neutral-900 border border-neutral-700 flex flex-col">
+                      <div className="bg-neutral-100 aspect-square overflow-hidden">
+                        <a href={url} target="_blank" rel="noopener noreferrer">
+                          <img
+                            src={url}
+                            alt={stage.label}
+                            className="w-full h-full object-contain hover:scale-105 transition-transform cursor-zoom-in"
+                          />
+                        </a>
+                      </div>
+                      <div className="p-3">
+                        <div className="text-white text-sm font-semibold">{stage.label}</div>
+                        <div className="text-white/60 text-[11px] mt-1 leading-snug">{stage.desc}</div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+        );
+      })()}
 
       {/* Label corner picker modal */}
       {labelPickerShotId && (() => {

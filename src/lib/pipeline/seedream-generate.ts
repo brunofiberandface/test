@@ -102,6 +102,10 @@ export interface SeedreamGenerationResult {
    *  on the shot doc so downstream steps (tee-edit, etc) know which model
    *  ran — 5.0 handles tucked-in tops natively, so tee-edit is skipped. */
   model?: string;
+  /** M04 two-pass only: GCS URL of the Pass 1 (sports-bra + briefs + shoes)
+   *  intermediate. Surfaced so the caller can record it in pipelineStages
+   *  for the debug viewer. Absent for single-pass M04 + every other shot. */
+  pass1Url?: string;
 }
 
 /** Strip query string (?v=..., signed URL params) so BytePlus fetches the raw object. */
@@ -479,9 +483,18 @@ async function seedreamM03(ctx: SeedreamGenerationContext, prompt: LoadedPrompt)
     }
   } else {
     // BOTTOM-FOCUS (default) — bottom is the hero, full ref set.
-    refs.push(await refFromUrl(bottomFlat, 'Garment Flat Front'));
+    //
+    // 2026-05-13 wash-lock: M03 wash was drifting (Bruno flagged Bowey Barrel
+    // jeans 53 j7RnJwgHfCTfEzgTXjpI — actual product is light-medium blue
+    // with whiskers, M03 rendered darker / more saturated medium blue).
+    // GARMENT FLAT FRONT is the cleanest color reference for the product
+    // (no lighting variance from a fit-model photo), so it's the right
+    // anchor to lock wash to. We make this label substantive and add wash
+    // language to the fit-model angle label so the multi-ref Seedream input
+    // doesn't average toward a more saturated wash.
+    refs.push(await refFromUrl(bottomFlat, 'GARMENT FLAT FRONT — SOURCE OF TRUTH for the jean wash, color, fade pattern, whiskers, and overall saturation. The jean WASH, COLOR, FADE LINES, WHISKER PATTERN, AND OVERALL SATURATION are LOCKED to this image — match the wash level (light, medium, or dark) and fade character EXACTLY as shown. Do NOT darken, do NOT saturate, do NOT shift toward a richer / deeper blue. Do NOT lighten, do NOT desaturate, do NOT shift toward white or grey. The flat front is the most accurate color reference for this product because it has no skin-tone or studio-light contamination — pull jean color from THIS image first.'));
     for (let i = 0; i < bottomAngles.length; i++) {
-      refs.push(await refFromUrl(bottomAngles[i], `Fit Model Front Angle ${i + 1} — primary garment-fit AND STANCE reference. Use this image for: garment shape, fit, hem behavior, stitching, silhouette, AND THE MODEL'S STANCE — match the exact stance shown in THIS fit-model photo. Both legs drop STRAIGHT DOWN vertically from hip to floor (no outward angle from hip to ankle, legs do NOT widen or splay outward at the feet beyond the hip line), feet planted flat on the floor parallel to each other with approximately ONE FOOT-WIDTH of clear space between the inner edges of the two feet — i.e. the gap between the inner side of the left foot and the inner side of the right foot equals roughly the WIDTH (NOT the length) of one shoe (~10cm for an adult — narrow gap, feet near each other but not touching). NOT touching / sole-to-sole. NOT wider than hip-width. NOT crossed. NOT one foot in front of the other, weight 50/50 across both feet, hips centered and level (NO hip tilt, NO contrapposto, NO weight shift onto one leg), arms relaxed at the sides. SKIN TONE, COMPLEXION, BLUSH, UNDERTONE, KEY-LIGHT COLOR, AND BODY IDENTITY ARE NOT TAKEN FROM THIS IMAGE. The studio key light in this photo has its own particular color rendering — do not transfer it onto the rendered model or fabrics.`));
+      refs.push(await refFromUrl(bottomAngles[i], `Fit Model Front Angle ${i + 1} — primary garment-fit AND STANCE reference. Use this image for: garment shape, fit, hem behavior, stitching, silhouette, AND THE MODEL'S STANCE — match the exact stance shown in THIS fit-model photo. Both legs drop STRAIGHT DOWN vertically from hip to floor (no outward angle from hip to ankle, legs do NOT widen or splay outward at the feet beyond the hip line), feet planted flat on the floor parallel to each other with approximately ONE FOOT-WIDTH of clear space between the inner edges of the two feet — i.e. the gap between the inner side of the left foot and the inner side of the right foot equals roughly the WIDTH (NOT the length) of one shoe (~10cm for an adult — narrow gap, feet near each other but not touching). NOT touching / sole-to-sole. NOT wider than hip-width. NOT crossed. NOT one foot in front of the other, weight 50/50 across both feet, hips centered and level (NO hip tilt, NO contrapposto, NO weight shift onto one leg), arms relaxed at the sides. The jean WASH, COLOR, FADE PATTERN, AND SATURATION shown here are the target — match the wash level seen here without darkening, saturating, lightening, or desaturating; the GARMENT FLAT FRONT above is the primary color anchor and this angle confirms the wash level on a body. SKIN TONE, COMPLEXION, BLUSH, UNDERTONE, KEY-LIGHT COLOR, AND BODY IDENTITY ARE NOT TAKEN FROM THIS IMAGE. The studio key light in this photo has its own particular color rendering — do not transfer it onto the rendered model or fabrics.`));
     }
   }
   refs.push(...(await getStylingRefs(ctx.wardrobe, 'front', ctx.focusSlot)));
@@ -538,7 +551,7 @@ async function seedreamM04(ctx: SeedreamGenerationContext, prompt: LoadedPrompt)
     jobName: 'twopass',
     shotTag: debugTag,
   });
-  return { imageData: out.imageData, mimeType: out.mimeType };
+  return { imageData: out.imageData, mimeType: out.mimeType, pass1Url: out.pass1Url };
 }
 
 // ── Legacy single-pass M04 kept for reference / fallback ───────────────────
