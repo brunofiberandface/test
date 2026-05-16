@@ -482,32 +482,19 @@ export async function checkBatch(apiKey: string): Promise<{ state: BatchState; p
   async function processLine(line: string): Promise<void> {
     if (line.trim().length === 0) return;
     totalLinesSeen++;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    let row: any;
+    // Aggressive memory hygiene: parse JSON, extract minimal fields, drop
+    // the rest immediately. Each line is ~19MB of base64; we need it to be
+    // GC-eligible the moment we've copied the base64 into a Buffer.
+    let key: string | undefined;
+    let base64Data: string | undefined;
+    let mime: string | undefined;
+    let errorMsg: string | undefined;
     try {
-      row = JSON.parse(line);
-    } catch {
-      console.warn(`[checkBatch] bad JSON line, skipping`);
-      failed++;
-      return;
-    }
-    if (!row.key) { failed++; return; }
-    if (processedKeys.has(row.key)) return; // already done in a prior poll
-    try {
-      const [cellId, view] = row.key.split('::') as [string, ViewKey];
-      if (!cellId || !view) {
-        console.warn(`[checkBatch] bad key ${row.key}, skipping`);
-        failed++;
-        return;
-      }
-      if (row.error) {
-        console.warn(`[checkBatch] ${row.key} error: ${JSON.stringify(row.error)}`);
-        failed++;
-        return;
-      }
-      // Google REST returns camelCase by default but accepts snake_case as fallback.
-      // Also: the parts can be inlineData OR inline_data; the candidate may be
-      // at row.response.candidates OR row.candidates depending on shape.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const row: any = JSON.parse(line);
+      key = row.key;
+      if (row.error) errorMsg = JSON.stringify(row.error);
+      // Google REST: camelCase by default, snake_case as fallback.
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const parts: any[] | undefined =
         row.response?.candidates?.[0]?.content?.parts ||
@@ -515,15 +502,37 @@ export async function checkBatch(apiKey: string): Promise<{ state: BatchState; p
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const inlinePart = parts?.find((p: any) => p.inlineData?.data || p.inline_data?.data);
       const inline = inlinePart?.inlineData || inlinePart?.inline_data;
-      if (!inline?.data) {
-        // Log a slim version of the row so the actual shape is visible.
-        const slim = { key: row.key, hasResponse: !!row.response, responseKeys: row.response ? Object.keys(row.response) : null, candKeys: row.response?.candidates?.[0] ? Object.keys(row.response.candidates[0]) : null, partKeys: parts?.[0] ? Object.keys(parts[0]) : null };
-        console.warn(`[checkBatch] ${row.key} no inline image data; row shape=${JSON.stringify(slim)}`);
+      base64Data = inline?.data;
+      mime = inline?.mimeType || inline?.mime_type || 'image/png';
+    } catch {
+      console.warn(`[checkBatch] bad JSON line, skipping`);
+      failed++;
+      return;
+    }
+    if (!key) { failed++; return; }
+    if (processedKeys.has(key)) return; // already done in a prior poll
+    try {
+      const [cellId, view] = key.split('::') as [string, ViewKey];
+      if (!cellId || !view) {
+        console.warn(`[checkBatch] bad key ${key}, skipping`);
         failed++;
         return;
       }
-      const imgBuf = Buffer.from(inline.data, 'base64');
-      const mime = inline.mimeType || inline.mime_type || 'image/png';
+      if (errorMsg) {
+        console.warn(`[checkBatch] ${key} error: ${errorMsg}`);
+        failed++;
+        return;
+      }
+      if (!base64Data) {
+        console.warn(`[checkBatch] ${key} no inline image data`);
+        failed++;
+        return;
+      }
+      // Decode base64 to Buffer. Immediately drop the base64 string so it
+      // can be GC'd (otherwise we hold 19MB string + 14MB binary = 33MB
+      // per in-flight line, OOMs at high concurrency).
+      const imgBuf = Buffer.from(base64Data, 'base64');
+      base64Data = undefined;
       // Recover (shoeId, modelId) from the existing cell doc.
       const cellSnap = await qaShoeMatrixCol.doc(cellId).get();
       if (!cellSnap.exists) {
@@ -560,12 +569,12 @@ export async function checkBatch(apiKey: string): Promise<{ state: BatchState; p
         viewsCompleted: FieldValue.arrayUnion(view),
         updatedAt: FieldValue.serverTimestamp(),
       });
-      processedKeys.add(row.key);
+      processedKeys.add(key);
       touchedCellIds.add(cellId);
       done++;
     } catch (err) {
       console.error(`[checkBatch] line process failed:`, err);
-      processedKeys.add(row.key); // mark failed too so we don't retry forever
+      processedKeys.add(key); // mark failed too so we don't retry forever
       failed++;
     }
   }
@@ -596,8 +605,12 @@ export async function checkBatch(apiKey: string): Promise<{ state: BatchState; p
     console.log(`[checkBatch] persisted progress (${label}): processed=${processedKeys.size}, done=${done}, failed=${failed}, bytesRead=${(bytesRead / 1024 / 1024).toFixed(1)}MB, elapsed=${((Date.now() - startTime) / 1000).toFixed(0)}s`);
   }
 
-  // Iterate readline events — node delivers one complete line per 'line' event.
+  // Iterate readline events. We pause the stream while processing each
+  // line so readline doesn't buffer the NEXT line in memory (~19MB each)
+  // while we're still processing the current one. Force V8 GC after each
+  // line to reclaim the previous line's base64 string + image buffers.
   for await (const line of lineEmitter) {
+    lineEmitter.pause();
     bytesRead += line.length;
     if (!firstChunkLogged) {
       console.log(`[checkBatch] first line arrived: ${line.length} chars`);
@@ -606,6 +619,7 @@ export async function checkBatch(apiKey: string): Promise<{ state: BatchState; p
     if (Date.now() - startTime > POLL_BUDGET_MS) {
       overBudget = true;
       if (line.trim().length > 0) totalLinesSeen++;
+      lineEmitter.resume();
       continue;
     }
     const before = processedKeys.size;
@@ -617,6 +631,12 @@ export async function checkBatch(apiKey: string): Promise<{ state: BatchState; p
         processedSinceLastPersist = 0;
       }
     }
+    // Force GC if exposed (--expose-gc). Reclaims the 19MB line string,
+    // 14MB image buffer, and any parser intermediates from this iteration
+    // before readline delivers the next 19MB line.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    if ((global as any).gc) (global as any).gc();
+    lineEmitter.resume();
   }
   console.log(`[checkBatch] streamed ${(bytesRead / 1024 / 1024).toFixed(1)}MB, seen ${totalLinesSeen} lines, overBudget=${overBudget}`);
 
