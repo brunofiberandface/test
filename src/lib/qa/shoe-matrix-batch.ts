@@ -565,23 +565,54 @@ export async function checkBatch(apiKey: string): Promise<{ state: BatchState; p
   // newlines, processes each full line. Final partial line at end is
   // flushed after the stream ends. Stops processing new lines (but keeps
   // counting them as `seen`) once the budget is exhausted.
+  //
+  // Persist progress every 25 processed lines so a Cloud-Run kill in the
+  // middle doesn't lose all the work.
   const touchedCellIds = new Set<string>();
   let bytesRead = 0;
+  let firstChunkLogged = false;
+  let processedSinceLastPersist = 0;
+  const PERSIST_EVERY = 25;
+
+  async function persistProgress(label: string): Promise<void> {
+    await db.collection('system').doc(BATCH_JOB_DOC_ID).set(
+      {
+        completedRequests: done,
+        failedRequests: failed,
+        processedKeys: Array.from(processedKeys),
+        lastCheckedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true },
+    );
+    console.log(`[checkBatch] persisted progress (${label}): processed=${processedKeys.size}, done=${done}, failed=${failed}, bytesRead=${(bytesRead / 1024 / 1024).toFixed(1)}MB, elapsed=${((Date.now() - startTime) / 1000).toFixed(0)}s`);
+  }
+
   while (true) {
     const { done: streamDone, value } = await reader.read();
     if (streamDone) break;
     bytesRead += value.length;
+    if (!firstChunkLogged) {
+      console.log(`[checkBatch] first chunk arrived: ${value.length} bytes`);
+      firstChunkLogged = true;
+    }
     buffer += decoder.decode(value, { stream: true });
     const lines = buffer.split('\n');
     buffer = lines.pop() || ''; // keep partial last line
     for (const line of lines) {
       if (Date.now() - startTime > POLL_BUDGET_MS) {
         overBudget = true;
-        // Still count it so we know how much remains.
         if (line.trim().length > 0) totalLinesSeen++;
         continue;
       }
+      const before = processedKeys.size;
       await processLine(line);
+      if (processedKeys.size > before) {
+        processedSinceLastPersist++;
+        if (processedSinceLastPersist >= PERSIST_EVERY) {
+          await persistProgress(`every-${PERSIST_EVERY}`);
+          processedSinceLastPersist = 0;
+        }
+      }
     }
   }
   // Flush trailing partial line.
