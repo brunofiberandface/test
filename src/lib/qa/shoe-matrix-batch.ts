@@ -425,10 +425,10 @@ export async function checkBatch(apiKey: string): Promise<{ state: BatchState; p
     };
   }
 
-  // Done — download the result JSONL. Verified in production (rev 00569-pzc):
-  // the field is `response.responsesFile`, also mirrored at
-  // `metadata.output.responsesFile`. Docs claimed `dest.fileName` but the
-  // actual API returns this shape. Keep aliases for resilience.
+  // Done — STREAM the result JSONL. For a 1,036-entry batch the file is
+  // ~8GB of inline base64 image data; loading it into memory OOMs Cloud
+  // Run's 2GiB allocation. We stream line-by-line and process each entry
+  // as soon as its full JSONL line arrives.
   const outputFileName: string | undefined =
     status.response?.responsesFile ||
     status.metadata?.output?.responsesFile ||
@@ -439,37 +439,40 @@ export async function checkBatch(apiKey: string): Promise<{ state: BatchState; p
   if (!outputFileName) {
     throw new Error(`Batch SUCCEEDED but no output file path found. Raw status: ${JSON.stringify(status).slice(0, 1500)}`);
   }
-  console.log(`[checkBatch] downloading results from ${outputFileName}`);
+  console.log(`[checkBatch] streaming results from ${outputFileName}`);
   const dlRes = await fetch(
     `${GENERATIVE_API_BASE}/download/v1beta/${outputFileName}:download?alt=media&key=${apiKey}`,
   );
   if (!dlRes.ok) {
     throw new Error(`result download failed ${dlRes.status}: ${await dlRes.text()}`);
   }
-  const resultText = await dlRes.text();
-  const resultLines = resultText.split('\n').filter(l => l.trim().length > 0);
-  console.log(`[checkBatch] got ${resultLines.length} result lines`);
+  if (!dlRes.body) {
+    throw new Error(`result download had no body stream`);
+  }
 
-  // Process lines incrementally. Each line is independent; we maintain a
-  // `processedKeys` set in the batch tracking doc and skip keys we've
-  // already handled. Stops at a time budget (~13 min) so Cloud Run's
-  // 15-min request timeout doesn't kill us mid-write. Caller polls again
-  // to drain remaining entries.
+  // Process lines incrementally as they STREAM in. Each line is independent;
+  // we maintain a `processedKeys` set in the batch tracking doc and skip
+  // keys we've already handled. Stops at a time budget (~13 min) so Cloud
+  // Run's 15-min request timeout doesn't kill us mid-write. Caller polls
+  // again to drain remaining entries.
   const POLL_BUDGET_MS = 13 * 60 * 1000;
   const startTime = Date.now();
   const processedKeys = new Set<string>((job.processedKeys as string[]) || []);
   const sharp = (await import('sharp')).default;
   let done = (job.completedRequests as number) || 0;
   let failed = (job.failedRequests as number) || 0;
-  let skippedOverBudget = 0;
-  for (const line of resultLines) {
-    if (Date.now() - startTime > POLL_BUDGET_MS) {
-      skippedOverBudget++;
-      continue;
-    }
-    // Parse the JSONL row first so `row.key` is in scope for both the
-    // success and failure paths (we mark the key as processed in both
-    // cases so we don't retry forever).
+  let totalLinesSeen = 0;
+
+  // Stream-process lines from the fetch body.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const reader = (dlRes.body as any).getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let overBudget = false;
+
+  async function processLine(line: string): Promise<void> {
+    if (line.trim().length === 0) return;
+    totalLinesSeen++;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     let row: any;
     try {
@@ -477,21 +480,21 @@ export async function checkBatch(apiKey: string): Promise<{ state: BatchState; p
     } catch {
       console.warn(`[checkBatch] bad JSON line, skipping`);
       failed++;
-      continue;
+      return;
     }
-    if (!row.key) { failed++; continue; }
-    if (processedKeys.has(row.key)) continue;  // already done in a prior poll
+    if (!row.key) { failed++; return; }
+    if (processedKeys.has(row.key)) return; // already done in a prior poll
     try {
       const [cellId, view] = row.key.split('::') as [string, ViewKey];
       if (!cellId || !view) {
         console.warn(`[checkBatch] bad key ${row.key}, skipping`);
         failed++;
-        continue;
+        return;
       }
       if (row.error) {
         console.warn(`[checkBatch] ${row.key} error: ${JSON.stringify(row.error)}`);
         failed++;
-        continue;
+        return;
       }
       // Google REST returns camelCase by default but accepts snake_case as fallback.
       // Also: the parts can be inlineData OR inline_data; the candidate may be
@@ -508,7 +511,7 @@ export async function checkBatch(apiKey: string): Promise<{ state: BatchState; p
         const slim = { key: row.key, hasResponse: !!row.response, responseKeys: row.response ? Object.keys(row.response) : null, candKeys: row.response?.candidates?.[0] ? Object.keys(row.response.candidates[0]) : null, partKeys: parts?.[0] ? Object.keys(parts[0]) : null };
         console.warn(`[checkBatch] ${row.key} no inline image data; row shape=${JSON.stringify(slim)}`);
         failed++;
-        continue;
+        return;
       }
       const imgBuf = Buffer.from(inline.data, 'base64');
       const mime = inline.mimeType || inline.mime_type || 'image/png';
@@ -517,7 +520,7 @@ export async function checkBatch(apiKey: string): Promise<{ state: BatchState; p
       if (!cellSnap.exists) {
         console.warn(`[checkBatch] cell ${cellId} not in Firestore, skipping`);
         failed++;
-        continue;
+        return;
       }
       const cellData = cellSnap.data() as { shoeId: string; modelId: string };
       const ext = mime === 'image/jpeg' ? 'jpg' : 'png';
@@ -549,6 +552,7 @@ export async function checkBatch(apiKey: string): Promise<{ state: BatchState; p
         updatedAt: FieldValue.serverTimestamp(),
       });
       processedKeys.add(row.key);
+      touchedCellIds.add(cellId);
       done++;
     } catch (err) {
       console.error(`[checkBatch] line process failed:`, err);
@@ -557,17 +561,41 @@ export async function checkBatch(apiKey: string): Promise<{ state: BatchState; p
     }
   }
 
-  // Mark cells whose 4 views are all in: check viewsCompleted length per cell.
-  // Only touch cells whose keys we processed THIS poll.
+  // Streaming read loop: pulls chunks from the response body, splits on
+  // newlines, processes each full line. Final partial line at end is
+  // flushed after the stream ends. Stops processing new lines (but keeps
+  // counting them as `seen`) once the budget is exhausted.
   const touchedCellIds = new Set<string>();
-  for (const line of resultLines) {
-    try {
-      const row = JSON.parse(line) as { key: string };
-      if (!processedKeys.has(row.key)) continue;
-      const [cellId] = row.key.split('::');
-      touchedCellIds.add(cellId);
-    } catch { /* ignore */ }
+  let bytesRead = 0;
+  while (true) {
+    const { done: streamDone, value } = await reader.read();
+    if (streamDone) break;
+    bytesRead += value.length;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || ''; // keep partial last line
+    for (const line of lines) {
+      if (Date.now() - startTime > POLL_BUDGET_MS) {
+        overBudget = true;
+        // Still count it so we know how much remains.
+        if (line.trim().length > 0) totalLinesSeen++;
+        continue;
+      }
+      await processLine(line);
+    }
   }
+  // Flush trailing partial line.
+  if (buffer.length > 0 && !overBudget) {
+    if (Date.now() - startTime <= POLL_BUDGET_MS) {
+      await processLine(buffer);
+    } else if (buffer.trim().length > 0) {
+      totalLinesSeen++;
+      overBudget = true;
+    }
+  }
+  console.log(`[checkBatch] streamed ${(bytesRead / 1024 / 1024).toFixed(1)}MB, seen ${totalLinesSeen} lines, overBudget=${overBudget}`);
+
+  // Mark cells whose 4 views are all in.
   for (const cellId of touchedCellIds) {
     const cellSnap = await qaShoeMatrixCol.doc(cellId).get();
     if (!cellSnap.exists) continue;
@@ -577,10 +605,10 @@ export async function checkBatch(apiKey: string): Promise<{ state: BatchState; p
     await qaShoeMatrixCol.doc(cellId).update({ status });
   }
 
-  // Persist processed-keys progress so the next poll picks up where we
-  // stopped. Only flip batch state to SUCCEEDED once every result line
-  // has been drained.
-  const allDrained = processedKeys.size >= resultLines.length;
+  // Persist progress. We've drained everything only if we read the entire
+  // stream AND processedKeys covers every line we saw.
+  const totalRequests = (job.totalRequests as number) || totalLinesSeen;
+  const allDrained = !overBudget && processedKeys.size >= totalLinesSeen;
   const updatePayload: Record<string, unknown> = {
     completedRequests: done,
     failedRequests: failed,
@@ -592,16 +620,14 @@ export async function checkBatch(apiKey: string): Promise<{ state: BatchState; p
     updatePayload.state = 'SUCCEEDED';
     updatePayload.completedAt = FieldValue.serverTimestamp();
   } else {
-    // Keep state as RUNNING (or whatever Google reports) so the UI shows
-    // "in progress" — caller needs to re-poll to drain remaining entries.
     updatePayload.state = 'RUNNING';
   }
   await db.collection('system').doc(BATCH_JOB_DOC_ID).set(updatePayload, { merge: true });
 
-  console.log(`[checkBatch] processed ${processedKeys.size}/${resultLines.length} (this poll: +${done - ((job.completedRequests as number) || 0)} done, +${failed - ((job.failedRequests as number) || 0)} failed, ${skippedOverBudget} over budget)`);
+  console.log(`[checkBatch] processed ${processedKeys.size}/${totalLinesSeen} total (this poll: +${done - ((job.completedRequests as number) || 0)} done, +${failed - ((job.failedRequests as number) || 0)} failed, allDrained=${allDrained})`);
   return {
     state: allDrained ? 'SUCCEEDED' : 'RUNNING',
-    progress: { done, total: (job.totalRequests as number) || resultLines.length },
+    progress: { done, total: totalRequests },
   };
 }
 
