@@ -19,12 +19,22 @@ interface ModelLite {
   gender?: 'male' | 'female';
 }
 
+type ViewKey = 'fullBodyFront' | 'fullBodyBack' | 'legsFront' | 'legsBack';
+const VIEWS: ViewKey[] = ['fullBodyFront', 'fullBodyBack', 'legsFront', 'legsBack'];
+
 interface MatrixCell {
   id: string;
   shoeId: string;
   modelId: string;
+  /** New 4-view 4K URLs (1:1 square, Gemini Pro Image Preview). */
+  images?: Partial<Record<ViewKey, string>>;
+  /** 512px JPEG thumbnails matched to images. */
+  thumbs?: Partial<Record<ViewKey, string>>;
+  viewsCompleted?: ViewKey[];
+  /** Legacy single-view URL (Seedream 3:4 era). Still rendered when present
+   *  so old cells display until a re-render replaces them. */
   imageUrl?: string;
-  status: 'pending' | 'rendering' | 'done' | 'failed';
+  status: 'pending' | 'rendering' | 'done' | 'failed' | 'partial' | 'batch-pending';
   blocked: boolean;
   blockedReason?: string;
   errorMessage?: string;
@@ -305,52 +315,73 @@ export default function ShoeMatrixPage() {
                     </button>
                   </div>
 
-                  <div className="grid grid-cols-4 gap-4">
+                  <div className="grid grid-cols-3 gap-4">
                     {visibleModels.map(m => {
                       const cell = cellFor(m.id);
                       const cellRenderId = `${selectedShoeId}_${m.id}`;
                       const isLocallyRendering = renderingCells.has(cellRenderId);
                       const status = cell?.status || (isLocallyRendering ? 'rendering' : 'pending');
+                      const hasNewSchema = !!(cell?.images && Object.keys(cell.images).length > 0);
+                      const hasLegacyImage = !!cell?.imageUrl && !hasNewSchema;
+                      const completedCount = cell?.viewsCompleted?.length || (hasLegacyImage ? 1 : 0);
                       return (
-                        <div
+                        <a
                           key={m.id}
-                          className={`border rounded overflow-hidden ${cell?.blocked ? 'border-red-400 bg-red-50' : 'border-neutral-200 bg-white'}`}
+                          href={`/qa/shoe-matrix/${cellRenderId}`}
+                          className={`block border rounded overflow-hidden hover:border-neutral-400 transition-colors ${cell?.blocked ? 'border-red-400 bg-red-50' : 'border-neutral-200 bg-white'}`}
                         >
-                          <div className="aspect-[3/4] bg-neutral-100 relative">
-                            {cell?.imageUrl && status === 'done' && (
-                              <img src={cell.imageUrl} alt="" className="w-full h-full object-contain" />
-                            )}
-                            {!cell?.imageUrl && status === 'pending' && (
-                              <div className="w-full h-full flex items-center justify-center text-neutral-400 text-sm">not rendered</div>
-                            )}
-                            {status === 'rendering' && (
-                              <div className="w-full h-full flex items-center justify-center text-neutral-500 text-sm">rendering…</div>
-                            )}
-                            {status === 'failed' && (
-                              <div className="w-full h-full flex items-center justify-center text-red-600 text-xs p-2 text-center">failed: {cell?.errorMessage}</div>
+                          {/* 2x2 mini-grid of the 4 views */}
+                          <div className="aspect-square bg-neutral-100 relative grid grid-cols-2 grid-rows-2">
+                            {hasNewSchema ? (
+                              VIEWS.map(view => {
+                                const url = cell!.thumbs?.[view] || cell!.images?.[view];
+                                return (
+                                  <div key={view} className="bg-neutral-100 overflow-hidden">
+                                    {url ? (
+                                      <img src={url} alt={view} className="w-full h-full object-cover" />
+                                    ) : (
+                                      <div className="w-full h-full flex items-center justify-center text-[9px] text-neutral-400">{view}</div>
+                                    )}
+                                  </div>
+                                );
+                              })
+                            ) : hasLegacyImage ? (
+                              <div className="col-span-2 row-span-2 bg-neutral-100">
+                                <img src={cell!.imageUrl} alt="" className="w-full h-full object-contain" />
+                                <div className="absolute bottom-1 left-1 bg-amber-100 text-amber-800 text-[9px] px-1.5 py-0.5 rounded uppercase tracking-wider">legacy 1-view</div>
+                              </div>
+                            ) : status === 'rendering' ? (
+                              <div className="col-span-2 row-span-2 flex items-center justify-center text-neutral-500 text-sm">rendering…</div>
+                            ) : status === 'failed' ? (
+                              <div className="col-span-2 row-span-2 flex items-center justify-center text-red-600 text-xs p-2 text-center">failed: {cell?.errorMessage?.slice(0, 60)}</div>
+                            ) : (
+                              <div className="col-span-2 row-span-2 flex items-center justify-center text-neutral-400 text-sm">not rendered</div>
                             )}
                             {cell?.blocked && (
                               <div className="absolute top-2 right-2 bg-red-600 text-white text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded">blocked</div>
                             )}
+                            {status === 'partial' && (
+                              <div className="absolute top-2 left-2 bg-amber-500 text-white text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded">{completedCount}/4 views</div>
+                            )}
                           </div>
-                          <div className="p-3">
+                          <div className="p-3 border-t border-neutral-100">
                             <div className="flex items-center gap-2 mb-2">
                               {m.cardImageUrl && (
                                 <img src={m.cardImageUrl} alt="" className="w-6 h-6 object-cover rounded-full" />
                               )}
                               <div className="text-sm font-medium truncate">{m.name || m.id}</div>
                             </div>
-                            <div className="flex gap-2">
+                            <div className="flex gap-2" onClick={e => e.preventDefault()}>
                               <button
-                                onClick={() => renderCell(m.id)}
+                                onClick={(e) => { e.preventDefault(); renderCell(m.id); }}
                                 disabled={status === 'rendering'}
                                 className="flex-1 bg-neutral-100 hover:bg-neutral-200 disabled:opacity-50 text-xs px-2 py-1 rounded"
                               >
-                                {status === 'done' ? 'Re-render' : 'Render'}
+                                {status === 'done' ? 'Re-render' : status === 'partial' ? 'Retry missing' : 'Render'}
                               </button>
-                              {status === 'done' && (
+                              {(status === 'done' || status === 'partial') && (
                                 <button
-                                  onClick={() => toggleBlock(m.id, cell?.blocked || false)}
+                                  onClick={(e) => { e.preventDefault(); toggleBlock(m.id, cell?.blocked || false); }}
                                   className={`text-xs px-2 py-1 rounded ${cell?.blocked ? 'bg-red-600 text-white hover:bg-red-700' : 'bg-neutral-100 hover:bg-neutral-200'}`}
                                 >
                                   {cell?.blocked ? 'Unblock' : 'Block'}
@@ -361,7 +392,7 @@ export default function ShoeMatrixPage() {
                               <p className="text-[10px] text-red-700 mt-1">{cell.blockedReason}</p>
                             )}
                           </div>
-                        </div>
+                        </a>
                       );
                     })}
                   </div>

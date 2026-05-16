@@ -1,94 +1,120 @@
 /**
- * QA: shoe × model proportion matrix.
+ * Tier-2 cache: (model × shoe) 4-view 4K library.
  *
- * Pre-renders every (model, shoe) pair as a basics + shoes Seedream call so
- * reviewers can audit shoe scale/fit per combination before it hits a real job.
- * Bad combos (e.g. chunky platform shoes that consistently render oversized on
- * a particular model) are flagged via the `blocked` field; the new-job wizard
- * warns when the user picks a blocked pair.
+ * Pre-renders every (active shoe × active model with matching gender) as 4
+ * 1:1 4K square views, each showing the model wearing the shoe with the
+ * neutral matte-black placeholder outfit. These cells become the input
+ * anchor for production jobs — Tier-1 (barefoot) → Tier-2 (model+shoe).
  *
- * One Firestore doc per cell at `qaShoeMatrix/{shoeId}_{modelId}` so it's
- * idempotent — re-rendering replaces the GCS object and bumps `updatedAt`.
+ * Architecture (rewritten 2026-05-16):
+ *   - Input: Tier-1 4K barefoot asset for the view + shoe flat photo
+ *   - Renderer: Gemini-3-pro-image-preview at 1:1 4K
+ *   - Prompt: "Paint the shoes onto the bare feet of IMAGE 1, preserve
+ *     everything else." Narrow edit, not a full re-render.
+ *   - Output: 4 views per (shoe × model) — fullBodyFront, fullBodyBack,
+ *     legsFront, legsBack
  *
- * GCS path: `gs://gstar-ai-studio-assets/output/qa-matrix/{shoeId}/{modelId}.png`.
+ * Why this design fixes the prior inconsistency:
+ *   - Before: Seedream rendered from scratch using model card + shoe ref.
+ *     Pose/outfit/identity drifted across renders (Shay vs Georgia mismatch).
+ *   - After: Tier-1 barefoot pixel-locks pose/outfit/identity. Only the
+ *     shoes change. Consistency guaranteed because the base image is shared.
  *
- * Auto-sync (added 2026-05-13): `syncMatrix()` reconciles the matrix against
- * the current set of active shoes × active models, archives stale cells, and
- * renders missing/failed cells within a time budget. Models younger than the
- * `newModelBufferMs` (default 1h) are skipped so a misclicked model creation
- * doesn't trigger compute — gives the operator a window to delete it.
+ * Firestore schema (per cell at `qaShoeMatrix/{shoeId}_{modelId}`):
+ *   {
+ *     id, shoeId, modelId, status, blocked, ...
+ *     images: { fullBodyFront, fullBodyBack, legsFront, legsBack }   // 4K URLs
+ *     thumbs: { fullBodyFront, fullBodyBack, legsFront, legsBack }   // 512px JPEG URLs
+ *     viewsCompleted: ('fullBodyFront' | ...)[]   // which views are done
+ *     imageUrl?: string  // LEGACY — old single-view URL, kept for safety
+ *   }
+ *
+ * GCS paths:
+ *   gs://gstar-ai-studio-assets/output/qa-matrix/{shoeId}/{modelId}/{view}.png       (4K)
+ *   gs://gstar-ai-studio-assets/output/qa-matrix/{shoeId}/{modelId}/{view}_thumb.jpg (512px)
+ *
+ * Batch API (new 2026-05-16): see shoe-matrix-batch.ts for the async Pro
+ * Batch API submission flow that costs 50% less for the same renders.
  */
 import { getModel, getWardrobeItem, qaShoeMatrixCol, listModels, listWardrobeItems } from '@/lib/firestore';
-import { generateSeedreamImage, type SeedreamReferenceImage } from '@/lib/pipeline/seedream-client';
-import { ensureSeedreamSafeUrl } from '@/lib/pipeline/seedream-image-safe';
+import { generateImage, type ReferenceImage } from '@/lib/vertex';
 import { uploadGeneratedImage } from '@/lib/gcs';
 import { FieldValue } from '@google-cloud/firestore';
 
-const STUDIO_BACKDROP_URL =
-  'https://storage.googleapis.com/gstar-ai-studio-assets/backdrops/clean-studio-grey.jpg';
+export type ViewKey = 'fullBodyFront' | 'fullBodyBack' | 'legsFront' | 'legsBack';
+export const VIEWS: ViewKey[] = ['fullBodyFront', 'fullBodyBack', 'legsFront', 'legsBack'];
 
-// Mirror the unified MODEL CARD (FRONT) label from seedream-generate.ts so the
-// matrix render uses the exact same identity scoping as a real job. The QA
-// matrix is even stricter than production: the SAME model is rendered against
-// every shoe and the operator visually cross-compares — any face drift defeats
-// the matrix's purpose. So we lean harder on "identical, do not modify" here.
-const MODEL_CARD_FRONT_LABEL =
-  'MODEL CARD (FRONT) — canonical, exclusive, LOCKED source of truth for the ' +
-  'model\'s face and identity. Reproduce this card identically in the rendered ' +
-  'output: every facial feature (eye shape, eye color, nose, mouth, brow shape ' +
-  'and thickness), the exact natural facial expression captured here, skin tone ' +
-  'with undertone, freckle pattern, hair color and texture and length, body ' +
-  'proportions and height. The face in this card is the only allowable face — ' +
-  'do NOT invent new features, do NOT alter any feature, do NOT change ' +
-  'expression. This QA matrix renders the same model across many shoes and the ' +
-  'face must look identical across every render. Lighting on the rendered model ' +
-  'is neutral 5500K — do not transfer warm key lighting from any other reference.';
+const TIER1_BASE_LABEL =
+  'IMAGE 1 — TIER-1 BAREFOOT BASE. This is the canonical model asset. The ' +
+  'output must look 95% IDENTICAL to this image: same person, same face, same ' +
+  'skin tone, same outfit (matte-black sports bra + hot pants for female / ' +
+  'bare chest + matte-black boxer briefs for male), same pose, same stance, ' +
+  'same hand position, same arm position, same body angle, same backdrop, ' +
+  'same lighting, same framing, same composition. PRESERVE EVERY PIXEL except ' +
+  'the bare feet area at the bottom of the frame. The only allowed change is: ' +
+  'paint the shoes from IMAGE 2 onto the bare feet of IMAGE 1.';
 
 const SHOE_REF_LABEL =
-  'SHOE REFERENCE — visual reference for the focus footwear style, color, ' +
-  'material, leather finish, sole construction, and silhouette. Use this image ' +
-  'for the shoe\'s appearance and design details only. The product-photography ' +
-  'perspective in this reference is not a guide for render scale. Render the ' +
-  'shoe at correct anatomical foot proportions for the AI model — a normal ' +
-  'adult female shoe footprint, scaled to match the body and stance shown in ' +
-  'the model reference.';
+  'IMAGE 2 — SHOE REFERENCE. Visual source of the footwear style: shape, ' +
+  'colour, material, leather finish, sole construction, silhouette, lacing, ' +
+  'hardware. Use this for the shoes\' appearance only. The product-photography ' +
+  'perspective in this reference is NOT a guide for render scale — render the ' +
+  'shoes at the correct anatomical foot proportions for the model in IMAGE 1.';
 
-const STUDIO_BACKDROP_LABEL =
-  'STUDIO BACKDROP — exact appearance for the seamless backdrop and floor ' +
-  'surface in this render. Smooth seamless light-grey sweep, no texture, no ' +
-  'patterns. NOT a source of pose, garment, or model identity — only the ' +
-  'studio set.';
+function buildMatrixPrompt(view: ViewKey): string {
+  const isBack = view === 'fullBodyBack' || view === 'legsBack';
+  const isLegsOnly = view === 'legsFront' || view === 'legsBack';
 
-const MATRIX_PROMPT = `Photorealistic studio e-commerce photograph, 3:4 portrait, FRONT VIEW. Full body head-to-toe in frame, model facing camera. Backdrop: neutral cool light-grey (#D9DAD2). Soft diffused studio lighting, white-balanced 5500K.
+  return `Photorealistic studio reference photo, 1:1 SQUARE crop, 4K resolution, ${isBack ? 'BACK' : 'FRONT'} VIEW, ${isLegsOnly ? 'waist-down (legs + feet)' : 'full body head-to-toe'}.
 
-### Identity lock — face is fixed, do not vary
-The model's face, hair, eyes (shape AND color), brow shape, nose, mouth, skin tone with undertone, freckle pattern, and body proportions must be IDENTICAL to MODEL CARD (FRONT) (Image 2). Treat the face in Image 2 as a locked reference — do NOT modify any facial feature, do NOT change hair length or color, do NOT add or remove freckles, do NOT alter the expression. Match Image 2 face-for-face. This QA matrix renders the same model across many shoes; the face must look identical across every render for cross-comparison to work.
+═══ THIS IS A NARROW EDIT — IMAGE 1 IS YOUR BLUEPRINT ═══
+The output is IMAGE 1 with shoes added. Every pixel of IMAGE 1 outside the bare-feet area MUST be preserved exactly:
+- Identity (face, hair, skin tone, body proportions): preserved from IMAGE 1.
+- Outfit (top + bottom): preserved from IMAGE 1.
+- Pose (stance, foot placement on the floor, hip/shoulder angle, arm position, hand position, head tilt): preserved from IMAGE 1.
+- Background (light-grey studio sweep #D9DAD2): preserved from IMAGE 1.
+- Lighting, framing, composition, camera angle: preserved from IMAGE 1.
 
-Bilaterally symmetric pose: both feet flat at natural shoulder-width stance, weight 50/50 across both feet, arms hanging straight at sides with a small natural gap from the torso, hands relaxed. The pose is identical for every render so only the shoes and proportions vary.
+═══ THE EDIT — REPLACE BARE FEET WITH THE SHOES IN IMAGE 2 ═══
+The model in IMAGE 1 is barefoot. Replace ONLY the bare-feet area with the shoes shown in IMAGE 2:
+- Shoe style: match IMAGE 2 exactly — same shape, colour, material, finish, sole, hardware, laces, straps.
+- Shoe scale: rendered at correct anatomical proportions for the model's feet in IMAGE 1. The shoes fit the model's existing foot positions — same stance, same foot orientation, same gap between feet.
+- Position: each shoe sits on the floor at exactly the same spot the corresponding bare foot was standing in IMAGE 1. ${isBack ? 'Heels visible to the camera.' : 'Toes/tops of shoes visible to the camera.'}
+- Both shoes fully visible — neither shoe is occluded, hidden behind the other foot, or cropped. The same shoe-width gap between the inner edges of the two shoes as IMAGE 1 had between the feet.
+- The floor shadow under each shoe is faint and soft, matching the studio lighting in IMAGE 1.
 
-### Outfit — fixed base undergarments + footwear ONLY
-This is a QA matrix render to verify shoe scale and fit per model. The model wears EXACTLY this outfit on every render — no stylistic variation, no color variation, no fit variation:
+═══ ABSOLUTELY FORBIDDEN ═══
+- DO NOT modify the model's face, hair, skin tone, or body — those are 100% locked to IMAGE 1.
+- DO NOT modify the outfit (top, bottom) — preserved from IMAGE 1.
+- DO NOT modify the pose, stance, or foot placement — the shoes go on the EXACT feet positions IMAGE 1 has.
+- DO NOT change the background, lighting, or framing.
+- DO NOT show only one shoe — both shoes are fully visible at correct anatomical proportions.
+- DO NOT add socks, ankle accessories, or anything not in IMAGE 2.`;
+}
 
-- TOP: plain matte-black racerback sports bra. Thin spaghetti straps over the shoulders. Scoop neckline at the front. A flat 2cm band at the bottom hem sitting just under the bust. NO logos, NO patterns, NO mesh panels, NO piping, NO stitching detail visible, NO color or accent other than matte black, NO sheen.
-- BOTTOM: plain matte-black low-rise hipster briefs sitting at the hip bone (well below the navel). Plain flat waistband, plain leg openings. NO logos, NO piping, NO mesh, NO waistband contrast or text, NO color other than matte black, NO sheen.
-- FOOTWEAR: as shown in SHOE REFERENCE (Image 3).
+export type CellStatus = 'pending' | 'rendering' | 'done' | 'failed' | 'partial' | 'batch-pending';
 
-Bare arms, bare upper torso, bare midriff, bare upper thighs, bare lower legs — natural skin tone matching MODEL CARD (FRONT).
-
-NOT wearing: NO t-shirt, NO top, NO blouse, NO jacket, NO pants, NO jeans, NO leggings, NO shorts, NO skirt, NO socks, NO accessories, NO jewellery.
-
-### Footwear
-Match SHOE REFERENCE (Image 3) for shape, color, material, and sole construction. Render the shoe at the AI model's natural foot proportions — a normal adult female shoe footprint, sized to match the body and stance. The product-photography perspective in the shoe reference is not a guide for render scale.
-
-Clean studio-product render. Same locked identity, same locked pose, same locked base layer, only the shoes vary across renders.`;
-
-export type CellStatus = 'pending' | 'rendering' | 'done' | 'failed';
+export type ViewImageMap = Partial<Record<ViewKey, string>>;
 
 export interface ShoeMatrixCell {
   id: string; // `${shoeId}_${modelId}`
   shoeId: string;
   modelId: string;
+
+  /**
+   * 4-view 4K image URLs. Cell is 'done' only when all 4 are populated.
+   * Falls back to `imageUrl` (legacy) if absent on old cells.
+   */
+  images?: ViewImageMap;
+  /** 512px JPEG thumbnail URLs for fast UI grid loading. */
+  thumbs?: ViewImageMap;
+  /** Which views have completed (mirrors `Object.keys(images)`). */
+  viewsCompleted?: ViewKey[];
+
+  /** Legacy single-view URL from the old Seedream 3:4 pipeline. Kept so old
+   *  cells still display until the Tier-1-based re-render replaces them. */
   imageUrl?: string;
+
   status: CellStatus;
   blocked: boolean;
   blockedReason?: string;
@@ -105,17 +131,115 @@ export interface ShoeMatrixCell {
   updatedAt?: Date;
 }
 
-function cellId(shoeId: string, modelId: string): string {
+export function cellId(shoeId: string, modelId: string): string {
   return `${shoeId}_${modelId}`;
 }
 
+interface ModelWithAssets {
+  referenceImageUrl?: string;
+  cardImageUrl?: string;
+  assets4K_fullBodyFront?: string;
+  assets4K_fullBodyBack?: string;
+  assets4K_legsFront?: string;
+  assets4K_legsBack?: string;
+}
+
+interface ShoeRefs {
+  flatFrontUrl?: string;
+  flatBackUrl?: string;
+  name?: string;
+}
+
+async function fetchBuffer(url: string): Promise<Buffer> {
+  const r = await fetch(url.split('?')[0]);
+  if (!r.ok) throw new Error(`fetch ${url.slice(0, 60)} → ${r.status}`);
+  return Buffer.from(await r.arrayBuffer());
+}
+
 /**
- * Render a single (shoe, model) cell. Synchronous — caller awaits ~40s for
- * the Seedream call. Writes the image to GCS at output/qa-matrix/{shoeId}/{modelId}.png
- * and upserts the Firestore doc.
+ * Render a SINGLE view of a (shoe, model) cell using Gemini Pro Image
+ * Preview at 1:1 4K. Uses the Tier-1 barefoot asset as the base image and
+ * the shoe flat as the secondary reference.
  *
- * Throws on missing shoe/model/refs. Updates `status='failed'` + `errorMessage`
- * before throwing so the cell is visible in the UI as failed.
+ * Returns { imageUrl, thumbUrl }. Throws on failure.
+ *
+ * This is the building block both renderMatrixCell (sync, all 4 views in
+ * parallel) and the Batch API path (one JSONL request per view) use.
+ */
+export async function renderMatrixCellView(
+  shoeId: string,
+  modelId: string,
+  view: ViewKey,
+  apiKey?: string,
+): Promise<{ imageUrl: string; thumbUrl: string }> {
+  const shoe = await getWardrobeItem(shoeId) as ShoeRefs | null;
+  if (!shoe) throw new Error(`Shoe ${shoeId} not found`);
+  // For back views, prefer flatBackUrl if available; fall back to front.
+  const isBack = view === 'fullBodyBack' || view === 'legsBack';
+  const shoeUrl = isBack ? (shoe.flatBackUrl || shoe.flatFrontUrl) : shoe.flatFrontUrl;
+  if (!shoeUrl) throw new Error(`Shoe ${shoeId} has no flat image`);
+
+  const model = await getModel(modelId) as ModelWithAssets | null;
+  if (!model) throw new Error(`Model ${modelId} not found`);
+  const tier1Url = (model as Record<string, string | undefined>)[`assets4K_${view}`];
+  if (!tier1Url) {
+    throw new Error(
+      `Model ${modelId} missing Tier-1 asset assets4K_${view}. ` +
+      `Run scripts/generate-model-assets.ts ${modelId} first.`,
+    );
+  }
+
+  // Pull both refs as buffers (Gemini Generative Language API accepts buffers).
+  const [tier1Buf, shoeBuf] = await Promise.all([
+    fetchBuffer(tier1Url),
+    fetchBuffer(shoeUrl),
+  ]);
+
+  const refs: ReferenceImage[] = [
+    { buffer: tier1Buf, mimeType: 'image/png', label: TIER1_BASE_LABEL },
+    { buffer: shoeBuf, mimeType: 'image/jpeg', label: SHOE_REF_LABEL },
+  ];
+
+  const result = await generateImage({
+    prompt: buildMatrixPrompt(view),
+    referenceImages: refs,
+    aspectRatio: '1:1',
+    imageSize: '4K',
+    model: 'gemini-3-pro-image-preview',
+    apiKey,
+  });
+
+  // Upload 4K master.
+  const imageUrl = await uploadGeneratedImage(
+    `qa-matrix/${shoeId}/${modelId}`,
+    `${view}.png`,
+    result.imageData,
+    result.mimeType,
+  );
+
+  // Generate + upload 512px JPEG thumbnail.
+  const sharp = (await import('sharp')).default;
+  const thumbBuf = await sharp(result.imageData)
+    .resize(512, 512, { fit: 'cover', kernel: 'lanczos3' })
+    .jpeg({ quality: 82, mozjpeg: true })
+    .toBuffer();
+  const thumbUrl = await uploadGeneratedImage(
+    `qa-matrix/${shoeId}/${modelId}`,
+    `${view}_thumb.jpg`,
+    thumbBuf,
+    'image/jpeg',
+  );
+
+  return { imageUrl, thumbUrl };
+}
+
+/**
+ * Render all 4 views of a (shoe, model) cell in parallel. Synchronous —
+ * caller awaits ~2-3 min for the 4 parallel Gemini Pro calls.
+ *
+ * Writes images to GCS at output/qa-matrix/{shoeId}/{modelId}/{view}.{png,jpg}
+ * and upserts the Firestore doc. Updates `status='partial'` if some views
+ * succeed, `'done'` only when all 4 land, `'failed'` if none.
  */
 export async function renderMatrixCell(
   shoeId: string,
@@ -137,77 +261,57 @@ export async function renderMatrixCell(
     { merge: true },
   );
 
-  try {
-    const shoe = await getWardrobeItem(shoeId) as { flatFrontUrl?: string; name?: string } | null;
-    if (!shoe) throw new Error(`Shoe ${shoeId} not found`);
-    if (shoe.flatFrontUrl == null) throw new Error(`Shoe ${shoeId} has no flatFrontUrl`);
+  // Run all 4 views in parallel. Each view is independent — partial
+  // success is fine, we'll surface viewsCompleted to the UI.
+  const results = await Promise.allSettled(VIEWS.map(async (view) => {
+    const { imageUrl, thumbUrl } = await renderMatrixCellView(shoeId, modelId, view);
+    return { view, imageUrl, thumbUrl };
+  }));
 
-    const model = await getModel(modelId) as { referenceImageUrl?: string; cardImageUrl?: string } | null;
-    if (!model) throw new Error(`Model ${modelId} not found`);
-    const modelFrontUrl = model.referenceImageUrl || model.cardImageUrl;
-    if (!modelFrontUrl) throw new Error(`Model ${modelId} has no card image`);
-
-    const refs: SeedreamReferenceImage[] = [
-      {
-        url: await ensureSeedreamSafeUrl(STUDIO_BACKDROP_URL),
-        label: STUDIO_BACKDROP_LABEL,
-      },
-      {
-        url: await ensureSeedreamSafeUrl(modelFrontUrl.split('?')[0]),
-        label: MODEL_CARD_FRONT_LABEL,
-      },
-      {
-        url: await ensureSeedreamSafeUrl(shoe.flatFrontUrl.split('?')[0]),
-        label: SHOE_REF_LABEL,
-      },
-    ];
-
-    const result = await generateSeedreamImage({
-      prompt: MATRIX_PROMPT,
-      referenceImages: refs,
-      aspectRatio: '3:4',
-    });
-
-    const imageUrl = await uploadGeneratedImage(
-      `qa-matrix/${shoeId}`,
-      `${modelId}.png`,
-      result.imageData,
-      result.mimeType,
-    );
-
-    const cell: ShoeMatrixCell = {
-      id,
-      shoeId,
-      modelId,
-      imageUrl,
-      status: 'done',
-      blocked: false,
-    };
-
-    await docRef.set(
-      {
-        ...cell,
-        // Cache-bust query string so the UI re-fetches after a re-render.
-        imageUrl: `${imageUrl}?v=${Date.now()}`,
-        updatedAt: FieldValue.serverTimestamp(),
-      },
-      { merge: true },
-    );
-
-    return { ...cell, imageUrl: `${imageUrl}?v=${Date.now()}` };
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.error(`[ShoeMatrix] render ${id} failed:`, err);
-    await docRef.set(
-      {
-        status: 'failed' as CellStatus,
-        errorMessage: msg,
-        updatedAt: FieldValue.serverTimestamp(),
-      },
-      { merge: true },
-    );
-    throw err;
+  const images: ViewImageMap = {};
+  const thumbs: ViewImageMap = {};
+  const failures: string[] = [];
+  const succeeded: ViewKey[] = [];
+  for (const r of results) {
+    if (r.status === 'fulfilled') {
+      const { view, imageUrl, thumbUrl } = r.value;
+      images[view] = `${imageUrl}?v=${Date.now()}`;
+      thumbs[view] = `${thumbUrl}?v=${Date.now()}`;
+      succeeded.push(view);
+    } else {
+      failures.push(r.reason instanceof Error ? r.reason.message : String(r.reason));
+    }
   }
+
+  let status: CellStatus;
+  if (succeeded.length === VIEWS.length) status = 'done';
+  else if (succeeded.length === 0) status = 'failed';
+  else status = 'partial';
+
+  const update: Record<string, unknown> = {
+    status,
+    images,
+    thumbs,
+    viewsCompleted: succeeded,
+    updatedAt: FieldValue.serverTimestamp(),
+  };
+  if (failures.length > 0) {
+    update.errorMessage = failures.join(' | ').slice(0, 1000);
+  }
+
+  await docRef.set(update, { merge: true });
+  if (status === 'failed') {
+    console.error(`[ShoeMatrix] render ${id} ALL views failed:`, failures);
+  } else if (status === 'partial') {
+    console.warn(`[ShoeMatrix] render ${id} PARTIAL ${succeeded.length}/${VIEWS.length}:`, failures);
+  }
+
+  return {
+    id, shoeId, modelId,
+    images, thumbs, viewsCompleted: succeeded,
+    status, blocked: false,
+    errorMessage: update.errorMessage as string | undefined,
+  };
 }
 
 /**
@@ -218,54 +322,51 @@ export async function renderMatrixCell(
  * Archived cells (model deactivated or shoe removed) are excluded by default
  * — pass `includeArchived: true` to surface them for debugging.
  */
+function snapToCell(d: FirebaseFirestore.QueryDocumentSnapshot): ShoeMatrixCell {
+  const data = d.data();
+  return {
+    id: d.id,
+    shoeId: data.shoeId,
+    modelId: data.modelId,
+    // New 4-view schema fields.
+    images: data.images as ViewImageMap | undefined,
+    thumbs: data.thumbs as ViewImageMap | undefined,
+    viewsCompleted: data.viewsCompleted as ViewKey[] | undefined,
+    // Legacy single-view field — kept so old cells render until re-rendered.
+    imageUrl: data.imageUrl,
+    status: data.status,
+    blocked: data.blocked || false,
+    blockedReason: data.blockedReason,
+    errorMessage: data.errorMessage,
+    archived: data.archived || false,
+    archivedAt: data.archivedAt?.toDate?.(),
+    archivedReason: data.archivedReason,
+    createdAt: data.createdAt?.toDate?.(),
+    updatedAt: data.updatedAt?.toDate?.(),
+  };
+}
+
 export async function listCellsForShoe(
   shoeId: string,
   options: { includeArchived?: boolean } = {},
 ): Promise<ShoeMatrixCell[]> {
   const snap = await qaShoeMatrixCol.where('shoeId', '==', shoeId).get();
   return snap.docs
-    .map(d => {
-      const data = d.data();
-      return {
-        id: d.id,
-        shoeId: data.shoeId,
-        modelId: data.modelId,
-        imageUrl: data.imageUrl,
-        status: data.status,
-        blocked: data.blocked || false,
-        blockedReason: data.blockedReason,
-        errorMessage: data.errorMessage,
-        archived: data.archived || false,
-        archivedAt: data.archivedAt?.toDate?.(),
-        archivedReason: data.archivedReason,
-        createdAt: data.createdAt?.toDate?.(),
-        updatedAt: data.updatedAt?.toDate?.(),
-      };
-    })
+    .map(snapToCell)
     .filter(c => options.includeArchived || !c.archived);
 }
 
 /** List ALL cells across all shoes (used by the sync endpoint to reconcile). */
 export async function listAllCells(): Promise<ShoeMatrixCell[]> {
   const snap = await qaShoeMatrixCol.get();
-  return snap.docs.map(d => {
-    const data = d.data();
-    return {
-      id: d.id,
-      shoeId: data.shoeId,
-      modelId: data.modelId,
-      imageUrl: data.imageUrl,
-      status: data.status,
-      blocked: data.blocked || false,
-      blockedReason: data.blockedReason,
-      errorMessage: data.errorMessage,
-      archived: data.archived || false,
-      archivedAt: data.archivedAt?.toDate?.(),
-      archivedReason: data.archivedReason,
-      createdAt: data.createdAt?.toDate?.(),
-      updatedAt: data.updatedAt?.toDate?.(),
-    };
-  });
+  return snap.docs.map(snapToCell);
+}
+
+/** Get a single cell by composite ID (used by the cell detail page). */
+export async function getCellById(id: string): Promise<ShoeMatrixCell | null> {
+  const doc = await qaShoeMatrixCol.doc(id).get();
+  if (!doc.exists) return null;
+  return snapToCell(doc as FirebaseFirestore.QueryDocumentSnapshot);
 }
 
 export async function setBlocked(
@@ -490,11 +591,12 @@ export async function syncMatrix(options: SyncMatrixOptions = {}): Promise<SyncM
     }
   }
 
-  // ── 3. Render pending + failed cells within budget ────────────────────────
+  // ── 3. Render pending + failed + partial cells within budget ────────────
   // Re-fetch the cell list so we include the ones we just created (and the
-  // ones forceRerender just flipped back to pending).
+  // ones forceRerender just flipped back to pending). Partial cells are
+  // included so failed views get a retry.
   const cellsToRender = (await listAllCells())
-    .filter(c => !c.archived && (c.status === 'pending' || c.status === 'failed'))
+    .filter(c => !c.archived && (c.status === 'pending' || c.status === 'failed' || c.status === 'partial'))
     // Skip cells whose shoe or model have disappeared (shouldn't happen given
     // the reconcile loop above, but defensive).
     .filter(c => shoesById.has(c.shoeId) && modelsById.has(c.modelId));
