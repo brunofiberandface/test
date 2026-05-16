@@ -581,7 +581,7 @@ export async function checkBatch(apiKey: string): Promise<{ state: BatchState; p
   let bytesRead = 0;
   let firstChunkLogged = false;
   let processedSinceLastPersist = 0;
-  const PERSIST_EVERY = 25;
+  const PERSIST_EVERY = 5;
 
   async function persistProgress(label: string): Promise<void> {
     await db.collection('system').doc(BATCH_JOB_DOC_ID).set(
