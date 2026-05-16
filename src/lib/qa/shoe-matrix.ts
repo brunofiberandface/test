@@ -261,56 +261,85 @@ export async function renderMatrixCell(
     { merge: true },
   );
 
+  // Read existing cell so we can merge prior-succeeded views into the
+  // final result. Without this, retries that lose a transient view would
+  // also lose the previously-succeeded views (image map gets overwritten).
+  const existingSnap = await docRef.get();
+  const existingData = existingSnap.exists ? existingSnap.data() : {};
+  const existingImages = (existingData?.images || {}) as ViewImageMap;
+  const existingThumbs = (existingData?.thumbs || {}) as ViewImageMap;
+  const existingViewsCompleted = (existingData?.viewsCompleted || []) as ViewKey[];
+
   // Run all 4 views in parallel. Each view is independent — partial
-  // success is fine, we'll surface viewsCompleted to the UI.
+  // success is fine, we accumulate succeeded views over multiple runs.
   const results = await Promise.allSettled(VIEWS.map(async (view) => {
     const { imageUrl, thumbUrl } = await renderMatrixCellView(shoeId, modelId, view);
     return { view, imageUrl, thumbUrl };
   }));
 
-  const images: ViewImageMap = {};
-  const thumbs: ViewImageMap = {};
+  const newSucceeded: ViewKey[] = [];
   const failures: string[] = [];
-  const succeeded: ViewKey[] = [];
+
+  // Use Firestore field-path notation so each view writes independently —
+  // failed views don't touch their slot, so a previously-succeeded view's
+  // URL stays put on a retry that fails that view.
+  const update: Record<string, unknown> = {
+    updatedAt: FieldValue.serverTimestamp(),
+  };
   for (const r of results) {
     if (r.status === 'fulfilled') {
       const { view, imageUrl, thumbUrl } = r.value;
-      images[view] = `${imageUrl}?v=${Date.now()}`;
-      thumbs[view] = `${thumbUrl}?v=${Date.now()}`;
-      succeeded.push(view);
+      update[`images.${view}`] = `${imageUrl}?v=${Date.now()}`;
+      update[`thumbs.${view}`] = `${thumbUrl}?v=${Date.now()}`;
+      newSucceeded.push(view);
     } else {
       failures.push(r.reason instanceof Error ? r.reason.message : String(r.reason));
     }
   }
 
+  // Final viewsCompleted = union of previously-completed + this-run-succeeded.
+  // Build the union as a Set so duplicates collapse.
+  const finalViewsCompleted = Array.from(
+    new Set<ViewKey>([...existingViewsCompleted, ...newSucceeded]),
+  );
+
   let status: CellStatus;
-  if (succeeded.length === VIEWS.length) status = 'done';
-  else if (succeeded.length === 0) status = 'failed';
+  if (finalViewsCompleted.length === VIEWS.length) status = 'done';
+  else if (finalViewsCompleted.length === 0) status = 'failed';
   else status = 'partial';
 
-  const update: Record<string, unknown> = {
-    status,
-    images,
-    thumbs,
-    viewsCompleted: succeeded,
-    updatedAt: FieldValue.serverTimestamp(),
-  };
+  update.status = status;
+  update.viewsCompleted = finalViewsCompleted;
   if (failures.length > 0) {
     update.errorMessage = failures.join(' | ').slice(0, 1000);
+  } else if (status === 'done') {
+    // Clear stale error from previous partial runs.
+    update.errorMessage = FieldValue.delete();
   }
 
   await docRef.set(update, { merge: true });
   if (status === 'failed') {
     console.error(`[ShoeMatrix] render ${id} ALL views failed:`, failures);
   } else if (status === 'partial') {
-    console.warn(`[ShoeMatrix] render ${id} PARTIAL ${succeeded.length}/${VIEWS.length}:`, failures);
+    console.warn(`[ShoeMatrix] render ${id} PARTIAL ${finalViewsCompleted.length}/${VIEWS.length} total (this run ${newSucceeded.length}):`, failures);
   }
 
+  // Build response with the merged map for the caller.
+  const finalImages: ViewImageMap = { ...existingImages };
+  const finalThumbs: ViewImageMap = { ...existingThumbs };
+  for (const r of results) {
+    if (r.status === 'fulfilled') {
+      finalImages[r.value.view] = update[`images.${r.value.view}`] as string;
+      finalThumbs[r.value.view] = update[`thumbs.${r.value.view}`] as string;
+    }
+  }
   return {
     id, shoeId, modelId,
-    images, thumbs, viewsCompleted: succeeded,
+    images: finalImages,
+    thumbs: finalThumbs,
+    viewsCompleted: finalViewsCompleted,
     status, blocked: false,
-    errorMessage: update.errorMessage as string | undefined,
+    errorMessage: typeof update.errorMessage === 'string' ? update.errorMessage : undefined,
   };
 }
 
