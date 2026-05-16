@@ -262,30 +262,44 @@ export async function submitBatch(entries: BatchEntry[], apiKey: string): Promis
   console.log(`[submitBatch] uniques: ${tier1RefKeys.size} tier-1 refs, ${shoeRefKeys.size} shoe refs`);
 
   // Step 2: resolve each unique ref → download buffer → upload to Files API.
+  // Parallelized in chunks of 10 — fully sequential would take 7-12 min for
+  // ~140 refs and risk Cloud Run's 15-min timeout. Chunks of 10 keep us
+  // safely under both the timeout AND the Files API rate limit.
+  const CONCURRENCY = 10;
   const tier1UriByKey = new Map<string, { uri: string; mimeType: string }>();
-  for (const key of tier1RefKeys) {
-    const [modelId, view] = key.split('::') as [string, ViewKey];
-    const model = await getModel(modelId) as Record<string, string | undefined> | null;
-    if (!model) throw new Error(`Model ${modelId} not found`);
-    const tier1Url = model[`assets4K_${view}`];
-    if (!tier1Url) throw new Error(`Model ${modelId} missing assets4K_${view}`);
-    const { buffer, mimeType } = await fetchBufferFromUrl(tier1Url);
-    const file = await uploadFileToGemini(buffer, mimeType, `tier1-${modelId}-${view}`, apiKey);
-    tier1UriByKey.set(key, { uri: file.uri, mimeType: file.mimeType });
-    console.log(`[submitBatch] uploaded tier1 ${key} → ${file.name}`);
+  const tier1KeysArr = Array.from(tier1RefKeys);
+  for (let i = 0; i < tier1KeysArr.length; i += CONCURRENCY) {
+    const chunk = tier1KeysArr.slice(i, i + CONCURRENCY);
+    await Promise.all(chunk.map(async key => {
+      const [modelId, view] = key.split('::') as [string, ViewKey];
+      const model = await getModel(modelId) as Record<string, string | undefined> | null;
+      if (!model) throw new Error(`Model ${modelId} not found`);
+      const tier1Url = model[`assets4K_${view}`];
+      if (!tier1Url) throw new Error(`Model ${modelId} missing assets4K_${view}`);
+      const { buffer, mimeType } = await fetchBufferFromUrl(tier1Url);
+      const file = await uploadFileToGemini(buffer, mimeType, `tier1-${modelId}-${view}`, apiKey);
+      tier1UriByKey.set(key, { uri: file.uri, mimeType: file.mimeType });
+      console.log(`[submitBatch] uploaded tier1 ${key} → ${file.name}`);
+    }));
+    console.log(`[submitBatch] tier1 progress: ${Math.min(i + CONCURRENCY, tier1KeysArr.length)}/${tier1KeysArr.length}`);
   }
 
   const shoeUriByKey = new Map<string, { uri: string; mimeType: string }>();
-  for (const key of shoeRefKeys) {
-    const [shoeId, side] = key.split('::');
-    const shoe = await getWardrobeItem(shoeId) as { flatFrontUrl?: string; flatBackUrl?: string } | null;
-    if (!shoe) throw new Error(`Shoe ${shoeId} not found`);
-    const shoeUrl = side === 'back' ? (shoe.flatBackUrl || shoe.flatFrontUrl) : shoe.flatFrontUrl;
-    if (!shoeUrl) throw new Error(`Shoe ${shoeId} has no flat for side=${side}`);
-    const { buffer, mimeType } = await fetchBufferFromUrl(shoeUrl);
-    const file = await uploadFileToGemini(buffer, mimeType, `shoe-${shoeId}-${side}`, apiKey);
-    shoeUriByKey.set(key, { uri: file.uri, mimeType: file.mimeType });
-    console.log(`[submitBatch] uploaded shoe ${key} → ${file.name}`);
+  const shoeKeysArr = Array.from(shoeRefKeys);
+  for (let i = 0; i < shoeKeysArr.length; i += CONCURRENCY) {
+    const chunk = shoeKeysArr.slice(i, i + CONCURRENCY);
+    await Promise.all(chunk.map(async key => {
+      const [shoeId, side] = key.split('::');
+      const shoe = await getWardrobeItem(shoeId) as { flatFrontUrl?: string; flatBackUrl?: string } | null;
+      if (!shoe) throw new Error(`Shoe ${shoeId} not found`);
+      const shoeUrl = side === 'back' ? (shoe.flatBackUrl || shoe.flatFrontUrl) : shoe.flatFrontUrl;
+      if (!shoeUrl) throw new Error(`Shoe ${shoeId} has no flat for side=${side}`);
+      const { buffer, mimeType } = await fetchBufferFromUrl(shoeUrl);
+      const file = await uploadFileToGemini(buffer, mimeType, `shoe-${shoeId}-${side}`, apiKey);
+      shoeUriByKey.set(key, { uri: file.uri, mimeType: file.mimeType });
+      console.log(`[submitBatch] uploaded shoe ${key} → ${file.name}`);
+    }));
+    console.log(`[submitBatch] shoe progress: ${Math.min(i + CONCURRENCY, shoeKeysArr.length)}/${shoeKeysArr.length}`);
   }
 
   // Step 3: build the JSONL. Each line is a complete BatchRequest.
