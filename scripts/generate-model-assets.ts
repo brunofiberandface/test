@@ -237,21 +237,44 @@ async function processModel(db: Firestore, modelId: string): Promise<void> {
     }
   }));
 
-  // Upload successful renders + update Firestore
+  // Upload successful renders + thumbnails + update Firestore.
+  // Thumbnail = 512x512 JPEG quality 82 (~50-80KB) for the model-detail-page
+  // grid. The full 4K PNG (~17MB) is reserved for the lightbox-on-click view.
+  // Generating the thumb inline (one resize per asset) is ~1s per file via
+  // sharp lanczos3 — much faster than backfilling later.
+  const sharp = (await import('sharp')).default;
   const update: Record<string, string> = {};
   for (const r of results) {
     if (!r.ok) continue;
-    const filename = `${r.view}.png`;
-    const gcsPath = `model-assets/${modelId}/${filename}`;
-    const url = await uploadGeneratedImage(`model-assets/${modelId}`, filename, r.buf);
+    // Upload 4K master.
+    const url = await uploadGeneratedImage(`model-assets/${modelId}`, `${r.view}.png`, r.buf);
     update[`assets4K_${r.view}`] = url;
-    console.log(`  ✓ Uploaded → ${url}`);
+    // Generate + upload 512px JPEG thumbnail.
+    try {
+      const thumbBuf = await sharp(r.buf)
+        .resize(512, 512, { fit: 'cover', kernel: 'lanczos3' })
+        .jpeg({ quality: 82, mozjpeg: true })
+        .toBuffer();
+      const thumbUrl = await uploadGeneratedImage(
+        `model-assets/${modelId}`,
+        `${r.view}_thumb.jpg`,
+        thumbBuf,
+        'image/jpeg',
+      );
+      update[`assetsThumb_${r.view}`] = thumbUrl;
+      console.log(`  ✓ ${r.view}: 4K (${(r.buf.length / 1024 / 1024).toFixed(1)}MB) + thumb (${(thumbBuf.length / 1024).toFixed(0)}KB)`);
+    } catch (e) {
+      console.warn(`  ⚠ ${r.view} thumb failed (4K still saved):`, e instanceof Error ? e.message : e);
+    }
   }
 
   if (Object.keys(update).length > 0) {
     update['assets4K_updatedAt'] = new Date().toISOString();
+    if (Object.keys(update).some(k => k.startsWith('assetsThumb_'))) {
+      update['assetsThumb_updatedAt'] = new Date().toISOString();
+    }
     await db.collection('models').doc(modelId).update(update);
-    console.log(`  ✓ Firestore updated with ${Object.keys(update).length - 1} asset URLs`);
+    console.log(`  ✓ Firestore updated`);
   }
 }
 

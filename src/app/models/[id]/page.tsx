@@ -41,6 +41,13 @@ interface ModelData {
   assets4K_legsFront?: string;
   assets4K_legsBack?: string;
   assets4K_updatedAt?: string;
+  // 512px JPEG thumbnails for fast grid load (~50-80KB vs 17MB for the 4K PNG).
+  // Page loads thumbs in the grid; click opens the 4K in the lightbox.
+  assetsThumb_fullBodyFront?: string;
+  assetsThumb_fullBodyBack?: string;
+  assetsThumb_legsFront?: string;
+  assetsThumb_legsBack?: string;
+  assetsThumb_updatedAt?: string;
 }
 
 export default function ModelDetailPage() {
@@ -63,16 +70,26 @@ export default function ModelDetailPage() {
   const [zoomMode, setZoomMode] = useState<'full' | 'head' | 'torso'>('full');
   const imgContainerRef = useRef<HTMLDivElement>(null);
   // 4K asset lightbox state — click an asset → opens lightbox (image fits
-  // window). Click again → full 4K opens in a new browser tab.
+  // window). Click the image inside the lightbox → zoom to native 4K pixels
+  // centered on click point (scroll-pan to inspect details). Click again →
+  // back to fit-window. Esc closes lightbox entirely.
   const [assetLightbox, setAssetLightbox] = useState<string | null>(null);
+  const [lightboxZoomed, setLightboxZoomed] = useState(false);
+  const lightboxScrollRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (!assetLightbox) return;
     const handleKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setAssetLightbox(null);
+      if (e.key === 'Escape') {
+        // First Esc exits zoom (if zoomed), second Esc closes lightbox
+        if (lightboxZoomed) setLightboxZoomed(false);
+        else setAssetLightbox(null);
+      }
     };
     window.addEventListener('keydown', handleKey);
     return () => window.removeEventListener('keydown', handleKey);
-  }, [assetLightbox]);
+  }, [assetLightbox, lightboxZoomed]);
+  // Reset zoom when lightbox closes or a different asset opens
+  useEffect(() => { setLightboxZoomed(false); }, [assetLightbox]);
 
   // Replace-reference-image upload path removed 2026-05-10. Generation +
   // Regenerate (overlay button on front image) is now the canonical flow.
@@ -349,8 +366,9 @@ export default function ModelDetailPage() {
 
       {/* 4K Model Asset Library — main visual content of this page.
           4 columns in a SINGLE ROW regardless of viewport, each square.
-          Click any → fullscreen popup (image fills 100vw × 100vh).
-          Generated via scripts/generate-model-assets.ts. */}
+          Grid loads the 512px THUMBNAIL JPEG (~60KB) per cell for fast page
+          render. Click any → fullscreen popup loads the full 4K PNG (~17MB)
+          and supports click-to-zoom to native pixels. */}
       {(model.assets4K_fullBodyFront ||
         model.assets4K_fullBodyBack ||
         model.assets4K_legsFront ||
@@ -358,20 +376,20 @@ export default function ModelDetailPage() {
         <div className="mb-12">
           <div className="grid grid-cols-4 gap-4">
             {([
-              ['Full body — front', model.assets4K_fullBodyFront],
-              ['Full body — back',  model.assets4K_fullBodyBack],
-              ['Legs — front (M01)', model.assets4K_legsFront],
-              ['Legs — back (M02)',  model.assets4K_legsBack],
-            ] as Array<[string, string | undefined]>).map(([label, url]) => (
+              ['Full body — front', model.assetsThumb_fullBodyFront, model.assets4K_fullBodyFront],
+              ['Full body — back',  model.assetsThumb_fullBodyBack,  model.assets4K_fullBodyBack],
+              ['Legs — front (M01)', model.assetsThumb_legsFront,    model.assets4K_legsFront],
+              ['Legs — back (M02)',  model.assetsThumb_legsBack,     model.assets4K_legsBack],
+            ] as Array<[string, string | undefined, string | undefined]>).map(([label, thumbUrl, fullUrl]) => (
               <div key={label} className="space-y-2">
                 <div
                   className="aspect-square bg-neutral-100 border border-neutral-200 overflow-hidden relative cursor-zoom-in group"
-                  onClick={() => url && setAssetLightbox(url)}
+                  onClick={() => fullUrl && setAssetLightbox(fullUrl)}
                 >
-                  {url ? (
+                  {(thumbUrl || fullUrl) ? (
                     <>
                       <img
-                        src={url}
+                        src={thumbUrl || fullUrl}
                         alt={label}
                         loading="lazy"
                         className="w-full h-full object-contain"
@@ -568,24 +586,66 @@ export default function ModelDetailPage() {
           )}
         </div>
 
-      {/* 4K asset lightbox — first click on a thumb opens this (image fits the
-          viewport at fit-window). Click backdrop or Esc closes the popup. */}
+      {/* 4K asset lightbox — opens fitted to the viewport. Click the image
+          → zoom to native pixel size (4096×4096), centered on click point,
+          container becomes scrollable for pan. Click again → fit. Esc
+          un-zooms first, then closes. */}
       {assetLightbox && (
         <div
-          className="fixed inset-0 z-50 bg-black flex items-center justify-center cursor-zoom-out"
+          ref={lightboxScrollRef}
+          className={`fixed inset-0 z-50 bg-black ${lightboxZoomed ? 'overflow-auto cursor-zoom-out' : 'flex items-center justify-center cursor-zoom-out'}`}
           onClick={() => setAssetLightbox(null)}
         >
-          <img
-            src={assetLightbox}
-            alt="4K asset"
-            className="max-w-screen max-h-screen w-screen h-screen object-contain"
-          />
+          {lightboxZoomed ? (
+            // Native pixel size — container scrolls if image > viewport.
+            <img
+              src={assetLightbox}
+              alt="4K asset"
+              className="block max-w-none max-h-none cursor-zoom-out"
+              onClick={(e) => {
+                e.stopPropagation();
+                setLightboxZoomed(false);
+              }}
+            />
+          ) : (
+            // Fit-window — image scaled to fit the viewport.
+            <img
+              src={assetLightbox}
+              alt="4K asset"
+              className="max-w-screen max-h-screen w-screen h-screen object-contain cursor-zoom-in"
+              onClick={(e) => {
+                e.stopPropagation();
+                // Capture click position relative to the image to compute
+                // where to scroll the container after the native-size image
+                // appears.
+                const img = e.currentTarget;
+                const rect = img.getBoundingClientRect();
+                // Click point within the displayed image bounds (0..1)
+                const xRatio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+                const yRatio = Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height));
+                setLightboxZoomed(true);
+                // After React re-renders the lightbox into zoomed mode, scroll
+                // the container so the click point is centred in the viewport.
+                requestAnimationFrame(() => {
+                  const c = lightboxScrollRef.current;
+                  if (!c) return;
+                  c.scrollLeft = xRatio * c.scrollWidth - c.clientWidth / 2;
+                  c.scrollTop = yRatio * c.scrollHeight - c.clientHeight / 2;
+                });
+              }}
+            />
+          )}
           <button
-            onClick={() => setAssetLightbox(null)}
-            className="absolute top-4 right-4 bg-white/15 hover:bg-white/30 text-white text-xs font-medium px-3 py-1.5 backdrop-blur-sm transition-colors"
+            onClick={(e) => { e.stopPropagation(); setAssetLightbox(null); }}
+            className="fixed top-4 right-4 bg-white/15 hover:bg-white/30 text-white text-xs font-medium px-3 py-1.5 backdrop-blur-sm transition-colors z-10"
           >
             Close (Esc)
           </button>
+          {!lightboxZoomed && (
+            <div className="fixed bottom-4 left-1/2 -translate-x-1/2 bg-white/15 text-white text-[11px] px-3 py-1.5 backdrop-blur-sm pointer-events-none">
+              Click image to zoom to native 4K · Esc closes
+            </div>
+          )}
         </div>
       )}
     </Shell>

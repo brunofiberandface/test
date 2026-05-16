@@ -39,6 +39,12 @@ interface Model {
   assets4K_legsFront?: string;
   assets4K_legsBack?: string;
   assets4K_updatedAt?: string;
+  // 512px JPEG thumbnails (~50-80KB each) for fast grid loading on detail page.
+  assetsThumb_fullBodyFront?: string;
+  assetsThumb_fullBodyBack?: string;
+  assetsThumb_legsFront?: string;
+  assetsThumb_legsBack?: string;
+  assetsThumb_updatedAt?: string;
 }
 
 export default function ModelsPage() {
