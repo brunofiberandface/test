@@ -317,7 +317,12 @@ export async function renderMatrixCell(
     update.errorMessage = FieldValue.delete();
   }
 
-  await docRef.set(update, { merge: true });
+  // IMPORTANT: use update() not set({merge:true}) — Firestore's set+merge
+  // treats dot-notation field paths as literal top-level keys with a dot
+  // in them, not as nested-field references. Verified the hard way in
+  // batch-check (which had the same bug). update() interprets dot-notation
+  // correctly as field paths into nested maps.
+  await docRef.update(update);
   if (status === 'failed') {
     console.error(`[ShoeMatrix] render ${id} ALL views failed:`, failures);
   } else if (status === 'partial') {

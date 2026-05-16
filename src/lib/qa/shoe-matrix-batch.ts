@@ -500,15 +500,16 @@ export async function checkBatch(apiKey: string): Promise<{ state: BatchState; p
         'image/jpeg',
       );
       const v = Date.now();
-      await qaShoeMatrixCol.doc(cellId).set(
-        {
-          [`images.${view}`]: `${imageUrl}?v=${v}`,
-          [`thumbs.${view}`]: `${thumbUrl}?v=${v}`,
-          viewsCompleted: FieldValue.arrayUnion(view),
-          updatedAt: FieldValue.serverTimestamp(),
-        },
-        { merge: true },
-      );
+      // IMPORTANT: use update() for dot-notation field paths. set({merge:true})
+      // treats dot-notation as literal top-level keys with a dot in them
+      // (verified the hard way — it created keys like "images.fullBodyFront"
+      // alongside the nested "images" map, hiding the new URLs).
+      await qaShoeMatrixCol.doc(cellId).update({
+        [`images.${view}`]: `${imageUrl}?v=${v}`,
+        [`thumbs.${view}`]: `${thumbUrl}?v=${v}`,
+        viewsCompleted: FieldValue.arrayUnion(view),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
       done++;
     } catch (err) {
       console.error(`[checkBatch] line process failed:`, err);
