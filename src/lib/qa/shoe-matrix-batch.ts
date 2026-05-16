@@ -440,15 +440,29 @@ export async function checkBatch(apiKey: string): Promise<{ state: BatchState; p
     throw new Error(`Batch SUCCEEDED but no output file path found. Raw status: ${JSON.stringify(status).slice(0, 1500)}`);
   }
   console.log(`[checkBatch] streaming results from ${outputFileName}`);
-  const dlRes = await fetch(
-    `${GENERATIVE_API_BASE}/download/v1beta/${outputFileName}:download?alt=media&key=${apiKey}`,
-  );
-  if (!dlRes.ok) {
-    throw new Error(`result download failed ${dlRes.status}: ${await dlRes.text()}`);
-  }
-  if (!dlRes.body) {
-    throw new Error(`result download had no body stream`);
-  }
+  // Use Node's built-in http instead of fetch — fetch's Web Streams API
+  // accumulates large buffers under the hood (verified: 8MB JSONL lines
+  // OOM Cloud Run at 2GiB even with streaming code). Node http + readline
+  // is closer to the metal, properly streams without keeping the whole
+  // body in memory.
+  const downloadUrl = `${GENERATIVE_API_BASE}/download/v1beta/${outputFileName}:download?alt=media&key=${apiKey}`;
+  const https = await import('https');
+  const readline = await import('readline');
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const lineEmitter = await new Promise<any>((resolve, reject) => {
+    const req = https.get(downloadUrl, (res) => {
+      if (res.statusCode !== 200) {
+        reject(new Error(`download failed: HTTP ${res.statusCode}`));
+        return;
+      }
+      console.log(`[checkBatch] response started, content-length=${res.headers['content-length']}`);
+      // readline streams line-by-line from the response. Backpressure-aware.
+      const rl = readline.createInterface({ input: res, crlfDelay: Infinity });
+      resolve(rl);
+    });
+    req.on('error', reject);
+    req.setTimeout(30 * 60 * 1000); // 30min download timeout
+  });
 
   // Process lines incrementally as they STREAM in. Each line is independent;
   // we maintain a `processedKeys` set in the batch tracking doc and skip
@@ -463,11 +477,6 @@ export async function checkBatch(apiKey: string): Promise<{ state: BatchState; p
   let failed = (job.failedRequests as number) || 0;
   let totalLinesSeen = 0;
 
-  // Stream-process lines from the fetch body.
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const reader = (dlRes.body as any).getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
   let overBudget = false;
 
   async function processLine(line: string): Promise<void> {
@@ -587,41 +596,26 @@ export async function checkBatch(apiKey: string): Promise<{ state: BatchState; p
     console.log(`[checkBatch] persisted progress (${label}): processed=${processedKeys.size}, done=${done}, failed=${failed}, bytesRead=${(bytesRead / 1024 / 1024).toFixed(1)}MB, elapsed=${((Date.now() - startTime) / 1000).toFixed(0)}s`);
   }
 
-  while (true) {
-    const { done: streamDone, value } = await reader.read();
-    if (streamDone) break;
-    bytesRead += value.length;
+  // Iterate readline events — node delivers one complete line per 'line' event.
+  for await (const line of lineEmitter) {
+    bytesRead += line.length;
     if (!firstChunkLogged) {
-      console.log(`[checkBatch] first chunk arrived: ${value.length} bytes`);
+      console.log(`[checkBatch] first line arrived: ${line.length} chars`);
       firstChunkLogged = true;
     }
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split('\n');
-    buffer = lines.pop() || ''; // keep partial last line
-    for (const line of lines) {
-      if (Date.now() - startTime > POLL_BUDGET_MS) {
-        overBudget = true;
-        if (line.trim().length > 0) totalLinesSeen++;
-        continue;
-      }
-      const before = processedKeys.size;
-      await processLine(line);
-      if (processedKeys.size > before) {
-        processedSinceLastPersist++;
-        if (processedSinceLastPersist >= PERSIST_EVERY) {
-          await persistProgress(`every-${PERSIST_EVERY}`);
-          processedSinceLastPersist = 0;
-        }
-      }
-    }
-  }
-  // Flush trailing partial line.
-  if (buffer.length > 0 && !overBudget) {
-    if (Date.now() - startTime <= POLL_BUDGET_MS) {
-      await processLine(buffer);
-    } else if (buffer.trim().length > 0) {
-      totalLinesSeen++;
+    if (Date.now() - startTime > POLL_BUDGET_MS) {
       overBudget = true;
+      if (line.trim().length > 0) totalLinesSeen++;
+      continue;
+    }
+    const before = processedKeys.size;
+    await processLine(line);
+    if (processedKeys.size > before) {
+      processedSinceLastPersist++;
+      if (processedSinceLastPersist >= PERSIST_EVERY) {
+        await persistProgress(`every-${PERSIST_EVERY}`);
+        processedSinceLastPersist = 0;
+      }
     }
   }
   console.log(`[checkBatch] streamed ${(bytesRead / 1024 / 1024).toFixed(1)}MB, seen ${totalLinesSeen} lines, overBudget=${overBudget}`);
