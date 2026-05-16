@@ -393,21 +393,20 @@ export default function ModelsPage() {
               <div className="grid grid-cols-5 gap-4">
                 {section.data.map(model => {
                   const mid = (model.modelId || model.id).trim();
-                  const isEditingThis = editingId === mid;
-
+                  // Simplified card (2026-05-16): image + Fx/Mx ID label only.
+                  // All other detail (name, description, admin actions like
+                  // edit / regen / delete / clone) lives on /models/{id}.
                   return (
-                    <div
+                    <Link
                       key={mid}
-                      className="group border border-neutral-200 bg-white hover:border-neutral-400 transition-colors"
+                      href={`/models/${mid}`}
+                      className="group block border border-neutral-200 bg-white hover:border-neutral-400 transition-colors"
                     >
-                      <Link
-                        href={`/models/${mid}`}
-                        className="aspect-[3/4] bg-neutral-100 relative overflow-hidden cursor-pointer block"
-                      >
+                      <div className="aspect-[3/4] bg-neutral-100 relative overflow-hidden">
                         {(model.referenceImageUrl || model.cardImageUrl) ? (
                           <img
                             src={(model.referenceImageUrl || model.cardImageUrl)!}
-                            alt={`${model.modelId} — ${model.name}`}
+                            alt={model.modelId}
                             className="w-full h-full object-cover object-top"
                           />
                         ) : (
@@ -420,58 +419,11 @@ export default function ModelsPage() {
                             <span className="text-xs text-neutral-500 uppercase">Inactive</span>
                           </div>
                         )}
-                      </Link>
-
-                      <div className="p-3">
-                        <div className="flex items-center justify-between gap-1">
-                          {isEditingThis && editField === 'modelId' ? (
-                            <input
-                              ref={inputRef}
-                              type="text"
-                              value={editValue}
-                              onChange={e => setEditValue(e.target.value)}
-                              onKeyDown={handleKeyDown}
-                              onBlur={saveEdit}
-                              disabled={saving}
-                              className="text-sm font-medium text-neutral-900 border border-neutral-300 px-1 py-0 w-16 outline-none focus:border-neutral-900"
-                            />
-                          ) : (
-                            <span
-                              className={`text-sm font-medium text-neutral-900 ${isAdmin ? 'cursor-pointer hover:bg-neutral-100 px-1 -mx-1' : ''}`}
-                              onClick={e => { if (isAdmin) { e.preventDefault(); startEdit(model, 'modelId'); } }}
-                            >
-                              {model.modelId}
-                            </span>
-                          )}
-
-                          {isEditingThis && editField === 'name' ? (
-                            <input
-                              ref={inputRef}
-                              type="text"
-                              value={editValue}
-                              onChange={e => setEditValue(e.target.value)}
-                              onKeyDown={handleKeyDown}
-                              onBlur={saveEdit}
-                              disabled={saving}
-                              className="text-xs text-neutral-600 border border-neutral-300 px-1 py-0 w-20 outline-none focus:border-neutral-900 text-right"
-                            />
-                          ) : (
-                            <span
-                              className={`text-xs text-neutral-400 ${isAdmin ? 'cursor-pointer hover:bg-neutral-100 px-1 -mx-1' : ''}`}
-                              onClick={e => { if (isAdmin) { e.preventDefault(); startEdit(model, 'name'); } }}
-                            >
-                              {model.name}
-                            </span>
-                          )}
-                        </div>
-                        <Link
-                          href={`/models/${mid}`}
-                          className="text-xs text-neutral-500 mt-1 line-clamp-2 cursor-pointer block"
-                        >
-                          {model.description}
-                        </Link>
                       </div>
-                    </div>
+                      <div className="px-2 py-1.5 text-center">
+                        <span className="text-sm font-medium text-neutral-900">{model.modelId}</span>
+                      </div>
+                    </Link>
                   );
                 })}
               </div>

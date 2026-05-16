@@ -264,181 +264,14 @@ export default function ModelDetailPage() {
         &larr; Back to portfolio
       </Link>
 
-      <div className="flex gap-8">
-        {/* Left — front + back reference images */}
-        <div className="flex-shrink-0">
-          {/* Zoom buttons */}
-          <div className="flex gap-1 mb-3">
-            {([
-              { key: 'full', label: 'Full Body' },
-              { key: 'head', label: 'Head Close-up' },
-              { key: 'torso', label: 'Torso' },
-            ] as const).map(z => (
-              <button
-                key={z.key}
-                onClick={() => setZoomMode(z.key)}
-                className={`px-3 py-1.5 text-xs font-medium transition-colors ${
-                  zoomMode === z.key
-                    ? 'bg-neutral-900 text-white'
-                    : 'border border-neutral-300 text-neutral-600 hover:bg-neutral-50'
-                }`}
-              >
-                {z.label}
-              </button>
-            ))}
-          </div>
-
-          {/* Front + Back side by side */}
-          <div className="flex gap-3">
-            {/* Front reference */}
-            <div className="w-[220px]">
-              <p className="text-[10px] font-medium text-neutral-400 uppercase tracking-wider mb-1">Front</p>
-              <div
-                ref={imgContainerRef}
-                className="aspect-[9/16] bg-neutral-100 border border-neutral-200 overflow-hidden relative cursor-pointer"
-                onClick={() => {
-                  const modes: Array<'full' | 'head' | 'torso'> = ['full', 'head', 'torso'];
-                  const idx = modes.indexOf(zoomMode);
-                  setZoomMode(modes[(idx + 1) % modes.length]);
-                }}
-              >
-                {(model.referenceImageUrl || model.cardImageUrl) ? (
-                  <img
-                    src={(model.referenceImageUrl || model.cardImageUrl)!}
-                    alt={`${model.modelId} — front`}
-                    className="w-full h-full transition-transform duration-500 ease-out"
-                    style={zoomStyles[zoomMode]}
-                  />
-                ) : (
-                  <div className="w-full h-full flex items-center justify-center text-neutral-300 text-sm">
-                    No reference photo
-                  </div>
-                )}
-                {(model.referenceImageUrl || model.cardImageUrl) && isAdmin && (
-                  <button
-                    onClick={(e) => { e.stopPropagation(); handleRegenerateFront(); }}
-                    disabled={regeneratingFront}
-                    className="absolute bottom-2 left-2 bg-black/80 text-white text-xs font-medium px-3 py-1.5 hover:bg-black transition-colors disabled:opacity-50 shadow-lg"
-                    title="Regenerate the front reference using the existing card as identity anchor + the v2 base layer (sports bra / bare torso + compression shorts + infinity cove)."
-                  >
-                    {regeneratingFront ? 'Regenerating…' : 'Regenerate'}
-                  </button>
-                )}
-              </div>
-            </div>
-
-            {/* Back reference */}
-            <div className="w-[220px]">
-              <p className="text-[10px] font-medium text-neutral-400 uppercase tracking-wider mb-1">Back</p>
-              <div className="aspect-[9/16] bg-neutral-100 border border-neutral-200 overflow-hidden relative">
-                {model.backReferenceImageUrl ? (
-                  <img
-                    src={model.backReferenceImageUrl}
-                    alt={`${model.modelId} — back`}
-                    className="w-full h-full object-contain"
-                  />
-                ) : (
-                  <div className="w-full h-full flex flex-col items-center justify-center text-neutral-300 text-sm gap-3">
-                    <span>No back view</span>
-                    {isAdmin && (
-                      <button
-                        onClick={handleGenerateBack}
-                        disabled={generatingBack}
-                        className="border border-neutral-300 px-3 py-1.5 text-xs font-medium text-neutral-600 hover:bg-neutral-50 transition-colors disabled:opacity-30"
-                      >
-                        {generatingBack ? 'Generating...' : 'Generate Back View'}
-                      </button>
-                    )}
-                  </div>
-                )}
-                {model.backReferenceImageUrl && isAdmin && (
-                  <button
-                    onClick={handleGenerateBack}
-                    disabled={generatingBack}
-                    className="absolute bottom-2 left-2 bg-black/60 text-white text-[10px] px-2 py-1 hover:bg-black/80 transition-colors disabled:opacity-50"
-                  >
-                    {generatingBack ? 'Generating...' : 'Regenerate'}
-                  </button>
-                )}
-              </div>
-            </div>
-          </div>
-
-          {/* Replace-by-upload button removed 2026-05-10 — Regenerate (front
-              image overlay) is the canonical flow. /api/models/{id} PATCH
-              still supports a base64 referenceImageUrl if needed via curl. */}
-
-          {/* ── 4K Model Asset Library ───────────────────────────────────
-              4 high-resolution model reference images at 1:1 square 4K:
-              full body F+B + legs F+B (barefoot, hot pants placeholder).
-              Click any → lightbox at fit-window size. Click lightbox image →
-              full 4K opens in new tab (raw GCS URL).
-              Generated via scripts/generate-model-assets.ts. */}
-          {(model.assets4K_fullBodyFront ||
-            model.assets4K_fullBodyBack ||
-            model.assets4K_legsFront ||
-            model.assets4K_legsBack) && (
-            <div className="mt-10">
-              <div className="flex items-baseline justify-between mb-3">
-                <h2 className="text-sm font-bold uppercase tracking-wider text-neutral-700">
-                  4K Model Assets
-                </h2>
-                {model.assets4K_updatedAt && (
-                  <p className="text-[11px] text-neutral-400">
-                    Updated {new Date(model.assets4K_updatedAt).toLocaleDateString()}
-                  </p>
-                )}
-              </div>
-              <p className="text-xs text-neutral-500 mb-4">
-                Click any image to view at fit-window size. Click again to open the full 4K file.
-              </p>
-              <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-                {([
-                  ['Full body — front', model.assets4K_fullBodyFront],
-                  ['Full body — back',  model.assets4K_fullBodyBack],
-                  ['Legs — front (M01)', model.assets4K_legsFront],
-                  ['Legs — back (M02)',  model.assets4K_legsBack],
-                ] as Array<[string, string | undefined]>).map(([label, url]) => (
-                  <div key={label} className="space-y-2">
-                    <div
-                      className="aspect-square bg-neutral-100 border border-neutral-200 overflow-hidden relative cursor-zoom-in group"
-                      onClick={() => url && setAssetLightbox(url)}
-                    >
-                      {url ? (
-                        <>
-                          <img
-                            src={url}
-                            alt={label}
-                            loading="lazy"
-                            className="w-full h-full object-contain"
-                          />
-                          <div className="absolute inset-0 bg-black/0 group-hover:bg-black/15 transition-colors flex items-center justify-center">
-                            <div className="opacity-0 group-hover:opacity-100 bg-black/70 text-white text-xs font-medium px-3 py-1.5 transition-opacity">
-                              View
-                            </div>
-                          </div>
-                        </>
-                      ) : (
-                        <div className="w-full h-full flex items-center justify-center text-neutral-300 text-xs text-center px-3">
-                          Not generated yet
-                        </div>
-                      )}
-                    </div>
-                    <p className="text-xs text-neutral-600 text-center">{label}</p>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-        </div>
-
-        {/* Right — model info + actions */}
-        <div className="flex-1">
-          <div className="flex items-center gap-3 mb-2">
+      {/* Header — Fx + name + compact admin actions in the top-right corner */}
+      <div className="flex items-start justify-between gap-6 mb-8">
+        <div>
+          <div className="flex items-baseline gap-3 mb-2">
             <h1 className="text-3xl font-bold text-neutral-900">{model.modelId}</h1>
             <span className="text-lg text-neutral-400">{model.name}</span>
           </div>
-          <div className="flex items-center gap-2 mb-6">
+          <div className="flex items-center gap-2">
             <span className={`text-xs px-2 py-0.5 font-medium ${model.gender === 'female' ? 'bg-pink-50 text-pink-700' : 'bg-blue-50 text-blue-700'}`}>
               {model.gender === 'female' ? 'Woman' : 'Man'}
             </span>
@@ -446,7 +279,134 @@ export default function ModelDetailPage() {
               {model.active ? 'Active' : 'Inactive'}
             </span>
           </div>
+        </div>
 
+        {/* Compact admin corner — only visible to admins. Plain text buttons,
+            no overlays, since the F/B reference photos themselves are hidden
+            on this page. Admin can still regenerate; the result becomes the
+            new card image on /models. */}
+        {isAdmin && (
+          <div className="flex flex-wrap items-center gap-2 justify-end pt-1">
+            <button
+              onClick={handleRegenerateFront}
+              disabled={regeneratingFront}
+              className="border border-neutral-300 px-3 py-1.5 text-xs font-medium text-neutral-600 hover:bg-neutral-50 disabled:opacity-50 transition-colors"
+              title="Regenerate the front reference image"
+            >
+              {regeneratingFront ? 'Regenerating…' : 'Regenerate Front'}
+            </button>
+            <button
+              onClick={handleGenerateBack}
+              disabled={generatingBack}
+              className="border border-neutral-300 px-3 py-1.5 text-xs font-medium text-neutral-600 hover:bg-neutral-50 disabled:opacity-50 transition-colors"
+              title="Generate (or regenerate) the back reference image"
+            >
+              {generatingBack ? 'Generating…' : (model.backReferenceImageUrl ? 'Regenerate Back' : 'Generate Back')}
+            </button>
+            <button
+              onClick={() => {
+                setShowCloneForm(!showCloneForm);
+                if (!showCloneForm) {
+                  const prefix = model.modelId.replace(/\d+$/, '');
+                  const num = parseInt(model.modelId.replace(/\D+/g, '') || '0') + 1;
+                  setCloneId(`${prefix}${num}`);
+                  setCloneName(`${model.name} variant`);
+                  setCloneDescription(model.description);
+                  setCloneGender(model.gender);
+                }
+              }}
+              className="border border-neutral-300 px-3 py-1.5 text-xs font-medium text-neutral-600 hover:bg-neutral-50 transition-colors"
+            >
+              Clone
+            </button>
+            {!confirmDelete ? (
+              <button
+                onClick={() => setConfirmDelete(true)}
+                className="border border-red-200 px-3 py-1.5 text-xs font-medium text-red-500 hover:bg-red-50 transition-colors"
+              >
+                Delete
+              </button>
+            ) : (
+              <span className="flex items-center gap-2">
+                <button
+                  onClick={handleDelete}
+                  disabled={deleting}
+                  className="bg-red-600 text-white px-3 py-1.5 text-xs font-medium hover:bg-red-700 disabled:opacity-30 transition-colors"
+                >
+                  {deleting ? 'Deleting…' : 'Confirm delete'}
+                </button>
+                <button
+                  onClick={() => setConfirmDelete(false)}
+                  className="border border-neutral-300 px-3 py-1.5 text-xs text-neutral-600 hover:bg-neutral-50"
+                >
+                  Cancel
+                </button>
+              </span>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* 4K Model Asset Library — main visual content of this page.
+          4 columns in a SINGLE ROW regardless of viewport, each square.
+          Click any → fullscreen popup (image fills 100vw × 100vh).
+          Generated via scripts/generate-model-assets.ts. */}
+      {(model.assets4K_fullBodyFront ||
+        model.assets4K_fullBodyBack ||
+        model.assets4K_legsFront ||
+        model.assets4K_legsBack) ? (
+        <div className="mb-12">
+          <div className="grid grid-cols-4 gap-4">
+            {([
+              ['Full body — front', model.assets4K_fullBodyFront],
+              ['Full body — back',  model.assets4K_fullBodyBack],
+              ['Legs — front (M01)', model.assets4K_legsFront],
+              ['Legs — back (M02)',  model.assets4K_legsBack],
+            ] as Array<[string, string | undefined]>).map(([label, url]) => (
+              <div key={label} className="space-y-2">
+                <div
+                  className="aspect-square bg-neutral-100 border border-neutral-200 overflow-hidden relative cursor-zoom-in group"
+                  onClick={() => url && setAssetLightbox(url)}
+                >
+                  {url ? (
+                    <>
+                      <img
+                        src={url}
+                        alt={label}
+                        loading="lazy"
+                        className="w-full h-full object-contain"
+                      />
+                      <div className="absolute inset-0 bg-black/0 group-hover:bg-black/15 transition-colors" />
+                    </>
+                  ) : (
+                    <div className="w-full h-full flex items-center justify-center text-neutral-300 text-xs text-center px-3">
+                      Not generated yet
+                    </div>
+                  )}
+                </div>
+                <p className="text-xs text-neutral-600 text-center">{label}</p>
+              </div>
+            ))}
+          </div>
+          {model.assets4K_updatedAt && (
+            <p className="text-[10px] text-neutral-400 mt-2 text-right">
+              4K assets updated {new Date(model.assets4K_updatedAt).toLocaleDateString()}
+            </p>
+          )}
+        </div>
+      ) : (
+        <div className="border border-neutral-200 bg-neutral-50 p-6 mb-12 text-center">
+          <p className="text-sm text-neutral-500">
+            No 4K assets generated yet for this model.
+          </p>
+          <p className="text-xs text-neutral-400 mt-1">
+            Run <code className="font-mono">npx tsx scripts/generate-model-assets.ts {model.modelId}</code> to create them.
+          </p>
+        </div>
+      )}
+
+      {/* Below the assets — celebrity check + description + create-job CTA */}
+      <div className="max-w-3xl">
           {/* Celebrity Resemblance Audit */}
           {model.celebrityCheck ? (
             <div className={`mb-6 border px-4 py-3 ${
@@ -517,60 +477,15 @@ export default function ModelDetailPage() {
             <p className="text-sm text-neutral-700 whitespace-pre-wrap leading-relaxed">{model.description}</p>
           </div>
 
-          {/* Actions */}
-          <div className="space-y-3 mb-8">
+          {/* Primary action — Create Job. Clone and Delete now live in the
+              admin corner at the top of the page (no duplicate buttons here). */}
+          <div className="mb-8">
             <Link
               href={`/jobs/new?modelId=${model.modelId}`}
               className="block w-fit bg-neutral-900 text-white px-6 py-2.5 text-sm font-medium hover:bg-neutral-800 transition-colors"
             >
               Create Job with {model.modelId}
             </Link>
-
-            <button
-              onClick={() => {
-                setShowCloneForm(!showCloneForm);
-                if (!showCloneForm) {
-                  const prefix = model.modelId.replace(/\d+$/, '');
-                  const num = parseInt(model.modelId.replace(/\D+/g, '') || '0') + 1;
-                  setCloneId(`${prefix}${num}`);
-                  setCloneName(`${model.name} variant`);
-                  setCloneDescription(model.description);
-                  setCloneGender(model.gender);
-                }
-              }}
-              className="block w-fit border border-neutral-300 px-6 py-2.5 text-sm font-medium text-neutral-600 hover:bg-neutral-50 transition-colors"
-            >
-              Create Model From This
-            </button>
-
-            {/* Delete */}
-            {isAdmin && (
-              !confirmDelete ? (
-                <button
-                  onClick={() => setConfirmDelete(true)}
-                  className="block w-fit text-xs text-red-400 hover:text-red-600 transition-colors"
-                >
-                  Delete Model
-                </button>
-              ) : (
-                <div className="flex items-center gap-2">
-                  <span className="text-xs text-red-600">Are you sure?</span>
-                  <button
-                    onClick={handleDelete}
-                    disabled={deleting}
-                    className="bg-red-600 text-white px-3 py-1 text-xs font-medium hover:bg-red-700 disabled:opacity-30"
-                  >
-                    {deleting ? 'Deleting...' : 'Yes, Delete'}
-                  </button>
-                  <button
-                    onClick={() => setConfirmDelete(false)}
-                    className="border border-neutral-300 px-3 py-1 text-xs text-neutral-600 hover:bg-neutral-50"
-                  >
-                    Cancel
-                  </button>
-                </div>
-              )
-            )}
           </div>
 
           {/* Clone form */}
@@ -652,40 +567,25 @@ export default function ModelDetailPage() {
             </div>
           )}
         </div>
-      </div>
 
       {/* 4K asset lightbox — first click on a thumb opens this (image fits the
-          viewport). The image itself is clickable: clicking the image opens the
-          raw 4K file in a new browser tab. Click the dark overlay or Esc
-          closes. */}
+          viewport at fit-window). Click backdrop or Esc closes the popup. */}
       {assetLightbox && (
         <div
-          className="fixed inset-0 z-50 bg-black/90 flex items-center justify-center cursor-zoom-out p-4"
+          className="fixed inset-0 z-50 bg-black flex items-center justify-center cursor-zoom-out"
           onClick={() => setAssetLightbox(null)}
         >
-          <a
-            href={assetLightbox}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="block cursor-zoom-in"
-            onClick={(e) => e.stopPropagation()}
-            title="Click to open full 4K in a new tab"
-          >
-            <img
-              src={assetLightbox}
-              alt="4K asset"
-              className="max-w-[95vw] max-h-[95vh] object-contain shadow-2xl"
-            />
-          </a>
+          <img
+            src={assetLightbox}
+            alt="4K asset"
+            className="max-w-screen max-h-screen w-screen h-screen object-contain"
+          />
           <button
             onClick={() => setAssetLightbox(null)}
             className="absolute top-4 right-4 bg-white/15 hover:bg-white/30 text-white text-xs font-medium px-3 py-1.5 backdrop-blur-sm transition-colors"
           >
             Close (Esc)
           </button>
-          <div className="absolute bottom-4 left-1/2 -translate-x-1/2 bg-white/15 text-white text-[11px] px-3 py-1.5 backdrop-blur-sm pointer-events-none">
-            Click image to open full 4K in new tab
-          </div>
         </div>
       )}
     </Shell>
