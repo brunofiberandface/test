@@ -381,12 +381,11 @@ export async function checkBatch(apiKey: string): Promise<{ state: BatchState; p
   if (!statusRes.ok) {
     throw new Error(`batch status fetch failed ${statusRes.status}: ${await statusRes.text()}`);
   }
-  const status = await statusRes.json() as {
-    name: string;
-    metadata?: { state?: string };
-    state?: string;
-    response?: { output_file?: { file_name?: string } };
-  };
+  // The response shape varies by API version + completion phase. We
+  // accept several aliases for the output file location.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const status = await statusRes.json() as any;
+  console.log(`[checkBatch] raw status response:`, JSON.stringify(status).slice(0, 2000));
   // The state shows up in different places depending on completion phase.
   const rawState = status.metadata?.state || status.state || 'JOB_STATE_UNSPECIFIED';
   // Google uses JOB_STATE_* prefix; map to our shorter enum.
@@ -412,10 +411,18 @@ export async function checkBatch(apiKey: string): Promise<{ state: BatchState; p
     };
   }
 
-  // Done — download the result JSONL.
-  const outputFileName = status.response?.output_file?.file_name;
+  // Done — download the result JSONL. Field path varies in Google's docs;
+  // accept all observed aliases. Newest docs use `dest.fileName` on the
+  // batch object.
+  const outputFileName: string | undefined =
+    status.dest?.fileName ||
+    status.dest?.file_name ||
+    status.response?.dest?.fileName ||
+    status.response?.dest?.file_name ||
+    status.response?.output_file?.file_name ||
+    status.response?.outputFile?.fileName;
   if (!outputFileName) {
-    throw new Error('Batch SUCCEEDED but no output_file in response');
+    throw new Error(`Batch SUCCEEDED but no output file path found. Raw status: ${JSON.stringify(status).slice(0, 1500)}`);
   }
   console.log(`[checkBatch] downloading results from ${outputFileName}`);
   const dlRes = await fetch(
