@@ -442,30 +442,38 @@ export async function checkBatch(apiKey: string): Promise<{ state: BatchState; p
   let failed = 0;
   for (const line of resultLines) {
     try {
-      const row = JSON.parse(line) as {
-        key: string;
-        response?: { candidates?: Array<{ content?: { parts?: Array<{ inline_data?: { mime_type?: string; data?: string } }> } }> };
-        error?: { message?: string };
-      };
-      const [cellId, view] = row.key.split('::') as [string, ViewKey];
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const row = JSON.parse(line) as any;
+      const [cellId, view] = row.key?.split('::') as [string, ViewKey];
       if (!cellId || !view) {
         console.warn(`[checkBatch] bad key ${row.key}, skipping`);
         failed++;
         continue;
       }
       if (row.error) {
-        console.warn(`[checkBatch] ${row.key} error: ${row.error.message}`);
+        console.warn(`[checkBatch] ${row.key} error: ${JSON.stringify(row.error)}`);
         failed++;
         continue;
       }
-      const inlinePart = row.response?.candidates?.[0]?.content?.parts?.find(p => p.inline_data?.data);
-      if (!inlinePart?.inline_data?.data) {
-        console.warn(`[checkBatch] ${row.key} no inline image data`);
+      // Google REST returns camelCase by default but accepts snake_case as fallback.
+      // Also: the parts can be inlineData OR inline_data; the candidate may be
+      // at row.response.candidates OR row.candidates depending on shape.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const parts: any[] | undefined =
+        row.response?.candidates?.[0]?.content?.parts ||
+        row.candidates?.[0]?.content?.parts;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const inlinePart = parts?.find((p: any) => p.inlineData?.data || p.inline_data?.data);
+      const inline = inlinePart?.inlineData || inlinePart?.inline_data;
+      if (!inline?.data) {
+        // Log a slim version of the row so the actual shape is visible.
+        const slim = { key: row.key, hasResponse: !!row.response, responseKeys: row.response ? Object.keys(row.response) : null, candKeys: row.response?.candidates?.[0] ? Object.keys(row.response.candidates[0]) : null, partKeys: parts?.[0] ? Object.keys(parts[0]) : null };
+        console.warn(`[checkBatch] ${row.key} no inline image data; row shape=${JSON.stringify(slim)}`);
         failed++;
         continue;
       }
-      const imgBuf = Buffer.from(inlinePart.inline_data.data, 'base64');
-      const mime = inlinePart.inline_data.mime_type || 'image/png';
+      const imgBuf = Buffer.from(inline.data, 'base64');
+      const mime = inline.mimeType || inline.mime_type || 'image/png';
       // Recover (shoeId, modelId) from the existing cell doc.
       const cellSnap = await qaShoeMatrixCol.doc(cellId).get();
       if (!cellSnap.exists) {
