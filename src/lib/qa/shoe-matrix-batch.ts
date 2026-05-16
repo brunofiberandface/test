@@ -450,15 +450,39 @@ export async function checkBatch(apiKey: string): Promise<{ state: BatchState; p
   const resultLines = resultText.split('\n').filter(l => l.trim().length > 0);
   console.log(`[checkBatch] got ${resultLines.length} result lines`);
 
-  // Process each line. Key format: `${cellId}::${view}` — split to find the cell.
+  // Process lines incrementally. Each line is independent; we maintain a
+  // `processedKeys` set in the batch tracking doc and skip keys we've
+  // already handled. Stops at a time budget (~13 min) so Cloud Run's
+  // 15-min request timeout doesn't kill us mid-write. Caller polls again
+  // to drain remaining entries.
+  const POLL_BUDGET_MS = 13 * 60 * 1000;
+  const startTime = Date.now();
+  const processedKeys = new Set<string>((job.processedKeys as string[]) || []);
   const sharp = (await import('sharp')).default;
-  let done = 0;
-  let failed = 0;
+  let done = (job.completedRequests as number) || 0;
+  let failed = (job.failedRequests as number) || 0;
+  let skippedOverBudget = 0;
   for (const line of resultLines) {
+    if (Date.now() - startTime > POLL_BUDGET_MS) {
+      skippedOverBudget++;
+      continue;
+    }
+    // Parse the JSONL row first so `row.key` is in scope for both the
+    // success and failure paths (we mark the key as processed in both
+    // cases so we don't retry forever).
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let row: any;
     try {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const row = JSON.parse(line) as any;
-      const [cellId, view] = row.key?.split('::') as [string, ViewKey];
+      row = JSON.parse(line);
+    } catch {
+      console.warn(`[checkBatch] bad JSON line, skipping`);
+      failed++;
+      continue;
+    }
+    if (!row.key) { failed++; continue; }
+    if (processedKeys.has(row.key)) continue;  // already done in a prior poll
+    try {
+      const [cellId, view] = row.key.split('::') as [string, ViewKey];
       if (!cellId || !view) {
         console.warn(`[checkBatch] bad key ${row.key}, skipping`);
         failed++;
@@ -524,18 +548,22 @@ export async function checkBatch(apiKey: string): Promise<{ state: BatchState; p
         viewsCompleted: FieldValue.arrayUnion(view),
         updatedAt: FieldValue.serverTimestamp(),
       });
+      processedKeys.add(row.key);
       done++;
     } catch (err) {
       console.error(`[checkBatch] line process failed:`, err);
+      processedKeys.add(row.key); // mark failed too so we don't retry forever
       failed++;
     }
   }
 
   // Mark cells whose 4 views are all in: check viewsCompleted length per cell.
+  // Only touch cells whose keys we processed THIS poll.
   const touchedCellIds = new Set<string>();
   for (const line of resultLines) {
     try {
       const row = JSON.parse(line) as { key: string };
+      if (!processedKeys.has(row.key)) continue;
       const [cellId] = row.key.split('::');
       touchedCellIds.add(cellId);
     } catch { /* ignore */ }
@@ -546,22 +574,35 @@ export async function checkBatch(apiKey: string): Promise<{ state: BatchState; p
     const data = cellSnap.data() as { viewsCompleted?: ViewKey[] };
     const completedSet = new Set(data.viewsCompleted || []);
     const status: 'done' | 'partial' = completedSet.size === VIEWS.length ? 'done' : 'partial';
-    await qaShoeMatrixCol.doc(cellId).set({ status }, { merge: true });
+    await qaShoeMatrixCol.doc(cellId).update({ status });
   }
 
-  await db.collection('system').doc(BATCH_JOB_DOC_ID).set(
-    {
-      state: 'SUCCEEDED' as BatchState,
-      completedAt: FieldValue.serverTimestamp(),
-      completedRequests: done,
-      failedRequests: failed,
-      outputUri: outputFileName,
-    },
-    { merge: true },
-  );
+  // Persist processed-keys progress so the next poll picks up where we
+  // stopped. Only flip batch state to SUCCEEDED once every result line
+  // has been drained.
+  const allDrained = processedKeys.size >= resultLines.length;
+  const updatePayload: Record<string, unknown> = {
+    completedRequests: done,
+    failedRequests: failed,
+    outputUri: outputFileName,
+    processedKeys: Array.from(processedKeys),
+    lastCheckedAt: FieldValue.serverTimestamp(),
+  };
+  if (allDrained) {
+    updatePayload.state = 'SUCCEEDED';
+    updatePayload.completedAt = FieldValue.serverTimestamp();
+  } else {
+    // Keep state as RUNNING (or whatever Google reports) so the UI shows
+    // "in progress" — caller needs to re-poll to drain remaining entries.
+    updatePayload.state = 'RUNNING';
+  }
+  await db.collection('system').doc(BATCH_JOB_DOC_ID).set(updatePayload, { merge: true });
 
-  console.log(`[checkBatch] processed ${done} ok, ${failed} failed`);
-  return { state: 'SUCCEEDED', progress: { done, total: (job.totalRequests as number) || resultLines.length } };
+  console.log(`[checkBatch] processed ${processedKeys.size}/${resultLines.length} (this poll: +${done - ((job.completedRequests as number) || 0)} done, +${failed - ((job.failedRequests as number) || 0)} failed, ${skippedOverBudget} over budget)`);
+  return {
+    state: allDrained ? 'SUCCEEDED' : 'RUNNING',
+    progress: { done, total: (job.totalRequests as number) || resultLines.length },
+  };
 }
 
 /** Return the current batch job doc (or null if none). UI uses this for the
