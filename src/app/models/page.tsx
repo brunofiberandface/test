@@ -400,9 +400,9 @@ export default function ModelsPage() {
                       key={mid}
                       className="group border border-neutral-200 bg-white hover:border-neutral-400 transition-colors"
                     >
-                      <div
-                        className="aspect-[3/4] bg-neutral-100 relative overflow-hidden cursor-pointer"
-                        onClick={() => openModal(model)}
+                      <Link
+                        href={`/models/${mid}`}
+                        className="aspect-[3/4] bg-neutral-100 relative overflow-hidden cursor-pointer block"
                       >
                         {(model.referenceImageUrl || model.cardImageUrl) ? (
                           <img
@@ -420,7 +420,7 @@ export default function ModelsPage() {
                             <span className="text-xs text-neutral-500 uppercase">Inactive</span>
                           </div>
                         )}
-                      </div>
+                      </Link>
 
                       <div className="p-3">
                         <div className="flex items-center justify-between gap-1">
@@ -464,12 +464,12 @@ export default function ModelsPage() {
                             </span>
                           )}
                         </div>
-                        <p
-                          className="text-xs text-neutral-500 mt-1 line-clamp-2 cursor-pointer"
-                          onClick={() => openModal(model)}
+                        <Link
+                          href={`/models/${mid}`}
+                          className="text-xs text-neutral-500 mt-1 line-clamp-2 cursor-pointer block"
                         >
                           {model.description}
-                        </p>
+                        </Link>
                       </div>
                     </div>
                   );
