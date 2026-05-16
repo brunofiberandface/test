@@ -411,16 +411,17 @@ export async function checkBatch(apiKey: string): Promise<{ state: BatchState; p
     };
   }
 
-  // Done — download the result JSONL. Field path varies in Google's docs;
-  // accept all observed aliases. Newest docs use `dest.fileName` on the
-  // batch object.
+  // Done — download the result JSONL. Verified in production (rev 00569-pzc):
+  // the field is `response.responsesFile`, also mirrored at
+  // `metadata.output.responsesFile`. Docs claimed `dest.fileName` but the
+  // actual API returns this shape. Keep aliases for resilience.
   const outputFileName: string | undefined =
+    status.response?.responsesFile ||
+    status.metadata?.output?.responsesFile ||
     status.dest?.fileName ||
     status.dest?.file_name ||
     status.response?.dest?.fileName ||
-    status.response?.dest?.file_name ||
-    status.response?.output_file?.file_name ||
-    status.response?.outputFile?.fileName;
+    status.response?.output_file?.file_name;
   if (!outputFileName) {
     throw new Error(`Batch SUCCEEDED but no output file path found. Raw status: ${JSON.stringify(status).slice(0, 1500)}`);
   }
