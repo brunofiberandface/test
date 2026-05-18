@@ -65,9 +65,25 @@ function formatDate(isoString: string | undefined): string {
   try {
     const d = new Date(isoString);
     if (isNaN(d.getTime())) return '—';
-    // Shortened format: "12 May 14:30" → "12 May" (drop time — date column is for quick scan,
-    // not precise timestamp).
     return d.toLocaleString('en-GB', { day: 'numeric', month: 'short' });
+  } catch {
+    return '—';
+  }
+}
+
+function formatDateTime(isoString: string | undefined): string {
+  if (!isoString) return '—';
+  try {
+    const d = new Date(isoString);
+    if (isNaN(d.getTime())) return '—';
+    // Format: "17 May 00:00"
+    return d.toLocaleString('en-GB', {
+      day: 'numeric',
+      month: 'short',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    });
   } catch {
     return '—';
   }
@@ -798,7 +814,8 @@ export default function DashboardPage() {
                 <th className="text-left px-5 py-2.5 text-xs font-medium text-neutral-500 uppercase tracking-wider">Category</th>
                 <th className="text-left px-5 py-2.5 text-xs font-medium text-neutral-500 uppercase tracking-wider">Model</th>
                 <th className="text-left px-5 py-2.5 text-xs font-medium text-neutral-500 uppercase tracking-wider">Created by</th>
-                <th className="text-left px-5 py-2.5 text-xs font-medium text-neutral-500 uppercase tracking-wider">Date</th>
+                <th className="text-left px-5 py-2.5 text-xs font-medium text-neutral-500 uppercase tracking-wider">Created</th>
+                <th className="text-left px-5 py-2.5 text-xs font-medium text-neutral-500 uppercase tracking-wider">Last rerun</th>
                 <th className="text-left px-5 py-2.5 text-xs font-medium text-neutral-500 uppercase tracking-wider">Status</th>
                 <th className="text-left px-5 py-2.5 text-xs font-medium text-neutral-500 uppercase tracking-wider">Actions</th>
               </tr>
@@ -918,10 +935,13 @@ export default function DashboardPage() {
                     </td>
                     <td className="px-5 py-3 text-sm text-neutral-600 truncate max-w-[180px]" title={job.creatorEmail || ''}>{job.creatorEmail || '—'}</td>
                     <td className="px-5 py-3 text-sm whitespace-nowrap">
-                      <div className="text-neutral-400 whitespace-nowrap">{formatDate(job.createdAt)}</div>
+                      <div className="text-neutral-400 whitespace-nowrap">{formatDateTime(job.createdAt)}</div>
                       {job.jobNumber != null && (
                         <div className="text-neutral-700 font-medium whitespace-nowrap">#{job.jobNumber}</div>
                       )}
+                    </td>
+                    <td className="px-5 py-3 text-sm whitespace-nowrap">
+                      <div className="text-neutral-400 whitespace-nowrap">{formatDateTime(job.updatedAt)}</div>
                     </td>
                     <td className="px-5 py-3">
                       <span className={`inline-flex text-xs px-2 py-0.5 font-medium ${STATUS_STYLES[statusKey] || STATUS_STYLES.generating}`}>
