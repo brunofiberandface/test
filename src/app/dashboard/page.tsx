@@ -71,6 +71,23 @@ function formatDate(isoString: string | undefined): string {
   }
 }
 
+/**
+ * Pull the first name out of an email address — used in the "Created by"
+ * column so the dashboard reads as people, not addresses.
+ *   "gwenda@g-star.com"        → "Gwenda"
+ *   "bruno.dheedene@..."       → "Bruno"
+ *   "BRUNO_D@..."              → "Bruno_D" (split-on-dot only; underscore left alone)
+ *   ""                         → "—"
+ */
+function firstNameFromEmail(email: string | undefined): string {
+  if (!email) return '—';
+  const local = email.split('@')[0];
+  if (!local) return '—';
+  const first = local.split(/[.\-+]/)[0] || local;
+  if (!first) return '—';
+  return first.charAt(0).toUpperCase() + first.slice(1).toLowerCase();
+}
+
 function formatDateTime(isoString: string | undefined): string {
   if (!isoString) return '—';
   try {
@@ -933,7 +950,7 @@ export default function DashboardPage() {
                         );
                       })()}
                     </td>
-                    <td className="px-5 py-3 text-sm text-neutral-600 truncate max-w-[180px]" title={job.creatorEmail || ''}>{job.creatorEmail || '—'}</td>
+                    <td className="px-5 py-3 text-sm text-neutral-600 whitespace-nowrap" title={job.creatorEmail || ''}>{firstNameFromEmail(job.creatorEmail)}</td>
                     <td className="px-5 py-3 text-sm whitespace-nowrap">
                       <div className="text-neutral-400 whitespace-nowrap">{formatDateTime(job.createdAt)}</div>
                       {job.jobNumber != null && (
