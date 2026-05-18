@@ -25,9 +25,10 @@ interface Job {
   archived?: boolean;
   queuePosition?: number;
   approvedCount?: number;
+  preApprovedCount?: number;
   doneCount?: number;
   totalShots?: number;
-  approvedShots?: Array<{ shotId: string; shotType: string; imageUrl?: string }>;
+  approvedShots?: Array<{ shotId: string; shotType: string; imageUrl?: string; wasApproved?: boolean }>;
 }
 
 interface QueueState {
@@ -220,6 +221,18 @@ export default function DashboardPage() {
   const [queueState, setQueueState] = useState<QueueState | null>(null);
   const [filter, setFilter] = useState<string>('all');
   const [archivedCount, setArchivedCount] = useState<number>(0);
+  // Pagination state — first page loads 50 newest; "Load more" appends the
+  // next 50 using cursor-based pagination (Firestore startAfter on createdAt).
+  const [nextCursor, setNextCursor] = useState<number | null>(null);
+  const [hasMore, setHasMore] = useState<boolean>(false);
+  const [loadingMore, setLoadingMore] = useState<boolean>(false);
+  // True once we've fetched the whole collection (triggered when a search
+  // filter goes active). Prevents redundant full-loads on subsequent filter
+  // changes within the same dashboard session.
+  const [allJobsLoaded, setAllJobsLoaded] = useState<boolean>(false);
+  // DB-wide stats — fetched from /api/jobs/counts so the header + chip
+  // numbers reflect the entire collection, not just the loaded page.
+  const [dbCounts, setDbCounts] = useState<{ total: number; generating: number; review: number; completed: number; archived: number } | null>(null);
 
   // Inline edit state
   const [editingJobId, setEditingJobId] = useState<string | null>(null);
@@ -264,6 +277,7 @@ export default function DashboardPage() {
     if (authStatus === 'authenticated') {
       fetchJobs(filter === 'archived');
       fetchQueue();
+      fetchCounts();
       // Fire-and-forget — empty map is safe (cells just render as text).
       fetch('/api/models')
         .then(res => res.ok ? res.json() : null)
@@ -315,11 +329,62 @@ export default function DashboardPage() {
   // Clear selection on filter change
   useEffect(() => { setSelected(new Set()); setBatchDeleteConfirm(false); }, [filter]);
 
+  // Auto-load the entire jobs collection when ANY search filter goes
+  // active. Search should match against the full DB, not the currently-
+  // paginated slice. Idempotent — allJobsLoaded guards against re-fetch
+  // on subsequent keystrokes within the same session.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    const searchActive = !!(nameFilter.trim() || designFilter.trim() || creatorFilter !== 'all');
+    if (searchActive && !allJobsLoaded && authStatus === 'authenticated') {
+      fetchAllJobs(filter === 'archived');
+    }
+  }, [nameFilter, designFilter, creatorFilter, authStatus]);
+
   async function fetchQueue() {
     try {
       const res = await fetch('/api/queue');
       if (res.ok) setQueueState(await res.json());
     } catch { /* non-blocking */ }
+  }
+
+  /** Pull DB-wide counts (total + per-status + archived). Refreshed on
+   *  initial load + after batch mutations (delete/archive). Survives
+   *  pagination since the numbers come from Firestore aggregate count(),
+   *  not the loaded jobs slice. */
+  async function fetchCounts() {
+    try {
+      const res = await fetch('/api/jobs/counts');
+      if (res.ok) setDbCounts(await res.json());
+    } catch { /* non-blocking */ }
+  }
+
+  /** Fetch the entire jobs collection (capped at 5000 server-side) in one
+   *  call. Triggered when the user activates a search filter — search must
+   *  match against the full DB, not the currently-paginated slice. Idempotent
+   *  via the allJobsLoaded flag; subsequent search edits in the same session
+   *  filter client-side over the already-loaded full set. */
+  async function fetchAllJobs(inclArchived = false) {
+    if (allJobsLoaded) return;
+    setLoadingMore(true);  // shares the same spinner as "Load more"
+    try {
+      const params = new URLSearchParams();
+      if (inclArchived) params.set('includeArchived', 'true');
+      params.set('fetchAll', 'true');
+      const res = await fetch(`/api/jobs?${params.toString()}`, {
+        headers: { 'x-user-email': session?.user?.email || '' },
+      });
+      if (!res.ok) throw new Error('Failed to fetch all jobs');
+      const data = await res.json();
+      setJobs(data.jobs || []);
+      setHasMore(false);   // we have everything
+      setNextCursor(null);
+      setAllJobsLoaded(true);
+    } catch (err: any) {
+      setError(err.message);
+    } finally {
+      setLoadingMore(false);
+    }
   }
 
   async function fetchJobs(inclArchived = false, isBackground = false) {
@@ -335,6 +400,10 @@ export default function DashboardPage() {
       if (!res.ok) throw new Error('Failed to load jobs');
       const data = await res.json();
       setJobs(data.jobs || []);
+      // Capture pagination state from the API. The first-page response now
+      // carries hasMore + nextCursor; "Load more" button uses these.
+      setHasMore(Boolean(data.hasMore));
+      setNextCursor(data.nextCursor ?? null);
       if (inclArchived) setArchivedCount((data.jobs || []).filter((j: Job) => j.archived === true).length);
       if (!inclArchived) {
         const arRes = await fetch('/api/jobs?includeArchived=true');
@@ -347,6 +416,37 @@ export default function DashboardPage() {
       setError(err.message);
     } finally {
       setLoading(false);
+    }
+  }
+
+  /** Append the next 50 older jobs using cursor pagination. The cursor is
+   *  the createdAt-ms of the last job currently in the list; the API uses
+   *  Firestore startAfter() to fetch the page that follows it. Maintains
+   *  archived-filter parity with fetchJobs. */
+  async function loadMoreJobs(inclArchived = false) {
+    if (!hasMore || loadingMore || nextCursor == null) return;
+    setLoadingMore(true);
+    try {
+      const params = new URLSearchParams();
+      if (inclArchived) params.set('includeArchived', 'true');
+      params.set('cursor', String(nextCursor));
+      const res = await fetch(`/api/jobs?${params.toString()}`, {
+        headers: { 'x-user-email': session?.user?.email || '' },
+      });
+      if (!res.ok) throw new Error('Failed to load more jobs');
+      const data = await res.json();
+      const newJobs: Job[] = data.jobs || [];
+      // Append, dedupe by id in case of concurrent writes / overlap.
+      setJobs(prev => {
+        const seen = new Set(prev.map(j => j.jobId || j.id));
+        return [...prev, ...newJobs.filter(j => !seen.has(j.jobId || j.id))];
+      });
+      setHasMore(Boolean(data.hasMore));
+      setNextCursor(data.nextCursor ?? null);
+    } catch (err: any) {
+      setError(err.message);
+    } finally {
+      setLoadingMore(false);
     }
   }
 
@@ -491,7 +591,10 @@ export default function DashboardPage() {
   };
 
   const activeJobs = jobs.filter(j => !j.archived);
-  const stats = {
+  // Stats prefer DB-wide counts (from /api/jobs/counts) when available so
+  // the numbers reflect the full database, not the currently-paginated slice.
+  // Falls back to local counts during initial load (counts request in flight).
+  const stats = dbCounts ?? {
     total: activeJobs.length,
     generating: activeJobs.filter(j => j.status === 'generating' || j.status === 'uploading' || j.status === 'queued').length,
     review: activeJobs.filter(j => j.status === 'review').length,
@@ -755,9 +858,12 @@ export default function DashboardPage() {
                               </svg>
                             </button>
                           </div>
-                          {/* Approved deliverable thumbnails — listed under the
-                              job name so the reviewer can see the approved set
-                              grow as they work through the job. */}
+                          {/* Approved + pre-approved deliverable thumbnails —
+                              listed under the job name so the reviewer can see
+                              the approved set grow as they work through the
+                              job. Pre-approved (was approved before a rerun,
+                              not yet re-approved) gets an amber border to flag
+                              "needs re-confirmation". */}
                           {job.approvedShots && job.approvedShots.length > 0 && (
                             <div className="flex items-center gap-1 mt-1.5 flex-wrap">
                               {job.approvedShots.map(s => (
@@ -766,8 +872,8 @@ export default function DashboardPage() {
                                     key={s.shotId}
                                     type="button"
                                     onClick={e => { e.preventDefault(); e.stopPropagation(); setEnlargedThumbUrl(s.imageUrl!); }}
-                                    className="w-8 h-10 bg-neutral-100 border border-neutral-200 overflow-hidden hover:border-neutral-400 transition-colors block"
-                                    title={`${s.shotType} — click to enlarge`}
+                                    className={`w-8 h-10 bg-neutral-100 overflow-hidden transition-colors block border-2 ${s.wasApproved ? 'border-amber-500 hover:border-amber-600' : 'border-neutral-200 hover:border-neutral-400'}`}
+                                    title={s.wasApproved ? `${s.shotType} — PRE-APPROVED (re-approve in the job results)` : `${s.shotType} — approved · click to enlarge`}
                                   >
                                     <img src={s.imageUrl} alt={s.shotType} className="w-full h-full object-cover" loading="lazy" decoding="async" />
                                   </button>
@@ -811,18 +917,18 @@ export default function DashboardPage() {
                       })()}
                     </td>
                     <td className="px-5 py-3 text-sm text-neutral-600 truncate max-w-[180px]" title={job.creatorEmail || ''}>{job.creatorEmail || '—'}</td>
-                    <td className="px-5 py-3 text-sm text-neutral-400">
+                    <td className="px-5 py-3 text-sm">
+                      <div className="text-neutral-400">{formatDate(job.createdAt)}</div>
                       {job.jobNumber != null && (
-                        <span className="text-neutral-700 font-medium mr-2">#{job.jobNumber}</span>
+                        <div className="text-neutral-700 font-medium">#{job.jobNumber}</div>
                       )}
-                      <span className="text-neutral-400">{formatDate(job.updatedAt || job.createdAt)}</span>
                     </td>
                     <td className="px-5 py-3">
                       <span className={`inline-flex text-xs px-2 py-0.5 font-medium ${STATUS_STYLES[statusKey] || STATUS_STYLES.generating}`}>
                         {statusKey === 'queued' && job.queuePosition
                           ? `Queued #${job.queuePosition}`
                           : statusKey === 'review' && job.totalShots
-                            ? `In Review ${job.approvedCount ?? 0}/${job.totalShots}`
+                            ? `In Review ${job.approvedCount ?? 0}/${job.totalShots}${job.preApprovedCount ? ` · ${job.preApprovedCount} pre-approved` : ''}`
                             : statusKey === 'generating' && job.totalShots
                               ? `Generating ${job.doneCount ?? 0}/${job.totalShots}`
                               : STATUS_LABEL[statusKey] || job.status}
@@ -909,6 +1015,23 @@ export default function DashboardPage() {
               })}
             </tbody>
           </table>
+          {/* Pagination — "Load more" appends the next 50 older jobs via
+              cursor-based pagination. Hidden when no more rows or while
+              the initial load is in flight. Matches the archived-filter
+              state so loadMore keeps the same scope as the current view. */}
+          {hasMore && !loading && (
+            <div className="flex justify-center py-6 border-t border-neutral-200">
+              <button
+                onClick={() => loadMoreJobs(filter === 'archived')}
+                disabled={loadingMore}
+                className="text-xs font-medium uppercase tracking-wider px-4 py-2 border border-neutral-300 hover:bg-neutral-50 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {loadingMore
+                  ? 'Loading…'
+                  : `Load more (showing ${jobs.length})`}
+              </button>
+            </div>
+          )}
         </div>
       )}
 
