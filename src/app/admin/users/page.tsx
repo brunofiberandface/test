@@ -88,6 +88,29 @@ export default function UsersPage() {
     fetchUsers();
   }
 
+  /**
+   * Admin escape hatch for users who can't receive their 6-digit OTP
+   * (email blocked by firewall / spam). Sets a password directly; user
+   * then logs in via the email + password flow (mode='password'). Admin
+   * shares the password via another channel (Slack/WhatsApp/etc).
+   */
+  async function setPassword(email: string) {
+    const pw = prompt(`Set a new password for ${email}.\nThe user can then log in with email + password (no OTP needed).\nMin 6 characters.`);
+    if (!pw) return;
+    if (pw.length < 6) { alert('Password must be at least 6 characters.'); return; }
+    const res = await fetch(`/api/users/${encodeURIComponent(email)}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: pw }),
+    });
+    if (res.ok) {
+      alert(`Password set for ${email}.\nShare via Slack / WhatsApp — DO NOT email (the email isn't reaching them, that's why we're doing this).`);
+    } else {
+      const data = await res.json().catch(() => ({}));
+      alert(`Failed to set password: ${data.error || res.statusText}`);
+    }
+  }
+
   return (
     <Shell user={user ? { email: user.email, name: user.name || '', role: user.role || 'creator' } : undefined}>
       <div className="flex items-center justify-between mb-6">
@@ -172,6 +195,11 @@ export default function UsersPage() {
                     <button onClick={() => toggleRole(u.email, u.role)}
                       className="text-xs text-neutral-500 hover:text-neutral-900 mr-3">
                       {u.role === 'admin' ? 'Make creator' : 'Make admin'}
+                    </button>
+                    <button onClick={() => setPassword(u.email)}
+                      className="text-xs text-neutral-500 hover:text-neutral-900 mr-3"
+                      title="Set a password directly — for users who can't receive the OTP email">
+                      Set password
                     </button>
                     <button onClick={() => toggleActive(u.email, u.active !== false)}
                       className={`text-xs ${u.active !== false ? 'text-red-500 hover:text-red-700' : 'text-emerald-600 hover:text-emerald-800'}`}>
