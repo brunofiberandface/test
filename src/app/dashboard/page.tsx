@@ -917,10 +917,10 @@ export default function DashboardPage() {
                       })()}
                     </td>
                     <td className="px-5 py-3 text-sm text-neutral-600 truncate max-w-[180px]" title={job.creatorEmail || ''}>{job.creatorEmail || '—'}</td>
-                    <td className="px-5 py-3 text-sm">
-                      <div className="text-neutral-400">{formatDate(job.createdAt)}</div>
+                    <td className="px-5 py-3 text-sm whitespace-nowrap">
+                      <div className="text-neutral-400 whitespace-nowrap">{formatDate(job.createdAt)}</div>
                       {job.jobNumber != null && (
-                        <div className="text-neutral-700 font-medium">#{job.jobNumber}</div>
+                        <div className="text-neutral-700 font-medium whitespace-nowrap">#{job.jobNumber}</div>
                       )}
                     </td>
                     <td className="px-5 py-3">
