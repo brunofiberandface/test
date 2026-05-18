@@ -35,24 +35,33 @@ interface ShotData {
   provider?: 'gemini' | 'seedream';
   teeEditApplied?: boolean;
   teeEditError?: string;
+  /** True iff this shot was approved before being reset for a rerun. UI
+   *  shows a "Pre-approved" badge + the Approve button becomes "Re-approve"
+   *  so the reviewer knows the prior version was OK and can quickly re-bless. */
+  wasApproved?: boolean;
   /** Pipeline-stage debug URLs (M03/M04 mostly). Used by the "Stages" viewer. */
   pipelineStages?: Partial<Record<
-    'pass1' | 'seedream' | 'teeedit' | 'shoeedit' | 'label' | 'upscaled' | 'matte-grey' | 'matte-white' | 'final',
+    | 'pass1' | 'seedream' | 'teeedit' | 'shoeedit' | 'label' | 'upscaled'
+    | 'matte-raw-grey' | 'matte-raw-white' | 'matte-grey' | 'matte-white' | 'final',
     string
   >>;
 }
 
+type StageKey = 'pass1' | 'seedream' | 'teeedit' | 'shoeedit' | 'label' | 'upscaled' | 'matte-raw-grey' | 'matte-raw-white' | 'matte-grey' | 'matte-white' | 'final';
+
 // Display order + human labels for the pipeline-stage viewer.
-const STAGE_ORDER: Array<{ key: 'pass1' | 'seedream' | 'teeedit' | 'shoeedit' | 'label' | 'upscaled' | 'matte-grey' | 'matte-white' | 'final'; label: string; desc: string }> = [
-  { key: 'pass1',       label: '1. Pass 1',        desc: 'M04 only — model + sports bra + briefs + shoes, no jeans yet (Seedream)' },
-  { key: 'seedream',    label: '2. Seedream',      desc: 'Raw Seedream final-pass output, before any Gemini editing' },
-  { key: 'teeedit',     label: '3. Tee-edit',      desc: 'Real top painted over the sports-bra placeholder (Gemini)' },
-  { key: 'shoeedit',    label: '4. Shoe-edit',     desc: 'Shoes repositioned under the hem, M04 only (Gemini)' },
-  { key: 'label',       label: '5. Label',         desc: 'Leather brand patch composited, M02/M04 only' },
-  { key: 'upscaled',    label: '6. 4K upscale',    desc: '4000×4000 square via sharp lanczos3' },
-  { key: 'matte-grey',  label: '7. Matte (grey)',  desc: 'rembg subject matte + grounding shadow on grey backdrop' },
-  { key: 'matte-white', label: '7b. Matte (white)', desc: 'Same matte, composited onto pure-white backdrop' },
-  { key: 'final',       label: '8. Final',         desc: 'Saved master (same content as imageUrl)' },
+const STAGE_ORDER: Array<{ key: StageKey; label: string; desc: string }> = [
+  { key: 'pass1',           label: '1. Pass 1',            desc: 'M04 only — model + sports bra + briefs + shoes, no jeans yet (Seedream)' },
+  { key: 'seedream',        label: '2. Seedream',          desc: 'Raw Seedream final-pass output, before any Gemini editing. ~2K native.' },
+  { key: 'teeedit',         label: '3. Tee-edit',          desc: 'Real top painted over the sports-bra placeholder (Gemini)' },
+  { key: 'shoeedit',        label: '4. Shoe-edit',         desc: 'Shoes repositioned under the hem, M04 only (Gemini)' },
+  { key: 'label',           label: '5. Label',             desc: 'Leather brand patch composited, M02/M04 only' },
+  { key: 'upscaled',        label: '6. 4K upscale',        desc: '4000×4000 via sharp lanczos3 (interpolation only — adds no detail)' },
+  { key: 'matte-raw-grey',  label: '7a. Matte raw (grey)', desc: 'rembg + procedural shadow on grey, BEFORE Gemini regen' },
+  { key: 'matte-raw-white', label: '7a. Matte raw (white)', desc: 'rembg + composite to white, BEFORE Gemini regen' },
+  { key: 'matte-grey',      label: '7b. Matte (grey)',     desc: 'After Gemini grounding-shadow regen on grey backdrop' },
+  { key: 'matte-white',     label: '7b. Matte (white)',    desc: 'After Gemini grounding-shadow regen on white backdrop' },
+  { key: 'final',           label: '8. Final',             desc: 'Saved master (same content as imageUrl)' },
 ];
 
 interface JobData {
@@ -496,6 +505,7 @@ export default function ResultsPage() {
           provider: s.provider as 'gemini' | 'seedream' | undefined,
           teeEditApplied: s.teeEditApplied as boolean | undefined,
           teeEditError: s.teeEditError as string | undefined,
+          wasApproved: s.wasApproved as boolean | undefined,
           pipelineStages: s.pipelineStages as ShotData['pipelineStages'],
         }; });
         setShots(mappedShots);
@@ -630,49 +640,17 @@ export default function ResultsPage() {
     }
   };
 
-  /**
-   * Re-crop M01/M02 from the current parent anchor (m03AnchorUrl / m04AnchorUrl)
-   * without rerunning the parent. Cheap (~2s) — no Seedream / Gemini calls.
-   * Use when the parent shot is good but the crop is stale.
-   */
-  const recropShot = async (shot: ShotData) => {
-    if (shot.type !== 'M01' && shot.type !== 'M02') return;
-    setRerunningShotId(shot.shotId);
-    try {
-      const res = await fetch(`/api/shots/${shot.shotId}/recrop`, { method: 'POST' });
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        alert(`Re-crop failed: ${data.error || res.statusText}`);
-        return;
-      }
-      fetchData();
-    } catch (e) {
-      console.error('Re-crop failed:', e);
-      alert(`Re-crop failed: ${String(e)}`);
-    } finally {
-      setRerunningShotId(null);
-    }
-  };
-
   const rerunShot = async (shot: ShotData) => {
-    // M01/M02 (cropped shots): rerun full chain M03→M04→M01→M02 with dressed base
-    // so foot proportions are corrected in the full-body anchors first
-    if (shot.type === 'M01' || shot.type === 'M02') {
-      return rerunChain();
-    }
     // Queue-path rerun: reset shot to 'queued' and kick the worker. This lets the
     // worker pick it up even if another shot is mid-generation — no races with
     // direct /api/generate calls, and the UI doesn't need a global lock.
+    // M01/M02 reruns hit the matrix-paint pipeline (single shot, no parent chain).
     setRerunningShotId(shot.shotId);
     try {
-      const isFullBody = shot.type === 'M03' || shot.type === 'M04';
       await fetch(`/api/shots/${shot.shotId}/reset`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          incrementVersion: true,
-          ...(isFullBody ? { useDressedBase: true } : {}),
-        }),
+        body: JSON.stringify({ incrementVersion: true }),
       });
       await kickWorker();
       setModificationText('');
@@ -832,34 +810,6 @@ export default function ResultsPage() {
       fetchData();
     } catch (e) {
       console.error('Generate remaining failed:', e);
-    } finally {
-      setRerunning(false);
-    }
-  };
-
-  // Rerun the full dependency chain M03→M04→M01→M02 with dressed base, skip M05.
-  // Used when re-running M01/M02 — feet proportions need the full pipeline.
-  const rerunChain = async () => {
-    const chainTypes = ['M03', 'M04', 'M01', 'M02'];
-    const chainShots = shots.filter(s => chainTypes.includes(s.type));
-    if (chainShots.length === 0) return;
-    setRerunning(true);
-    try {
-      for (const shot of chainShots) {
-        const isFullBody = shot.type === 'M03' || shot.type === 'M04';
-        await fetch(`/api/shots/${shot.shotId}/reset`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            incrementVersion: true,
-            ...(isFullBody ? { useDressedBase: true } : {}),
-          }),
-        });
-      }
-      await kickWorker();
-      fetchData();
-    } catch (e) {
-      console.error('Rerun chain failed:', e);
     } finally {
       setRerunning(false);
     }
@@ -1216,7 +1166,7 @@ export default function ResultsPage() {
             onDoubleClick={() => {
               const url = pickMaster(shot, bgVariant);
               if (url && (shot.status === 'done' || shot.status === 'approved')) {
-                window.open(bustCache(url, shot.updatedAt), '_blank');
+                setLightboxUrl(bustCache(url, shot.updatedAt));
               }
             }}
           >
@@ -1230,7 +1180,7 @@ export default function ResultsPage() {
                   onDoubleClick={(e) => {
                     e.stopPropagation();
                     const url = pickMaster(shot, bgVariant);
-                    if (url) window.open(bustCache(url, shot.updatedAt), '_blank');
+                    if (url) setLightboxUrl(bustCache(url, shot.updatedAt));
                   }}
                 />
               )}
@@ -1284,10 +1234,15 @@ export default function ResultsPage() {
                 </div>
               )}
               {shot.status === 'approved' && (
-                <div className="absolute top-2 right-2 w-5 h-5 bg-green-600 flex items-center justify-center">
+                <div className="absolute top-2 right-2 w-5 h-5 bg-green-600 flex items-center justify-center" title="Approved">
                   <svg className="w-3 h-3 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
                     <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
                   </svg>
+                </div>
+              )}
+              {shot.wasApproved && shot.status !== 'approved' && (
+                <div className="absolute top-2 right-2 px-1.5 h-5 bg-amber-500 flex items-center justify-center text-[10px] font-bold text-white tracking-wide" title="Was approved before rerun — click Re-approve to confirm">
+                  PRE-APPROVED
                 </div>
               )}
               <div className="absolute bottom-0 inset-x-0 bg-black/60 px-2 py-1 flex justify-between items-center">
@@ -1412,7 +1367,7 @@ export default function ResultsPage() {
                       className="w-full h-auto max-h-[600px] object-contain cursor-zoom-in"
                       onClick={() => {
                         const url = pickMaster(selectedShot, bgVariant);
-                        if (url) window.open(bustCache(url, selectedShot.updatedAt), '_blank');
+                        if (url) setLightboxUrl(bustCache(url, selectedShot.updatedAt));
                       }}
                     />
                     <div className="absolute bottom-2 right-2 bg-black/60 text-white text-[10px] px-2 py-1 opacity-0 group-hover:opacity-100 transition-opacity">
@@ -1526,7 +1481,7 @@ export default function ResultsPage() {
                               src={bustCache(pv.imageUrl, pv.createdAt)}
                               alt={`v${pv.version}`}
                               className="w-16 h-20 object-cover object-top border border-neutral-200 group-hover:border-neutral-400 transition-colors cursor-pointer"
-                              onClick={() => window.open(bustCache(pv.imageUrl, pv.createdAt), '_blank')}
+                              onClick={() => setLightboxUrl(bustCache(pv.imageUrl, pv.createdAt))}
                             />
                             <p className="text-[9px] text-neutral-400 mt-0.5">v{pv.version}</p>
                             <button
@@ -1550,6 +1505,14 @@ export default function ResultsPage() {
                       >
                         Unapprove
                       </button>
+                    ) : selectedShot.wasApproved ? (
+                      <button
+                        onClick={() => approveShot(selectedShot.shotId)}
+                        className="bg-amber-500 text-white px-6 py-2.5 text-sm font-medium hover:bg-amber-600 transition-colors"
+                        title="This shot was approved before the most recent rerun. Click to re-approve the new version."
+                      >
+                        Re-approve (was approved before rerun)
+                      </button>
                     ) : (
                       <button
                         onClick={() => approveShot(selectedShot.shotId)}
@@ -1558,24 +1521,13 @@ export default function ResultsPage() {
                         Approve Shot
                       </button>
                     )}
-                    {/* M01/M02 get a fast "re-crop from current parent anchor" button — no Seedream gen */}
-                    {(selectedShot.type === 'M01' || selectedShot.type === 'M02') && (
-                      <button
-                        onClick={() => recropShot(selectedShot)}
-                        disabled={rerunningShotId === selectedShot.shotId}
-                        className="border border-emerald-500 bg-emerald-50 px-6 py-2.5 text-sm font-medium text-emerald-700 hover:bg-emerald-100 transition-colors disabled:opacity-50"
-                        title={`Re-pulls the current ${selectedShot.type === 'M01' ? 'M03' : 'M04'} anchor and re-crops this shot. ${selectedShot.type === 'M01' ? 'M03' : 'M04'} is NOT rerun. ~2s.`}
-                      >
-                        {rerunningShotId === selectedShot.shotId ? 'Queueing…' : `Re-crop from ${selectedShot.type === 'M01' ? 'M03' : 'M04'}`}
-                      </button>
-                    )}
                     <button
                       onClick={() => rerunShot(selectedShot)}
                       disabled={rerunningShotId === selectedShot.shotId}
                       className="border border-neutral-300 px-6 py-2.5 text-sm font-medium text-neutral-600 hover:bg-neutral-50 transition-colors disabled:opacity-50"
-                      title={(selectedShot.type === 'M01' || selectedShot.type === 'M02') ? 'Re-runs M03 + M04 + M01 + M02 from scratch. Use this only when the parent anchor needs to change.' : 'Re-runs this shot from scratch.'}
+                      title="Re-runs this shot from scratch."
                     >
-                      {rerunningShotId === selectedShot.shotId ? 'Queueing…' : (selectedShot.type === 'M01' || selectedShot.type === 'M02') ? 'Re-run full chain (M03+M04+M01+M02)' : 'Re-run This Shot'}
+                      {rerunningShotId === selectedShot.shotId ? 'Queueing…' : 'Re-run This Shot'}
                     </button>
                     {selectedShot.pipelineStages && Object.keys(selectedShot.pipelineStages).length > 0 && (
                       <button
@@ -1587,14 +1539,6 @@ export default function ResultsPage() {
                       </button>
                     )}
                   </div>
-
-                  {/* Info text for M01/M02 button options */}
-                  {(selectedShot.type === 'M01' || selectedShot.type === 'M02') && (
-                    <p className="text-[10px] text-neutral-400 -mt-2 leading-relaxed">
-                      <span className="text-emerald-700 font-medium">Re-crop</span>: fast (~2s), uses current {selectedShot.type === 'M01' ? 'M03' : 'M04'} anchor. Use when {selectedShot.type === 'M01' ? 'M03' : 'M04'} is good but this crop is stale.<br />
-                      <span className="text-neutral-600 font-medium">Re-run full chain</span>: re-generates M03 + M04 + M01 + M02 from scratch. M05 stays untouched.
-                    </p>
-                  )}
 
                   {/* Alternative prompt rerun buttons */}
                   {alternatives.length > 0 && (
