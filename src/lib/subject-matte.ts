@@ -60,10 +60,21 @@ function getStorage(): Storage {
 export interface BackdropVariantsResult {
   whiteBuffer: Buffer;
   greyBuffer: Buffer;
+  /** Rembg+composite output BEFORE the Gemini grounding-shadow regen pass.
+   *  Surfaced so the pipeline-stages debug viewer can pinpoint whether
+   *  fabric-quality loss in the matte step happens at rembg (Python) or at
+   *  Gemini's regen (Gemini). Absent when disableShadow=true (Gemini skipped). */
+  whiteRawBuffer?: Buffer;
+  greyRawBuffer?: Buffer;
   uploadMs?: number;
   jobMs?: number;
   downloadMs?: number;
   geminiMs?: number;
+  /** Sharp composite step that pastes the rembg RGBA matte on top of the
+   *  Gemini grounding-shadow regen output. Restores crisp denim/skin pixels
+   *  that Gemini's generative regen softens. Absent when the matte download
+   *  failed or Gemini regen failed (in which case the plain regen is shipped). */
+  recompositeMs?: number;
   geminiSkipped?: boolean;  // true when options.disableShadow=true (M05)
 }
 
@@ -334,6 +345,12 @@ export async function produceBackdropVariants(
   const srcKey = `${TEMP_PREFIX}/${tempId}/src.png`;
   const whiteKey = `${TEMP_PREFIX}/${tempId}/white.png`;
   const greyKey = `${TEMP_PREFIX}/${tempId}/grey.png`;
+  // 2026-05-18: matte job also outputs the RGBA subject matte (transparent
+  // background, alpha edges from rembg). We composite this on top of the
+  // Gemini grounding-shadow regen output to keep the crisp subject pixels
+  // while still benefiting from Gemini's better grounding shadow. See
+  // recomposite block below + matte job docstring.
+  const matteKey = `${TEMP_PREFIX}/${tempId}/matte.png`;
 
   try {
     // 1. Upload source to GCS
@@ -367,6 +384,7 @@ export async function produceBackdropVariants(
               { name: 'SRC_GCS_URL',       value: `gs://${BUCKET}/${srcKey}` },
               { name: 'DST_WHITE_GCS_URL', value: `gs://${BUCKET}/${whiteKey}` },
               { name: 'DST_GREY_GCS_URL',  value: `gs://${BUCKET}/${greyKey}` },
+              { name: 'DST_MATTE_GCS_URL', value: `gs://${BUCKET}/${matteKey}` },
               // 2026-05-13: procedural shadow RE-ENABLED as the floor. V4 had
               // disabled it because the Gemini grounding-shadow pass produced
               // higher-quality shadows. But when Gemini 503s (Kate Boyfriend
@@ -416,14 +434,21 @@ export async function produceBackdropVariants(
     const jobMs = Date.now() - jobStart;
     console.log(`[SubjectMatte] job execution complete in ${jobMs}ms`);
 
-    // 4. Download white + grey results from GCS
+    // 4. Download white + grey + matte (RGBA subject) results from GCS.
+    // The matte download is best-effort: if it fails (e.g., old matte-job
+    // revision without DST_MATTE_GCS_URL support), recomposite degrades to
+    // the current behavior (Gemini regen output directly).
     const downloadStart = Date.now();
-    const [whiteBufferRaw, greyBufferRaw] = await Promise.all([
+    const [whiteBufferRaw, greyBufferRaw, matteBufferOpt] = await Promise.all([
       bucket.file(whiteKey).download().then(([b]) => b),
       bucket.file(greyKey).download().then(([b]) => b),
+      bucket.file(matteKey).download().then(([b]) => b).catch((e: unknown) => {
+        console.warn(`[SubjectMatte] matte download failed (recomposite disabled for this shot): ${e instanceof Error ? e.message : e}`);
+        return null;
+      }),
     ]);
     const downloadMs = Date.now() - downloadStart;
-    console.log(`[SubjectMatte] downloaded outputs in ${downloadMs}ms (white=${whiteBufferRaw.length}B grey=${greyBufferRaw.length}B)`);
+    console.log(`[SubjectMatte] downloaded outputs in ${downloadMs}ms (white=${whiteBufferRaw.length}B grey=${greyBufferRaw.length}B matte=${matteBufferOpt ? matteBufferOpt.length + 'B' : 'missing'})`);
 
     // 5. Gemini grounding shadow — parallel pass on each backdrop variant.
     // Skipped for shots without feet visible (M05) — those stay no-shadow.
@@ -432,6 +457,11 @@ export async function produceBackdropVariants(
       return {
         whiteBuffer: whiteBufferRaw,
         greyBuffer: greyBufferRaw,
+        // When Gemini is skipped, whiteBuffer === whiteRawBuffer. Set both
+        // anyway so the debug viewer can render the matte-raw tile without a
+        // special case.
+        whiteRawBuffer: whiteBufferRaw,
+        greyRawBuffer:  greyBufferRaw,
         uploadMs, jobMs, downloadMs,
         geminiSkipped: true,
       };
@@ -445,10 +475,78 @@ export async function produceBackdropVariants(
     const geminiMs = Date.now() - geminiStart;
     console.log(`[SubjectMatte] Gemini grounding done in ${geminiMs}ms (white_ok=${whiteShadowed.ok} grey_ok=${greyShadowed.ok})`);
 
+    // 6. Recomposite the crisp rembg matte on top of the Gemini regen output
+    // (Bruno 2026-05-18). The regen step softens denim texture even though
+    // its prompt says "preserve subject exactly" — Gemini-3-pro is a
+    // generative model, every pixel gets re-rendered. Compositing the rembg
+    // RGBA subject (with original crisp pixels) on top of Gemini's backdrop +
+    // grounding shadow gives us the best of both worlds:
+    //   - Gemini's backdrop + grounding shadow under feet (preserved)
+    //   - rembg's subject pixels = original crisp denim / skin / hair
+    // Falls back to plain regen output if the matte download failed OR if
+    // Gemini regen failed for that variant (so we never ship worse output
+    // than today's pipeline).
+    let whiteFinal = whiteShadowed.buffer;
+    let greyFinal = greyShadowed.buffer;
+    let recompositeMs: number | undefined;
+    if (matteBufferOpt && whiteShadowed.ok && greyShadowed.ok) {
+      const recompStart = Date.now();
+      try {
+        const sharp = (await import('sharp')).default;
+        const matteMeta = await sharp(matteBufferOpt).metadata();
+        const matteW = matteMeta.width ?? 0;
+        const matteH = matteMeta.height ?? 0;
+
+        const compositeOne = async (regen: Buffer): Promise<Buffer> => {
+          const regenMeta = await sharp(regen).metadata();
+          const rw = regenMeta.width ?? 0;
+          const rh = regenMeta.height ?? 0;
+          // Resize matte to regen dimensions if mismatched (rare — Gemini
+          // sometimes returns slightly different sizes than the input).
+          const matteSized = (rw === matteW && rh === matteH)
+            ? matteBufferOpt
+            : await sharp(matteBufferOpt).resize(rw, rh).png().toBuffer();
+          // Two-step composite (Bruno 2026-05-17 — fixes doubled-model ghosting):
+          //   1) `dest-out` knock-out: erases regen pixels where the rembg
+          //      matte has alpha. This removes Gemini's re-rendered subject
+          //      (which often drifts pose vs the rembg subject), leaving
+          //      only Gemini's backdrop + grounding shadow.
+          //   2) `over`: paints the crisp rembg subject back on top.
+          // Without step 1, Gemini's drifted subject peeked through outside
+          // the rembg silhouette, producing the "two models" artifact in
+          // matte-grey / matte-white stages.
+          return sharp(regen)
+            .composite([
+              { input: matteSized, blend: 'dest-out' },
+              { input: matteSized, blend: 'over' },
+            ])
+            .png()
+            .toBuffer();
+        };
+
+        [whiteFinal, greyFinal] = await Promise.all([
+          compositeOne(whiteShadowed.buffer),
+          compositeOne(greyShadowed.buffer),
+        ]);
+        recompositeMs = Date.now() - recompStart;
+        console.log(`[SubjectMatte] recomposite done in ${recompositeMs}ms (white=${whiteFinal.length}B grey=${greyFinal.length}B)`);
+      } catch (e) {
+        console.warn(`[SubjectMatte] recomposite failed (falling back to plain regen): ${e instanceof Error ? e.message : e}`);
+        // Keep whiteFinal / greyFinal pointing at the plain regen buffers.
+      }
+    } else {
+      console.log(`[SubjectMatte] recomposite skipped (matte=${matteBufferOpt ? 'present' : 'missing'} whiteRegen.ok=${whiteShadowed.ok} greyRegen.ok=${greyShadowed.ok})`);
+    }
+
     return {
-      whiteBuffer: whiteShadowed.buffer,
-      greyBuffer:  greyShadowed.buffer,
+      whiteBuffer: whiteFinal,
+      greyBuffer:  greyFinal,
+      // Expose the rembg+procedural-shadow output (pre-Gemini-regen) so the
+      // debug viewer can pinpoint whether fabric loss is from rembg or Gemini.
+      whiteRawBuffer: whiteBufferRaw,
+      greyRawBuffer:  greyBufferRaw,
       uploadMs, jobMs, downloadMs, geminiMs,
+      ...(recompositeMs !== undefined ? { recompositeMs } : {}),
     };
   } catch (err) {
     console.error('[SubjectMatte] produceBackdropVariants failed (non-blocking, keeping raw master):',
@@ -456,7 +554,7 @@ export async function produceBackdropVariants(
     return null;
   } finally {
     // Best-effort cleanup of temp GCS objects (don't block the caller)
-    void cleanupTempFiles([srcKey, whiteKey, greyKey]).catch(() => { /* ignore */ });
+    void cleanupTempFiles([srcKey, whiteKey, greyKey, matteKey]).catch(() => { /* ignore */ });
   }
 }
 
