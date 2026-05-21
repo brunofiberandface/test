@@ -122,7 +122,13 @@ PRESERVE EVERYTHING ELSE EXACTLY:
 
 Only change: add the subtle contact + barely-there leftward lean described above.`;
 
-const GROUNDING_ASPECT = '3:4';
+// Source masters are 1:1 square since the May 1 2026 architecture switch.
+// '3:4' here was stale: Gemini received a 1:1 input + a 3:4 output target,
+// and resolved the mismatch by TILING the subject horizontally to fill the
+// wider aspect — producing the "4 models side-by-side" artifact in the
+// matte-grey/matte-white stages. Matching the source aspect kills that
+// hallucination at the source. Bruno 2026-05-17.
+const GROUNDING_ASPECT = '1:1';
 const GROUNDING_SIZE = '4K';
 
 /** Retry config for transient Gemini errors (503/429). 2026-05-13 fix —
@@ -506,20 +512,8 @@ export async function produceBackdropVariants(
           const matteSized = (rw === matteW && rh === matteH)
             ? matteBufferOpt
             : await sharp(matteBufferOpt).resize(rw, rh).png().toBuffer();
-          // Two-step composite (Bruno 2026-05-17 — fixes doubled-model ghosting):
-          //   1) `dest-out` knock-out: erases regen pixels where the rembg
-          //      matte has alpha. This removes Gemini's re-rendered subject
-          //      (which often drifts pose vs the rembg subject), leaving
-          //      only Gemini's backdrop + grounding shadow.
-          //   2) `over`: paints the crisp rembg subject back on top.
-          // Without step 1, Gemini's drifted subject peeked through outside
-          // the rembg silhouette, producing the "two models" artifact in
-          // matte-grey / matte-white stages.
           return sharp(regen)
-            .composite([
-              { input: matteSized, blend: 'dest-out' },
-              { input: matteSized, blend: 'over' },
-            ])
+            .composite([{ input: matteSized, blend: 'over' }])
             .png()
             .toBuffer();
         };
