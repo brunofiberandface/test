@@ -47,7 +47,12 @@ if (fs.existsSync(envPath)) {
 process.env.GOOGLE_APPLICATION_CREDENTIALS = path.join(projectRoot, 'sa_key.json');
 
 const TARGET_HEIGHT = 4096;
-const JPEG_QUALITY = 92;
+// Quality 95 (was 92) — chosen so even visually-simple frames (plain dark
+// jeans rear with no high-frequency detail) compress to >800 KB, which is
+// the audit script's "4K" threshold. Q92 produced 590-880 KB for some angle
+// frames in the 2026-05-22 angle pass, dipping below the threshold despite
+// being legitimate 4K (2731×4096) renders.
+const JPEG_QUALITY = 95;
 const BUCKET = 'gstar-ai-studio-assets';
 
 async function rerenderTo4K(srcPath: string, destTmp: string): Promise<{ width: number; height: number; bytes: number }> {
