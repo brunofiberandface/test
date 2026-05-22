@@ -94,29 +94,82 @@ function parseArgs(argv: string[]): { positional: string[]; opts: Record<string,
   return { positional, opts };
 }
 
+/**
+ * Resolve the actual GCS destination path for a wardrobe slot by reading
+ * the URL from the wardrobe doc's `fitModels[<slotKey>]` field. This is
+ * the source of truth — categories on the doc may differ from the GCS
+ * path (e.g., doc.category='bottom' but the slot URL is at
+ * `wardrobe/pants/...` from when the item was created under the legacy
+ * 'pants' category).
+ *
+ * Returns the bucket-relative path (e.g. `wardrobe/pants/abc/fitmodel_00.jpg`)
+ * extracted from the doc URL. Throws if the slot has no URL.
+ */
+async function resolveGcsPath(
+  wardrobeId: string,
+  slotKey: 'front' | 'front45Left' | 'front45Right' | 'back' | 'back45Left' | 'back45Right',
+): Promise<string> {
+  const { Firestore } = await import('@google-cloud/firestore');
+  const db = new Firestore();
+  const snap = await db.collection('wardrobe').doc(wardrobeId).get();
+  if (!snap.exists) throw new Error(`Wardrobe doc ${wardrobeId} not found`);
+  const fm = ((snap.data() as Record<string, unknown>).fitModels || {}) as Record<string, string>;
+  const url = fm[slotKey];
+  if (!url) throw new Error(`Wardrobe ${wardrobeId} has no fitModels.${slotKey} URL`);
+  // URL format: https://storage.googleapis.com/<bucket>/<path>
+  const m = url.split('?')[0].match(new RegExp(`^https://storage\\.googleapis\\.com/${BUCKET}/(.+)$`));
+  if (!m) throw new Error(`Could not parse GCS path from URL: ${url}`);
+  return m[1];
+}
+
 async function main() {
   const { positional, opts } = parseArgs(process.argv.slice(2));
   const [category, wardrobeId, frontDSC, backDSC] = positional;
   if (!category || !wardrobeId || !frontDSC || !backDSC) {
-    console.error('Usage: backfill-fitmodel-4k.ts <category> <wardrobeId> <frontDSC> <backDSC> [--front-name <file>] [--back-name <file>]');
+    console.error('Usage: backfill-fitmodel-4k.ts <category> <wardrobeId> <frontDSC> <backDSC>');
+    console.error('  Optional flags (override slot inference from the doc URL):');
+    console.error('    --front-slot <key> --back-slot <key>     (resolve path from wardrobe doc)');
+    console.error('    --front-name <file> --back-name <file>   (force a filename; falls back to legacy `wardrobe/{category}/{wardrobeId}/`)');
+    console.error('');
+    console.error('  Default behaviour: looks up the front + back slot URLs from the wardrobe');
+    console.error('  doc and overwrites those exact GCS paths (the URLs the app actually loads).');
     process.exit(1);
   }
   if (!fs.existsSync(frontDSC)) throw new Error(`Front DSC not found: ${frontDSC}`);
   if (!fs.existsSync(backDSC)) throw new Error(`Back DSC not found: ${backDSC}`);
 
-  const frontName = opts['front-name'] || 'fitmodel_04.jpg';
-  const backName = opts['back-name'] || 'fitmodel_05.jpg';
-
-  console.log(`\n=== Backfilling ${category}/${wardrobeId} ===`);
-  console.log(`  front slot: ${frontName}`);
-  console.log(`  back slot: ${backName}`);
+  // Default: resolve target paths from the wardrobe doc's `fitModels.front`
+  // and `fitModels.back` URLs. This is the source of truth — Bruno's app
+  // loads whatever URL the doc references, so we must write THERE, not at
+  // a path we guess from --category.
+  let frontPath: string;
+  let backPath: string;
+  const frontSlotKey = opts['front-slot'] || 'front';
+  const backSlotKey = opts['back-slot'] || 'back';
+  if (opts['front-name'] || opts['back-name']) {
+    // Legacy override: caller specifies filenames; path is built from --category.
+    const frontName = opts['front-name'] || 'fitmodel_04.jpg';
+    const backName = opts['back-name'] || 'fitmodel_05.jpg';
+    frontPath = `wardrobe/${category}/${wardrobeId}/${frontName}`;
+    backPath = `wardrobe/${category}/${wardrobeId}/${backName}`;
+    console.log(`\n=== Backfilling ${wardrobeId} (manual paths) ===`);
+    console.log(`  front: ${frontPath}`);
+    console.log(`  back:  ${backPath}`);
+  } else {
+    // Read from doc — the safe default.
+    frontPath = await resolveGcsPath(wardrobeId, frontSlotKey as 'front');
+    backPath = await resolveGcsPath(wardrobeId, backSlotKey as 'back');
+    console.log(`\n=== Backfilling ${wardrobeId} (paths resolved from wardrobe doc) ===`);
+    console.log(`  ${frontSlotKey} slot → ${frontPath}`);
+    console.log(`  ${backSlotKey} slot → ${backPath}`);
+  }
 
   // Front
   console.log(`\n[front]`);
   const frontTmp = `/tmp/fitmodel_4K_${wardrobeId}_front.jpg`;
   const fOut = await rerenderTo4K(frontDSC, frontTmp);
   console.log(`  out ${frontTmp}: ${fOut.width}×${fOut.height}, ${(fOut.bytes / 1024 / 1024).toFixed(1)}MB`);
-  uploadToGCS(frontTmp, `wardrobe/${category}/${wardrobeId}/${frontName}`);
+  uploadToGCS(frontTmp, frontPath);
   fs.unlinkSync(frontTmp);
 
   // Back
@@ -124,12 +177,12 @@ async function main() {
   const backTmp = `/tmp/fitmodel_4K_${wardrobeId}_back.jpg`;
   const bOut = await rerenderTo4K(backDSC, backTmp);
   console.log(`  out ${backTmp}: ${bOut.width}×${bOut.height}, ${(bOut.bytes / 1024 / 1024).toFixed(1)}MB`);
-  uploadToGCS(backTmp, `wardrobe/${category}/${wardrobeId}/${backName}`);
+  uploadToGCS(backTmp, backPath);
   fs.unlinkSync(backTmp);
 
   console.log(`\nDone. URLs unchanged — wardrobe doc doesn't need updating.`);
-  console.log(`  https://storage.googleapis.com/${BUCKET}/wardrobe/${category}/${wardrobeId}/${frontName}`);
-  console.log(`  https://storage.googleapis.com/${BUCKET}/wardrobe/${category}/${wardrobeId}/${backName}`);
+  console.log(`  https://storage.googleapis.com/${BUCKET}/${frontPath}`);
+  console.log(`  https://storage.googleapis.com/${BUCKET}/${backPath}`);
 }
 
 main().catch(e => { console.error(e); process.exit(1); });
