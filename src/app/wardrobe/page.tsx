@@ -51,6 +51,12 @@ interface WardrobeItem {
   labelReady?: boolean;
   leatherLabelTemplateId?: string;
   pocketLabelTemplateId?: string;
+  // 4K fit-model audit (populated by scripts/audit-fit-model-4k.ts).
+  // Counts how many of the 6 fit-model slots are 4K-resolution.
+  fitModels4K_count?: number;
+  fitModels4K_populatedCount?: number;
+  fitModels4K_all?: boolean;
+  fitModels4K_auditedAt?: string;
 }
 
 interface LabelAsset {
@@ -729,6 +735,23 @@ export default function WardrobePage() {
                     {countFitImages(item)} angles
                   </span>
                 )}
+                {/* 4K fit-model badge. Green when all 6 slots are 4K, amber
+                    when partial, grey when 0/6 — only shows on items where
+                    the audit has run (fitModels4K_count !== undefined). */}
+                {typeof item.fitModels4K_count === 'number' && (
+                  <span
+                    className={`absolute top-2 right-2 px-2 py-0.5 text-xs font-medium ${
+                      item.fitModels4K_all
+                        ? 'bg-emerald-600 text-white'
+                        : item.fitModels4K_count > 0
+                          ? 'bg-amber-500 text-white'
+                          : 'bg-neutral-400 text-white'
+                    }`}
+                    title={`${item.fitModels4K_count} of 6 fit-model slots are 4K`}
+                  >
+                    {item.fitModels4K_all ? 'All 4K' : `${item.fitModels4K_count}/6 4K`}
+                  </span>
+                )}
                 {/* Label-readiness badge — only on bottoms. Green = warp tool
                     will work (templateId set OR three-tier config exists);
                     amber = needs setup before warp. */}
@@ -784,9 +807,25 @@ export default function WardrobePage() {
 
               {/* Fit model images — labeled grid */}
               <div>
-                <p className="text-xs font-medium text-neutral-500 uppercase tracking-wider mb-3">
-                  Fit Model Angles ({countFitImages(selectedItem)}/6)
-                </p>
+                <div className="flex items-center justify-between mb-3">
+                  <p className="text-xs font-medium text-neutral-500 uppercase tracking-wider">
+                    Fit Model Angles ({countFitImages(selectedItem)}/6)
+                  </p>
+                  {typeof selectedItem.fitModels4K_count === 'number' && (
+                    <span
+                      className={`px-2 py-0.5 text-xs font-medium ${
+                        selectedItem.fitModels4K_all
+                          ? 'bg-emerald-600 text-white'
+                          : selectedItem.fitModels4K_count > 0
+                            ? 'bg-amber-500 text-white'
+                            : 'bg-neutral-300 text-neutral-700'
+                      }`}
+                      title={`${selectedItem.fitModels4K_count} of 6 fit-model slots are 4K resolution`}
+                    >
+                      {selectedItem.fitModels4K_all ? 'All 4K ✓' : `${selectedItem.fitModels4K_count}/6 at 4K`}
+                    </span>
+                  )}
+                </div>
                 {(() => {
                   const images = getFitModelImages(selectedItem);
                   if (images.length === 0) return <p className="text-xs text-neutral-400 italic">No fit model photos uploaded yet.</p>;
