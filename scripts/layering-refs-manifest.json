@@ -1,0 +1,264 @@
+[
+  {
+    "wardrobeId": "TT2f4TLx5SmYUFX8Yw0d",
+    "name": "G-Straight Jeans",
+    "sku": "d26163-e205-h918",
+    "pdp": "https://www.g-star.com/nl_nl/shop/dames/jeans/d26163-e205-h918",
+    "m02Url": "https://img1.g-star.com/product/c_fill,f_jpg,w_4000,q_auto/v1761037733/D26163-E205-H918-M02/g-star-g-straight-jeans-lichtblauw.jpg",
+    "substitute": false
+  },
+  {
+    "wardrobeId": "Hun27VKK37Ca4EWYOsfm",
+    "name": "Midge Bootcut Jeans",
+    "sku": "d01896-6553-89",
+    "pdp": "https://www.g-star.com/nl_nl/shop/dames/jeans/d01896-6553-89",
+    "m02Url": "https://img1.g-star.com/product/c_fill,f_jpg,w_4000,q_auto/v1732530373/D01896-6553-89-M02/g-star-midge-bootcut-jeans-donkerblauw.jpg",
+    "substitute": false
+  },
+  {
+    "wardrobeId": "YOiSIPlqgjcduhR3R6Ix",
+    "name": "Kate Boyfriend Jeans",
+    "sku": "d15264-d931-h095",
+    "pdp": "https://www.g-star.com/nl_nl/shop/dames/jeans/d15264-d931-h095",
+    "m02Url": "https://img1.g-star.com/product/c_fill,f_jpg,w_4000,q_auto/v1779267702/D15264-D931-H095-M02/g-star-kate-boyfriend-jeans-grijs.jpg",
+    "substitute": false
+  },
+  {
+    "wardrobeId": "1DnvEYl01rDqggKgKTQa",
+    "name": "3301 Flare Jeans",
+    "sku": "d21290-a634-g730",
+    "pdp": "https://www.g-star.com/nl_nl/shop/dames/jeans/d21290-a634-g730",
+    "m02Url": "https://img1.g-star.com/product/c_fill,f_jpg,w_4000,q_auto/v1717665028/D21290-A634-G730-M02/g-star-3301-flare-jeans-donkerblauw.jpg",
+    "substitute": false
+  },
+  {
+    "wardrobeId": "6weuQ0caKivxaSTkr4Cw",
+    "name": "Judee Low Waist Loose Jeans",
+    "sku": "d22889-d933-h087",
+    "pdp": "https://www.g-star.com/nl_nl/shop/dames/jeans/d22889-d933-h087",
+    "m02Url": "https://img1.g-star.com/product/c_fill,f_jpg,w_4000,q_auto/v1769167393/D22889-D933-H087-M02/g-star-judee-loose-low-waist-jeans-grijs.jpg",
+    "substitute": false
+  },
+  {
+    "wardrobeId": "YgYlPXyfF75wJNVdbtKK",
+    "name": "CONTOR 3D EXTREME LOOSE WMN",
+    "sku": "d27690-d315-001",
+    "pdp": "https://www.g-star.com/nl_nl/shop/dames/jeans/d27690-d315-001",
+    "m02Url": "https://img1.g-star.com/product/c_fill,f_jpg,w_4000,q_auto/v1759229936/D27690-D315-001-M02/g-star-contor-barrel-wide-jeans-donkerblauw.jpg",
+    "substitute": false
+  },
+  {
+    "wardrobeId": "GPJx6wpxwTfYsIqPAHnA",
+    "name": "G-STAR RADAR LOOSE WMN",
+    "sku": "d30419-e358-d926",
+    "pdp": "https://www.g-star.com/nl_nl/shop/dames/jeans/d22889-d436-c947",
+    "m02Url": "https://img1.g-star.com/product/c_fill,f_jpg,w_4000,q_auto/v1733323250/D22889-D436-C947-M02/g-star-judee-loose-jeans-lichtblauw.jpg",
+    "substitute": true,
+    "substituteFor": "d22889-d436-c947",
+    "note": "silhouette substitute: RADAR \u2192 Judee Loose"
+  },
+  {
+    "wardrobeId": "4nyMHh7ICQLrpxBX8zmP",
+    "name": "Judee Low Waist Loose Jeans",
+    "sku": "d22889-d436-d331",
+    "pdp": "https://www.g-star.com/nl_nl/shop/dames/jeans/d22889-d436-d331",
+    "m02Url": "https://img1.g-star.com/product/c_fill,f_jpg,w_4000,q_auto/v1779267360/D22889-D436-D331-M02/g-star-judee-loose-jeans-midden-blauw.jpg",
+    "substitute": false
+  },
+  {
+    "wardrobeId": "vdOxwqzTUBch6ktkOgfY",
+    "name": "Midge Slim Straight Jeans",
+    "sku": "d07145-8968-6028",
+    "pdp": "https://www.g-star.com/nl_nl/shop/dames/jeans/d07145-8968-6028",
+    "m02Url": "https://img1.g-star.com/product/c_fill,f_jpg,w_4000,q_auto/v1779268144/D07145-8968-6028-M02/g-star-midge-straight-jeans-midden-blauw.jpg",
+    "substitute": false
+  },
+  {
+    "wardrobeId": "zIevwoBxsrHoqZpqB3sj",
+    "name": "3301 Skinny Jeans",
+    "sku": "d05175-8968-89",
+    "pdp": "https://www.g-star.com/nl_nl/shop/dames/jeans/d05175-8968-89",
+    "m02Url": "https://img1.g-star.com/product/c_fill,f_jpg,w_4000,q_auto/v1779266850/D05175-8968-89-M02/g-star-3301-skinny-jeans-donkerblauw.jpg",
+    "substitute": false
+  },
+  {
+    "wardrobeId": "Cyz9pf1QsMuKX6T4UhxU",
+    "name": "DARTT 3D ZIP SLIM WMN",
+    "sku": "d29074-e540-d926",
+    "pdp": "https://www.g-star.com/nl_nl/shop/dames/jeans/d29074-e540-d926",
+    "m02Url": "https://img1.g-star.com/product/c_fill,f_jpg,w_4000,q_auto/v1751618736/D29074-E540-D926-M02/g-star-dartt-zip-slim-jeans-donkerblauw.jpg",
+    "substitute": false
+  },
+  {
+    "wardrobeId": "OnOe3MaP00xavnoRtNN7",
+    "name": "Kate Boyfriend Jeans",
+    "sku": "d15264-c052-d332",
+    "pdp": "https://www.g-star.com/nl_nl/shop/dames/jeans/d15264-c052-d332",
+    "m02Url": "https://img1.g-star.com/product/c_fill,f_jpg,w_4000,q_auto/v1717664273/D15264-C052-D332-M02/g-star-kate-boyfriend-jeans-donkerblauw.jpg",
+    "substitute": false
+  },
+  {
+    "wardrobeId": "shU8uNGorWXuyMqS8Iis",
+    "name": "Midge Straight jeans 52",
+    "sku": "d02153-6553-89",
+    "pdp": "https://www.g-star.com/nl_nl/shop/dames/jeans/d02153-6553-89",
+    "m02Url": "https://img1.g-star.com/product/c_fill,f_jpg,w_4000,q_auto/v1711446535/D02153-6553-89-M02/g-star-midge-straight-jeans-donkerblauw.jpg",
+    "substitute": false
+  },
+  {
+    "wardrobeId": "k0FIVJnYT6jLqKc4EzsS",
+    "name": "LOUX BOYFRIEND WMN",
+    "sku": "d29953-e875-j648",
+    "pdp": "https://www.g-star.com/nl_nl/shop/dames/jeans/d15264-c052-8436",
+    "m02Url": "https://img1.g-star.com/product/c_fill,f_jpg,w_4000,q_auto/v1732629669/D15264-C052-8436-M02/g-star-kate-boyfriend-jeans-midden-blauw.jpg",
+    "substitute": true,
+    "substituteFor": "d15264-c052-8436",
+    "note": "silhouette substitute: LOUX \u2192 Kate Boyfriend"
+  },
+  {
+    "wardrobeId": "PWYdwXzb61EXfjhSdulq",
+    "name": "Kate Boyfriend Jeans 62",
+    "sku": "d15264-c293-b168",
+    "pdp": "https://www.g-star.com/nl_nl/shop/dames/jeans/d15264-c293-b168",
+    "m02Url": "https://img1.g-star.com/product/c_fill,f_jpg,w_4000,q_auto/v1732528897/D15264-C293-B168-M02/g-star-kate-boyfriend-jeans-grijs.jpg",
+    "substitute": false
+  },
+  {
+    "wardrobeId": "5LCOIQVA7GARxf33WxCY",
+    "name": "Kate Boyfriend Jeans 53",
+    "sku": "d15264-c052-8436",
+    "pdp": "https://www.g-star.com/nl_nl/shop/dames/jeans/d15264-c052-8436",
+    "m02Url": "https://img1.g-star.com/product/c_fill,f_jpg,w_4000,q_auto/v1732629669/D15264-C052-8436-M02/g-star-kate-boyfriend-jeans-midden-blauw.jpg",
+    "substitute": false
+  },
+  {
+    "wardrobeId": "ZB2GMhoH1hQDjdJQbD6d",
+    "name": "CONTOR 3D WIDE WMN",
+    "sku": "d27690-d788-h117",
+    "pdp": "https://www.g-star.com/nl_nl/shop/dames/jeans/d27690-d788-h924",
+    "m02Url": "https://img1.g-star.com/product/c_fill,f_jpg,w_4000,q_auto/v1770656026/D27690-D788-H924-M02/g-star-contor-barrel-wide-jeans-midden-blauw.jpg",
+    "substitute": true,
+    "substituteFor": "d27690-d788-h924",
+    "note": "colorway substitute"
+  },
+  {
+    "wardrobeId": "6aN3Hxx0GFJFCW9U2Oyj",
+    "name": "Kate Boyfriend Jeans 61",
+    "sku": "d15264-d775-g803",
+    "pdp": "https://www.g-star.com/nl_nl/shop/dames/jeans/d15264-d775-g803",
+    "m02Url": "https://img1.g-star.com/product/c_fill,f_jpg,w_4000,q_auto/v1737362644/D15264-D775-G803-M02/g-star-kate-boyfriend-jeans-donkerblauw.jpg",
+    "substitute": false
+  },
+  {
+    "wardrobeId": "OEyZ0lrt7soRIba963pI",
+    "name": "Kate Boyfriend Jeans 51",
+    "sku": "d15264-c052-a802",
+    "pdp": "https://www.g-star.com/nl_nl/shop/dames/jeans/d15264-c052-a802",
+    "m02Url": "https://img1.g-star.com/product/c_fill,f_jpg,w_4000,q_auto/v1732530346/D15264-C052-A802-M02/g-star-kate-boyfriend-jeans-midden-blauw.jpg",
+    "substitute": false
+  },
+  {
+    "wardrobeId": "C8inPAjtaie8SxdMjs1s",
+    "name": "3301 Flare jeans 53",
+    "sku": "d21290-d987-h280",
+    "pdp": "https://www.g-star.com/nl_nl/shop/dames/jeans/d21290-d987-h280",
+    "m02Url": "https://img1.g-star.com/product/c_fill,f_jpg,w_4000,q_auto/v1719220188/D21290-D987-H280-M02/g-star-3301-flare-jeans-midden-blauw.jpg",
+    "substitute": false
+  },
+  {
+    "wardrobeId": "ME7QswY55jaCJQXGi3lc",
+    "name": "Judee Low Waist Loose Jeans 53",
+    "sku": "d22889-d536-g841",
+    "pdp": "https://www.g-star.com/nl_nl/shop/dames/jeans/d22889-d536-g841",
+    "m02Url": "https://img1.g-star.com/product/c_fill,f_jpg,w_4000,q_auto/v1756196354/D22889-D536-G841-M02/g-star-judee-low-waist-loose-jeans-midden-blauw.jpg",
+    "substitute": false
+  },
+  {
+    "wardrobeId": "8gr2tzr9Er8m00ZmRzLi",
+    "name": "3301 Flare jeans 61",
+    "sku": "d21290-d987-h281",
+    "pdp": "https://www.g-star.com/nl_nl/shop/dames/jeans/d21290-d987-h281",
+    "m02Url": "https://img1.g-star.com/product/c_fill,f_jpg,w_4000,q_auto/v1718809505/D21290-D987-H281-M02/g-star-3301-flare-jeans-donkerblauw.jpg",
+    "substitute": false
+  },
+  {
+    "wardrobeId": "IUqRKvjYj96i29RvdsbO",
+    "name": "Judee Low Waist Loose Jeans 52",
+    "sku": "d22889-d436-c947",
+    "pdp": "https://www.g-star.com/nl_nl/shop/dames/jeans/d22889-d436-c947",
+    "m02Url": "https://img1.g-star.com/product/c_fill,f_jpg,w_4000,q_auto/v1733323250/D22889-D436-C947-M02/g-star-judee-loose-jeans-lichtblauw.jpg",
+    "substitute": false
+  },
+  {
+    "wardrobeId": "D1gooqDdFnvbzX6iDUHg",
+    "name": "G-Straight Jeans",
+    "sku": "d26163-e205-h914",
+    "pdp": "https://www.g-star.com/nl_nl/shop/dames/jeans/d26163-e205-h914",
+    "m02Url": "https://img1.g-star.com/product/c_fill,f_jpg,w_4000,q_auto/v1766571092/D26163-E205-H914-M02/g-star-g-straight-jeans-midden-blauw.jpg",
+    "substitute": false
+  },
+  {
+    "wardrobeId": "RGNvTdkutdIA0mXJ7LHF",
+    "name": "Culotte",
+    "sku": "d30800-e068-c742",
+    "pdp": "https://www.g-star.com/nl_nl/shop/dames/jeans/d30800-e068-c742",
+    "m02Url": "https://img1.g-star.com/product/c_fill,f_jpg,w_4000,q_auto/v1777644352/D30800-E068-C742-M02/g-star-culotte-chino-donkerblauw.jpg",
+    "substitute": false
+  },
+  {
+    "wardrobeId": "snJbQ9svoDIT3mmUmb7t",
+    "name": "Culotte",
+    "sku": "d30800-e068-c742",
+    "pdp": "https://www.g-star.com/nl_nl/shop/dames/jeans/d30800-e068-c742",
+    "m02Url": "https://img1.g-star.com/product/c_fill,f_jpg,w_4000,q_auto/v1777644352/D30800-E068-C742-M02/g-star-culotte-chino-donkerblauw.jpg",
+    "substitute": false
+  },
+  {
+    "wardrobeId": "AJEFuiuVuSdYk1di1dcv",
+    "name": "RR KICK CROPPED WMN",
+    "sku": "d28619-e460",
+    "pdp": "https://www.g-star.com/nl_nl/shop/dames/jeans/d05175-8968-89",
+    "m02Url": "https://img1.g-star.com/product/c_fill,f_jpg,w_4000,q_auto/v1779266850/D05175-8968-89-M02/g-star-3301-skinny-jeans-donkerblauw.jpg",
+    "substitute": true,
+    "substituteFor": "d05175-8968-89",
+    "note": "silhouette substitute: RR KICK \u2192 3301 Skinny"
+  },
+  {
+    "wardrobeId": "Rq3K3UQGdJmVu4W0LwgK",
+    "name": "Bowey Barrel jeans  53",
+    "sku": "d25372-e266-h545",
+    "pdp": "https://www.g-star.com/nl_nl/shop/dames/jeans/d25372-e266-h545",
+    "m02Url": "https://img1.g-star.com/product/c_fill,f_jpg,w_4000,q_auto/v1764151168/D25372-E266-H545-M02/g-star-bowey-barrel-jeans-midden-blauw.jpg",
+    "substitute": false
+  },
+  {
+    "wardrobeId": "MHdh73pRrOfnS2CQT1af",
+    "name": "Wrap-over wide leg tailored trouser",
+    "sku": "d30782-e068-c742",
+    "pdp": "https://www.g-star.com/nl_nl/shop/dames/jeans/d22889-d436-c947",
+    "m02Url": "https://img1.g-star.com/product/c_fill,f_jpg,w_4000,q_auto/v1733323250/D22889-D436-C947-M02/g-star-judee-loose-jeans-lichtblauw.jpg",
+    "substitute": true,
+    "substituteFor": "d22889-d436-c947",
+    "note": "silhouette substitute: Wrap-over \u2192 Judee Loose"
+  },
+  {
+    "wardrobeId": "NvTZVBMZuuAAMt1jaOnf",
+    "name": "G-star Roxx wide jeans ",
+    "sku": "d28394-d953-j059",
+    "pdp": "https://www.g-star.com/nl_nl/shop/dames/jeans/d27690-d788-h924",
+    "m02Url": "https://img1.g-star.com/product/c_fill,f_jpg,w_4000,q_auto/v1770656026/D27690-D788-H924-M02/g-star-contor-barrel-wide-jeans-midden-blauw.jpg",
+    "substitute": true,
+    "substituteFor": "d27690-d788-h924",
+    "note": "silhouette substitute: Roxx \u2192 Contor Barrel Wide"
+  },
+  {
+    "wardrobeId": "vTp2w3mYxytGaAflfG1r",
+    "name": "Cargo trouser ",
+    "sku": "d28906-e070-722",
+    "pdp": "https://www.g-star.com/nl_nl/shop/heren/broeken/d25523-d846-239",
+    "m02Url": "https://img1.g-star.com/product/c_fill,f_jpg,w_4000,q_auto/v1711445108/D25523-D846-239-M02/g-star-cargo-3d-regular-tapered-broek-beige.jpg",
+    "substitute": true,
+    "substituteFor": "d25523",
+    "note": "silhouette substitute: Cargo trouser \u2192 Cargo 3D Regular Tapered (straight ankle, NOT jogger)"
+  }
+]
