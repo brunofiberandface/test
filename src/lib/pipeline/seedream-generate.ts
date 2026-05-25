@@ -102,10 +102,6 @@ export interface SeedreamGenerationResult {
    *  on the shot doc so downstream steps (tee-edit, etc) know which model
    *  ran — 5.0 handles tucked-in tops natively, so tee-edit is skipped. */
   model?: string;
-  /** M04 two-pass only: GCS URL of the Pass 1 (sports-bra + briefs + shoes)
-   *  intermediate. Surfaced so the caller can record it in pipelineStages
-   *  for the debug viewer. Absent for single-pass M04 + every other shot. */
-  pass1Url?: string;
 }
 
 /** Strip query string (?v=..., signed URL params) so BytePlus fetches the raw object. */
@@ -123,30 +119,23 @@ async function refFromUrl(url: string, label: string): Promise<SeedreamReference
 }
 
 /**
- * SMART-CROP HELPER (originally M05-only 2026-05-11, generalized 2026-05-13).
+ * M05 SMART-CROP HELPER (added 2026-05-11 with Track A).
  *
  * Downloads `sourceUrl`, crops to vertical band [fromPct, toPct], uploads to
  * GCS at a content-addressed path, returns the cropped URL. Re-uses an
  * existing cropped object if already cached.
  *
- * Why: ref framing was being dominated by the full-body model card + fit-model
+ * Why: M05 framing was being dominated by the full-body model card + fit-model
  * refs (visual evidence > text instructions per LEARNING #89). Cropping these
- * refs to just the relevant zone BEFORE Seedream sees them aligns the
+ * refs to just the hip/buttock zone BEFORE Seedream sees them aligns the
  * visual + text signals — Seedream renders tight when refs are tight.
  *
- * Per-ref crops in production:
- *   MODEL CARD FRONT    → vertical 0-30%  (M03 head/shoulders identity anchor
- *                                          — counters fit-model identity bleed
- *                                          when 3 fit-model angles outvote the
- *                                          single full-body model card)
- *   MODEL CARD BACK     → vertical 5-30%  (M05 head/shoulders — skin tone,
+ * Per-ref crops (validated against H6Is/F9):
+ *   MODEL CARD BACK     → vertical 5-30%  (head/shoulders only — skin tone,
  *                                          NO compression-shorts styling)
- *   FIT MODEL BACK 45°  → vertical 25-60% (M05 hip/buttock — garment + framing)
+ *   FIT MODEL BACK 45°  → vertical 25-60% (hip/buttock — garment + framing)
  *
- * Cache: GCS path cropped-refs/{sha1(sourceUrl|from|to)}.jpg. Renamed from
- * m05-cropped-refs/ on 2026-05-13 when M03 started using the same helper —
- * existing M05 cache entries remain valid under the old path; new entries go
- * to the unified path. Both paths are read-only references by Seedream.
+ * Cache: GCS path m05-cropped-refs/{sha1(sourceUrl|from|to)}.jpg
  */
 async function cropAndCacheRef(
   sourceUrl: string,
@@ -159,7 +148,7 @@ async function cropAndCacheRef(
 
   const clean = sourceUrl.split('?')[0];
   const key = crypto.createHash('sha1').update(`${clean}|${fromPct}|${toPct}`).digest('hex');
-  const gcsPath = `cropped-refs/${key}.jpg`;
+  const gcsPath = `m05-cropped-refs/${key}.jpg`;
   const publicUrl = `https://storage.googleapis.com/gstar-ai-studio-assets/${gcsPath}`;
 
   const storage = new Storage();
@@ -440,21 +429,6 @@ async function seedreamM03(ctx: SeedreamGenerationContext, prompt: LoadedPrompt)
   refs.push(await refFromUrl(STUDIO_BACKDROP_URL, STUDIO_BACKDROP_LABEL));
   refs.push(await refFromUrl(modelRefUrl, 'MODEL CARD (FRONT) — canonical, exclusive source of truth for the model\'s identity. Match the model shown in this card identically: every facial feature (eye shape, eye color, nose, mouth, brow shape), the natural facial expression and presence as captured here, skin tone with undertone, freckle pattern, hair color and texture, body proportions. The face and expression in this card are exactly correct — preserve them precisely when the model\'s face is rendered. Lighting on the rendered model is neutral — do not transfer warm key lighting from any other reference. STANCE, FOOT POSITION, HIP TILT, WEIGHT DISTRIBUTION, AND BODY POSE are NOT taken from this card — those come from the FIT MODEL angles. Do not copy the contrapposto, single-leg-weight, or any asymmetric stance shown in this card image.'));
 
-  // 2026-05-13 FIX: head-crop identity anchor. M03 was occasionally drifting
-  // to a different model identity (Bruno caught on 90e5Z1nFR1XwS7BZyG6a)
-  // because the 3 fit-model angle refs (each with their own face) can
-  // outvote the single full-body MODEL CARD (FRONT) ref. Cropping the front
-  // card to head+shoulders gives Seedream an extra identity signal at face
-  // resolution — same pattern that fixed M06 skin drift today (top-focus
-  // 2026-05-12, bottom-focus 2026-05-13). cropAndCacheRef writes to GCS at
-  // a content-addressed path so it's a one-time cost per model.
-  try {
-    const headCropUrl = await cropAndCacheRef(modelRefUrl, 0.0, 0.30);
-    refs.push(await refFromUrl(headCropUrl, 'MODEL CARD (FRONT) — HEAD AND SHOULDERS CROP. Identity anchor: face features, hair color/length/texture, skin tone with undertone, freckles. Same person as MODEL CARD (FRONT) full-body ref above — this crop reinforces the identity at face resolution so it can\'t be diluted by the fit-model angles below. STANCE, POSE, GARMENTS are NOT taken from this crop.'));
-  } catch (e) {
-    console.warn(`[Seedream M03] head-crop identity anchor skipped (non-blocking):`, (e as Error).message);
-  }
-
   if (ctx.focusSlot === 'top') {
     // FOCUS — top garment refs. Without these, Seedream has no visual anchor
     // for the focus jacket and renders the hem / sleeves / closures from
@@ -469,32 +443,19 @@ async function seedreamM03(ctx: SeedreamGenerationContext, prompt: LoadedPrompt)
     for (let i = 0; i < topAnglesToInclude.length; i++) {
       refs.push(await refFromUrl(topAnglesToInclude[i], `FOCUS TOP FIT MODEL FRONT ANGLE ${i + 1} — focus garment on a fit model. Use ONLY for the focus top's fit, drape, hem behaviour, sleeve length and how the top sits on the body. SKIN TONE, COMPLEXION, IDENTITY, BACKDROP, FLOOR, and any garments worn below the waist are NOT taken from this image.`));
     }
-    // Styling bottom — flat + 2 angles (reduced from 3 on 2026-05-13 to make
-    // room for the head-crop identity anchor without overflowing the
-    // BytePlus 10-ref limit). Budget now:
-    //   1 backdrop + 1 model + 1 head crop + 4 top + 3 bottom = 10. Exactly
-    // at the limit. Dropping the 3rd styling-bottom angle is the right
-    // trade: the bottom is NOT the focus in top-focus jobs (it's supporting
-    // context), so 2 angles + 1 flat is enough for fit/drape/wash reference.
+    // Styling bottom — full visual ref set (flat + 3 angles) so jeans wash
+    // and fit are anchored visually, matching what bottom-focus jobs get.
+    // M03 has plenty of headroom: 1 backdrop + 1 model + 4 top + 4 bottom = 10
+    // refs at the BytePlus limit, so we keep all 4 bottom refs.
     refs.push(await refFromUrl(bottomFlat, 'STYLING BOTTOM FLAT — the styling bottom (pants/jeans) for color, wash, fabric, fit. Not the focus garment — render accurately in support of the focus top, no extra detail or invented hardware.'));
-    const stylingBottomAnglesTopFocus = bottomAngles.slice(0, 2);
-    for (let i = 0; i < stylingBottomAnglesTopFocus.length; i++) {
-      refs.push(await refFromUrl(stylingBottomAnglesTopFocus[i], `STYLING BOTTOM FIT MODEL FRONT ANGLE ${i + 1} — the styling bottom (pants/jeans) on a fit model for fit, drape, length, wash. SKIN TONE, COMPLEXION, IDENTITY, BACKDROP, KEY-LIGHT COLOR, and the top half of the outfit are NOT taken from this image.`));
+    for (let i = 0; i < bottomAngles.length; i++) {
+      refs.push(await refFromUrl(bottomAngles[i], `STYLING BOTTOM FIT MODEL FRONT ANGLE ${i + 1} — the styling bottom (pants/jeans) on a fit model for fit, drape, length, wash. SKIN TONE, COMPLEXION, IDENTITY, BACKDROP, KEY-LIGHT COLOR, and the top half of the outfit are NOT taken from this image.`));
     }
   } else {
     // BOTTOM-FOCUS (default) — bottom is the hero, full ref set.
-    //
-    // 2026-05-13 wash-lock: M03 wash was drifting (Bruno flagged Bowey Barrel
-    // jeans 53 j7RnJwgHfCTfEzgTXjpI — actual product is light-medium blue
-    // with whiskers, M03 rendered darker / more saturated medium blue).
-    // GARMENT FLAT FRONT is the cleanest color reference for the product
-    // (no lighting variance from a fit-model photo), so it's the right
-    // anchor to lock wash to. We make this label substantive and add wash
-    // language to the fit-model angle label so the multi-ref Seedream input
-    // doesn't average toward a more saturated wash.
-    refs.push(await refFromUrl(bottomFlat, 'GARMENT FLAT FRONT — SOURCE OF TRUTH for the jean wash, color, fade pattern, whiskers, and overall saturation. The jean WASH, COLOR, FADE LINES, WHISKER PATTERN, AND OVERALL SATURATION are LOCKED to this image — match the wash level (light, medium, or dark) and fade character EXACTLY as shown. Do NOT darken, do NOT saturate, do NOT shift toward a richer / deeper blue. Do NOT lighten, do NOT desaturate, do NOT shift toward white or grey. The flat front is the most accurate color reference for this product because it has no skin-tone or studio-light contamination — pull jean color from THIS image first.'));
+    refs.push(await refFromUrl(bottomFlat, 'Garment Flat Front'));
     for (let i = 0; i < bottomAngles.length; i++) {
-      refs.push(await refFromUrl(bottomAngles[i], `Fit Model Front Angle ${i + 1} — primary garment-fit AND STANCE reference. Use this image for: garment shape, fit, hem behavior, stitching, silhouette, AND THE MODEL'S STANCE — match the exact stance shown in THIS fit-model photo. Both legs drop STRAIGHT DOWN vertically from hip to floor (no outward angle from hip to ankle, legs do NOT widen or splay outward at the feet beyond the hip line), feet planted flat on the floor parallel to each other with approximately ONE FOOT-WIDTH of clear space between the inner edges of the two feet — i.e. the gap between the inner side of the left foot and the inner side of the right foot equals roughly the WIDTH (NOT the length) of one shoe (~10cm for an adult — narrow gap, feet near each other but not touching). NOT touching / sole-to-sole. NOT wider than hip-width. NOT crossed. NOT one foot in front of the other, weight 50/50 across both feet, hips centered and level (NO hip tilt, NO contrapposto, NO weight shift onto one leg), arms relaxed at the sides. The jean WASH, COLOR, FADE PATTERN, AND SATURATION shown here are the target — match the wash level seen here without darkening, saturating, lightening, or desaturating; the GARMENT FLAT FRONT above is the primary color anchor and this angle confirms the wash level on a body. SKIN TONE, COMPLEXION, BLUSH, UNDERTONE, KEY-LIGHT COLOR, AND BODY IDENTITY ARE NOT TAKEN FROM THIS IMAGE. The studio key light in this photo has its own particular color rendering — do not transfer it onto the rendered model or fabrics.`));
+      refs.push(await refFromUrl(bottomAngles[i], `Fit Model Front Angle ${i + 1} — primary garment-fit AND STANCE reference. Use this image for: garment shape, fit, hem behavior, stitching, silhouette, AND THE MODEL'S STANCE — match the exact stance shown in THIS fit-model photo. Both legs drop STRAIGHT DOWN vertically from hip to floor (no outward angle from hip to ankle, legs do NOT widen or splay outward at the feet beyond the hip line), feet planted flat on the floor parallel to each other with approximately ONE FOOT-WIDTH of clear space between the inner edges of the two feet — i.e. the gap between the inner side of the left foot and the inner side of the right foot equals roughly the WIDTH (NOT the length) of one shoe (~10cm for an adult — narrow gap, feet near each other but not touching). NOT touching / sole-to-sole. NOT wider than hip-width. NOT crossed. NOT one foot in front of the other, weight 50/50 across both feet, hips centered and level (NO hip tilt, NO contrapposto, NO weight shift onto one leg), arms relaxed at the sides. SKIN TONE, COMPLEXION, BLUSH, UNDERTONE, KEY-LIGHT COLOR, AND BODY IDENTITY ARE NOT TAKEN FROM THIS IMAGE. The studio key light in this photo has its own particular color rendering — do not transfer it onto the rendered model or fabrics.`));
     }
   }
   refs.push(...(await getStylingRefs(ctx.wardrobe, 'front', ctx.focusSlot)));
@@ -551,7 +512,7 @@ async function seedreamM04(ctx: SeedreamGenerationContext, prompt: LoadedPrompt)
     jobName: 'twopass',
     shotTag: debugTag,
   });
-  return { imageData: out.imageData, mimeType: out.mimeType, pass1Url: out.pass1Url };
+  return { imageData: out.imageData, mimeType: out.mimeType };
 }
 
 // ── Legacy single-pass M04 kept for reference / fallback ───────────────────
@@ -808,38 +769,10 @@ async function seedreamM05(ctx: SeedreamGenerationContext, prompt: LoadedPrompt)
   const labelUrls = await resolveLabelAssetUrls(item);
 
   // Build prompt — use the loaded promptVault prompt (rev 33) as-is.
-  let finalPrompt = await buildPrompt(
+  const finalPrompt = await buildPrompt(
     prompt,
     ctx.wardrobe, ctx.modelId, item, 'back', ctx.silhouette, false, 'M05', ctx.model, ctx.focusSlot,
   );
-
-  // 2026-05-13 FIX: append a no-bare-skin guard. The vault prompt says "a
-  // thin slice of the tucked top is visible … no more than 10-15%" — that's
-  // permissive (upper bound), not mandatory. When Seedream drifts, it goes
-  // to 0% and renders bare back / nude upper torso (Bruno caught on
-  // j7RnJwgHfCTfEzgTXjpI, intermittent).
-  //
-  // Important: this guard does NOT change framing, crop, camera, or pocket
-  // hero proportions — those stay as defined by the vault prompt (back-right
-  // pocket 40-50% of frame, upper-thigh bottom edge, upper body / shoulders
-  // / head out of frame). The ONLY change is what fills the small space
-  // above the waistband at the top edge: it must be the tucked-top's fabric
-  // hem (same thin sliver the vault already allows), NEVER bare skin.
-  finalPrompt += `
-
-═══ MANDATORY — NO BARE SKIN ABOVE THE WAISTBAND ═══
-This guard does NOT change the framing, crop, camera position, or pocket-hero proportions described above — those stay exactly as specified. The hero is still the back-right pocket; the bottom of frame is still upper-to-mid-thigh; upper body / shoulders / head are still out of frame. The ONLY thing this section locks down is what's rendered in the small region above the waistband at the top edge of the frame.
-
-In that region, the visible content MUST be the fabric hem of the tucked-in top — same thin sliver the framing already allows — NOT bare skin. The model is wearing a tucked-in top throughout this shot; treat the top as long enough to reach below the waistband and be tucked in, so the only thing visible above the waistband (within the existing crop) is the top's fabric.
-
-DO NOT zoom out, reframe, or include more of the top to satisfy this — keep the same tight crop. Just ensure the small slice above the waistband is fabric, not skin.
-
-FAILURE MODES — ABSOLUTELY WRONG:
-- bare back, bare upper torso, bare shoulders, or any nudity in the small region above the waistband.
-- the model rendered topless or without any garment above the waistband.
-- bare skin visible at the top of the frame instead of the tucked top's fabric.
-- a gap of bare skin between the top's hem and the waistband.
-- zooming out or reframing to fit more of the top — keep the same crop, just swap skin for fabric in the same region.`;
 
   const tagSegments: string[] = [];
   if (modelBackRefAdded) tagSegments.push('+MODEL_BACK');

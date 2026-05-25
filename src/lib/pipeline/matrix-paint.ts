@@ -96,7 +96,7 @@ const FULLBODY_VIEW_FOR_SHOT: Record<MatrixPaintShot, ViewKey> = {
  * (fullBody + crop) that still uses the inline builder until it earns its
  * own vault entries.
  */
-function buildBottomPaintPromptInline(
+export function buildBottomPaintPromptInline(
   shotType: MatrixPaintShot,
   isFullBody: boolean,
   bottomName: string,
@@ -113,12 +113,26 @@ function buildBottomPaintPromptInline(
   const upperBodyForbidden = isFullBody
     ? '\n- DO NOT modify the upper-body placeholder (sports bra / bare chest) — handled by a later pipeline stage.'
     : '';
+  // GLOBAL_RULES block (Bruno 2026-05-25): mirrors the v32 bottom-focus vault
+  // prompt's TIER PRIORITY / MODEL LOCK / EDIT ZONE LOCK / NO DUPLICATES
+  // header. Top-focus is the only current caller (isFullBody=true). The
+  // block is the prompt-body half of the ByteDance v1 audit pattern; the
+  // per-ref OUT-scoping labels in the inventory block are the other half.
+  const globalRules = isFullBody
+    ? `═══ GLOBAL RULES — APPLY ABOVE EVERYTHING ELSE ═══
+1. TIER PRIORITY — IMAGE 1 (Tier-2 model × shoe base) is the BLUEPRINT. All other reference images contribute ONLY the per-ref scope assigned in the REFERENCE IMAGE INVENTORY above. Where a fit-model ref shows a body, pose, or footwear that differs from IMAGE 1, IMAGE 1 wins. Where per-ref labels conflict with prompt text, the labels win.
+2. MODEL LOCK — ONE model, single instance. No comparison shot, no multi-angle layout, no diptych, no twin. The fit-model refs show the garment ON a body for fit reference only — they are NOT instructions to render multiple bodies in the output.
+3. EDIT ZONE LOCK — The ONLY area changed from IMAGE 1 is the placeholder briefs / hot-pants region between the waistband and the upper-thigh hem of the placeholder. The upper-body placeholder above the waistband (sports bra / bare chest / bare back) is preserved AS-IS — a later pipeline stage repaints the top. Footwear, legs below the placeholder hem, hands, head, backdrop, lighting, framing, contact shadow are all preserved AS-IS from IMAGE 1.
+4. NO DUPLICATES — No second waistband, no second pair of pants, no peplum, no draped panel, no contrast band, no styling garment peeking out from any side of the target trouser.
+
+`
+    : '';
   // Distill the gold-standard M04 prompt's Garment + Anti-Layering + Hem
   // language into this matrix-paint prompt. Was producing peplum / second-
   // waistband / "sash styled as back skirt" hallucinations without the
   // structured anti-layering rules. (Bruno 2026-05-17: combine M02-vault
   // back-construction focus with M04-vault anti-layering + hem-over-shoe.)
-  return `Photorealistic studio reference photo, 1:1 SQUARE crop, 4K resolution, ${isBack ? 'BACK' : 'FRONT'} VIEW, ${framing} of ONE SINGLE MODEL.
+  return `${globalRules}Photorealistic studio reference photo, 1:1 SQUARE crop, 4K resolution, ${isBack ? 'BACK' : 'FRONT'} VIEW, ${framing} of ONE SINGLE MODEL.
 
 ═══ SINGLE-MODEL LOCK ═══
 The output frame contains EXACTLY ONE model. ONE person. ONE body. Single-instance render. NOT a comparison shot. NOT a multi-angle layout. NOT two copies of the same model side-by-side. The fit-model reference images show the garment on a body for FIT REFERENCE ONLY — they are NOT an instruction to render multiple instances.
@@ -301,7 +315,40 @@ Top of frame: tee fabric (matching COLOUR, FABRIC TEXTURE, FINISH from IMAGE 2).
 - WRONG: changing the bottom garment, waistband, footwear, floor, or background.
 - WRONG: leaving any bare skin in the strip above the waistband.`;
 
-  const prompt = `This is a TIGHT WAIST-DOWN PRODUCT SHOT, 1:1 SQUARE, 4K resolution, ${side.toUpperCase()} VIEW. The frame shows the model's lower-back / hip / leg region wearing a bottom garment (pants, culotte, skirt, etc — whatever is in the source image). The bottom of the frame is the floor with the footwear; the top of the frame is the model's lower torso / midriff / waist area. Above the bottom garment's waistband there is currently a small slice of BARE SKIN (midriff).
+  // TUCKED mode uses the OLD V2 "layered under waistband + LENGTH OVERRIDE"
+  // language (validated 20+ style variants on full-body M03/M04 historically)
+  // ADAPTED for the waist-down framing — the V2 assumed Gemini saw shoulders
+  // and a sports-bra; in our waist-down view Gemini only sees bare midriff +
+  // waistband + pants. Without explicit "this is a CROP — fabric continues
+  // OFF the top of the frame" language, Gemini interprets the visible strip
+  // as a cropped-tee and renders a top hem inside it. The expanded prompt
+  // below defines the framing as a crop and forbids ANY visible hem.
+  //
+  // CROPPED + UNTUCKED keep the current modal renderingBlock/outputBlock/
+  // failureBlock structure.
+  const prompt = mode === 'tucked'
+    ? `Edit this e-commerce studio photo. The image is a waist-down ${side.toUpperCase()} VIEW product shot — the camera is cropped at mid-back / mid-torso level. THE MODEL'S BODY AND THE UPPER PORTION OF ANY GARMENT CONTINUE UPWARD OFF THE TOP OF THE FRAME. Only the lower portion of the torso (the lumbar / lower-back region above the waistband) is visible.
+
+Above the trouser waistband, the model's lower torso is currently visible as bare skin. PAINT THAT STRIP with tucked-in tee fabric, using the TOP REFERENCE image for the fabric's colour, texture, weave, and finish.
+
+THE TOP IS TUCKED INTO THE TROUSERS. In this frame:
+- The visible tee region is a CONTINUOUS strip of fabric. NO hem, NO finished edge, NO horizontal seam visible anywhere within the frame.
+- The fabric extends UPWARD OFF THE TOP OF THE FRAME (the top edge of the output cuts through tee fabric, mid-back). NO top hem visible — the fabric simply leaves the frame at the top.
+- The fabric extends DOWNWARD and DISAPPEARS UNDER the trouser waistband. The trouser waistband sits ON TOP of the tee fabric. NO bottom hem visible — it is hidden behind the waistband.
+- The waistband line is clean, unbroken, and is the dominant horizontal transition in this region (NOT a tee hem above it, NOT a tee hem on it).
+
+LENGTH OVERRIDE: Regardless of any "cropped", "short", "boxy", "hits at hip", "ends above waistband", or similar fit descriptor in the TOP TO PAINT text below, render the tee at full tucked length with NO VISIBLE HEMS in this frame. The fit descriptor describes the garment's off-body silhouette — NOT how it is worn here. In this product shot, the tee is tucked, period.
+
+TOP TO PAINT: ${topDescription}
+
+PRESERVE EVERYTHING ELSE EXACTLY:
+- Same model — visible skin (arms, hands if visible at sides), body proportions, pose, stance
+- Same trousers (color, wash, fit, waistband, pockets, stitching, hem)
+- Same shoes (style, color, position, contact shadow)
+- Same background (light-grey studio sweep), lighting, framing, composition
+
+Only change: replace the bare-skin lower-torso strip with a CONTINUOUS tucked-in fabric strip. NO hem visible anywhere — fabric extends off the top of the frame, fabric disappears under the waistband at the bottom. The waistband is the only horizontal transition.`
+    : `This is a TIGHT WAIST-DOWN PRODUCT SHOT, 1:1 SQUARE, 4K resolution, ${side.toUpperCase()} VIEW. The frame shows the model's lower-back / hip / leg region wearing a bottom garment (pants, culotte, skirt, etc — whatever is in the source image). The bottom of the frame is the floor with the footwear; the top of the frame is the model's lower torso / midriff / waist area. Above the bottom garment's waistband there is currently a small slice of BARE SKIN (midriff).
 
 ═══ ABSOLUTELY CRITICAL: FRAMING LOCK ═══
 DO NOT REFRAME. DO NOT ZOOM OUT. DO NOT change the camera angle. DO NOT extend the frame upward to show more of the body. The output frame MUST be byte-equivalent to the source image's framing:
@@ -326,21 +373,16 @@ ${failureBlock}
 
 ONLY the bare-skin midriff strip at the TOP of the source image becomes the top per the rendering rules above. Everything else is byte-equivalent.`;
 
-  // 2026-05-25: pre-blur ROLLED BACK. Test on Kate Boyfriend showed Gemini
-  // returning the input ≈ unchanged on 2/3 runs (interpreting the blurred
-  // bottom as "do not modify anything"). We send the un-modified Seedream
-  // buffer to Gemini and rely on the positional composite alone to keep
-  // the pant region byte-identical to Seedream.
-  //
-  // cutFraction selection (same as before):
-  //   - cropped tees: 0.10 — Gemini's zone covers the bare midriff + the
-  //     thin waistband strip.
-  //   - tucked / untucked: 0.15 — Gemini's zone extends below the waistband.
-  // Pocket-bleed risk (Gemini hallucinating pocket stitching on the tee
-  // body) returns at ~1/3 rate; accepted as a smaller problem than 2/3
-  // missing-tee. Future iteration may revisit with a softer blur or
-  // body-tracking cut.
-  const cutFraction = mode === 'cropped' ? 0.10 : 0.15;
+  // cutFraction selection:
+  //   - tucked: 0.08 — Gemini's zone covers bare-skin midriff + waistband +
+  //     a thin sliver below. Tight zone minimises pocket-bleed risk since
+  //     the V2 prompt explicitly tells Gemini the tee disappears UNDER the
+  //     waistband (no need for a larger painting area below).
+  //   - cropped: 0.10 — Gemini's zone covers the bare midriff + the thin
+  //     waistband strip (cropped tee hem ends above the waistband).
+  //   - untucked: 0.15 — Gemini's zone extends further below so the
+  //     untucked hem can drape over the waistband region.
+  const cutFraction = mode === 'tucked' ? 0.08 : mode === 'cropped' ? 0.10 : 0.15;
   console.log(`[paintTeeHemStrip] ${shotType} mode=${mode} cutFraction=${cutFraction}`);
 
   const refs: ReferenceImage[] = [
@@ -497,9 +539,14 @@ export async function matrixPaint(params: MatrixPaintParams): Promise<MatrixPain
   // remaining piece of the ByteDance v1 pattern that lived in the prompt
   // body, not in the labels.
   //
-  // Top-focus (focusSlot==='top') keeps its single matrix ref + lean
-  // labels because the top-paint happens later via geminiPaintTop and
-  // doesn't have the same multi-ref ambiguity.
+  // Top-focus (focusSlot==='top') ALSO gets the full ByteDance v1 pattern
+  // (Bruno 2026-05-25 prod-confirmation: top-focus pass-1 was still on
+  // single-matrix-ref + lean labels and produced pants drift on all 6
+  // confirmation renders). Same 3-component restoration as bottom-focus —
+  // silent anchor + per-ref OUT-scoping + forceInventory + GLOBAL_RULES —
+  // with BASE label adapted to say "preserve upper-body placeholder AS-IS"
+  // so Seedream pass-1 leaves the sports-bra/bare-chest zone untouched for
+  // the geminiPaintTop pass-2 to repaint.
   // ──────────────────────────────────────────────────────────────────────
   // Reference shoeDescription so the var isn't reported unused — passed to
   // injectStylingDescriptions below (no-op when the vault prompt has no
@@ -511,48 +558,114 @@ export async function matrixPaint(params: MatrixPaintParams): Promise<MatrixPain
   let refs: Array<{ url: string; label: string }>;
 
   if (isTopFocus) {
-    // Top-focus: single matrix base ref. Empty label (inventory stripped).
-    refs = [{ url: matrixUrlCanonical, label: '' }];
+    // ────────────────────────────────────────────────────────────────────
+    // Top-focus (M01 / M02): full ByteDance v1 audit pattern, mirroring
+    // the bottom-focus structure below. BASE label adapted to keep the
+    // upper-body placeholder AS-IS (geminiPaintTop pass-2 repaints it).
+    //
+    // M01 top-focus: 6 refs = matrix fullBodyFront (BASE) + fm.front
+    //   (FIT) + 2 front45 angles (FIT) + flat-front (FLAT) + matrix
+    //   silent anchor (empty label).
+    // M02 top-focus: 5-6 refs = matrix fullBodyBack (BASE) + fm.back
+    //   (GARMENT) + 2 back45 angles (GARMENT) + optional layeringRef
+    //   (LAYERING) + matrix silent anchor (empty label).
+    // ────────────────────────────────────────────────────────────────────
+    const BASE_LABEL_TOPFOCUS = isBack
+      ? 'BASE (Tier-2 model × shoe, full body back view). Authoritative source of truth for the rendered MODEL IDENTITY, body, pose, stance, hands, footwear, backdrop, lighting, framing, contact shadow. EVERY PIXEL OF THIS IMAGE IS PRESERVED EXCEPT the placeholder briefs / hot-pants area, which is REPLACED by the target trouser per IMAGES 2-4. The upper-body placeholder above the waistband (bare back / sports-bra back) is PRESERVED AS-IS — a later pipeline stage repaints it as the focus top. The model in this image is THE ONE MODEL rendered in the output — no other body, no second instance.'
+      : 'BASE (Tier-2 model × shoe, full body front view). Authoritative source of truth for the rendered MODEL IDENTITY, body, pose, stance, hands, footwear, backdrop, lighting, framing, contact shadow. EVERY PIXEL OF THIS IMAGE IS PRESERVED EXCEPT the placeholder briefs / hot-pants area, which is REPLACED by the target trouser per the garment refs. The upper-body placeholder above the waistband (sports bra / bare chest) is PRESERVED AS-IS — a later pipeline stage repaints it as the focus top. The model in this image is THE ONE MODEL rendered in the output — no other body, no second instance.';
+
+    if (isBack) {
+      const back45L = fm.back45Left || fm.back!;
+      const back45R = fm.back45Right || fm.back!;
+      const layeringRefUrl = (bottomItem.layeringRefBackUrl as string | undefined);
+      const layeringRefClean = layeringRefUrl ? layeringRefUrl.split('?')[0] : undefined;
+
+      const GARMENT_LABEL =
+        'GARMENT-ONLY REFERENCE (fit-model wearing the target trouser, back view angle). Authoritative source of truth for the trouser wash, base colour, fabric texture and finish, back-pocket construction, back-yoke / waistband construction, fly / closure visible on back, belt-loop spacing, hem treatment, overall silhouette shape and width progression. IGNORE this image\'s MODEL IDENTITY, SKIN, BODY PROPORTIONS, POSE, STANCE, LEGS, FEET, FOOTWEAR, BACKDROP, LIGHTING, and any garments above the waist. Those properties come from IMAGE 1 only.';
+      const LAYERING_LABEL =
+        'LAYERING REFERENCE (G-Star ECOM back-view photo, possibly different fit model + possibly different wash). Authoritative source of truth EXCLUSIVELY for the trouser-hem-to-shoe geometric relationship: where the hem meets the shoe (covers / rests on / ends above / rolled cuff above), pant-fabric-outside / shoe-inside layer order. IGNORE this image\'s MODEL IDENTITY, garment wash / colour / fabric / fit / length / pockets / any non-hem detail, BODY, POSE, LEGS, and BACKDROP. Use ONLY the hem-shoe geometry.';
+
+      refs = [
+        { url: matrixUrlCanonical, label: BASE_LABEL_TOPFOCUS },
+        { url: fm.back!,           label: GARMENT_LABEL },
+        { url: back45L,            label: GARMENT_LABEL },
+        { url: back45R,            label: GARMENT_LABEL },
+        ...(layeringRefClean ? [{ url: layeringRefClean, label: LAYERING_LABEL }] : []),
+        { url: matrixUrlCanonical, label: '' }, // silent anti-twin anchor
+      ];
+      if (!layeringRefClean) {
+        console.warn(`[matrixPaint] M02 top-focus ${bottomId} has no layeringRefBackUrl — running 5-ref fallback (4 named + 1 silent anchor).`);
+      } else {
+        console.log(`[matrixPaint] M02 top-focus layeringRef: ...${layeringRefClean.slice(-60)} (6 refs: 5 named + 1 silent anchor)`);
+      }
+    } else {
+      const m01FrontPrimary = fm.front || normalized.flatFrontUrl;
+      const m01Angles = [
+        fm.front45Left,
+        fm.front45Right,
+      ].filter((u): u is string => !!u);
+
+      const FIT_LABEL_M01 =
+        'GARMENT-ONLY REFERENCE (fit-model wearing the target trouser, front view). Authoritative source of truth for the trouser wash, base colour, fabric texture and finish, fly / button / closure, front-pocket geometry, rise, hem treatment, overall silhouette shape and width progression. IGNORE this image\'s MODEL IDENTITY, SKIN, BODY PROPORTIONS, POSE, STANCE, LEGS, FEET, FOOTWEAR, BACKDROP, LIGHTING, and any garments above the waist. Those come from IMAGE 1 only.';
+      const FLAT_LABEL_M01 =
+        'GARMENT FLAT (no body). Authoritative source for the trouser construction and graphic detail visible on a flat photo — wash variation, fly stitching, rivet placement, pocket bag visibility, hardware. IGNORE the orientation / fit / drape distortion of a flat layout; the body-on garment shape comes from the fit-model refs.';
+
+      refs = [
+        { url: matrixUrlCanonical, label: BASE_LABEL_TOPFOCUS },
+        { url: m01FrontPrimary, label: FIT_LABEL_M01 },
+        ...m01Angles.map(url => ({ url, label: FIT_LABEL_M01 })),
+        ...(normalized.flatFrontUrl && normalized.flatFrontUrl !== m01FrontPrimary
+          ? [{ url: normalized.flatFrontUrl, label: FLAT_LABEL_M01 }]
+          : []),
+        { url: matrixUrlCanonical, label: '' }, // silent anti-twin anchor
+      ];
+      console.log(`[matrixPaint] M01 top-focus: ${refs.length} refs (${refs.length - 1} named + 1 silent anchor)`);
+    }
   } else if (isBack) {
-    // M02 bottom-focus (rev 31, 2026-05-25): Tier-2 base + 3 back fit-model
-    // angles + per-garment ECOM layering ref. NO slot-6 silent anchor.
+    // M02 bottom-focus (rev 32, 2026-05-25): ByteDance v1 audit pattern
+    // restored. 5 named refs + 1 silent anchor = 6 refs total.
     //
-    // Slot 0 = Tier-2 (model×shoe) legsBack — model in target shoes,
-    //          placeholder briefs (to be replaced by Seedream paint).
-    // Slots 1-3 = 3 back fit-model angles (back, back45L, back45R) —
-    //          trouser identity / silhouette / construction authority.
-    // Slot 4 = wardrobe.layeringRefBackUrl — per-garment G-Star ECOM
-    //          back-view photo, used by the rev-31 prompt as the
-    //          EXCLUSIVE authority for hem ↔ shoe geometric relationship.
-    //          When the wardrobe item has no layeringRefBackUrl populated
-    //          (legacy items not yet backfilled), slot 4 is omitted — the
-    //          rev-31 prompt degrades gracefully to "no explicit hem ref".
+    // Slot 0 = Tier-2 (model × shoe) legsBack — body / pose / shoes / backdrop
+    //          authority. Placeholder briefs in this image are to be REPLACED.
+    // Slots 1-3 = 3 back fit-model angles (back, back45L, back45R) — garment-
+    //          only authority (wash, color, fabric, pockets, hem). Per-ref
+    //          OUT-scoping label tells the encoder to IGNORE these images'
+    //          fit-model body / pose / legs / footwear.
+    // Slot 4 = wardrobe.layeringRefBackUrl — exclusive authority for the
+    //          trouser-hem-to-shoe geometric relationship. Per-ref OUT-scoping
+    //          label restricts its contribution to JUST that relationship.
+    // Slot 5 = Tier-2 base AGAIN, EMPTY label — silent anti-twin anchor
+    //          (LEARNING #88). Empty label = excluded from inventory listing,
+    //          stays anonymous to the text encoder.
     //
-    // 2026-05-25 (rev 31): dropped the slot-6 silent Tier-2 anchor.
-    // Validation on Kate Boyfriend job CuRXwWG85vAUS7PTnM8y showed twin
-    // rate ~33% (1/3) WITH the anchor. The anchor was supposed to bias
-    // Seedream toward "one model = Tier-2 model" by duplication, but in
-    // practice Seedream still rendered a diptych in run 3. Replaced with
-    // explicit anti-twin language at the head of the rev-31 vault prompt
-    // (text-based hard constraint, not duplicate-ref soft hint).
-    //
-    // Missing back angles (back45L/R undefined) fall back to canonical
-    // back so the prompt's "3 angles" wording still has 3 images.
+    // Missing back angles (back45L/R undefined) fall back to canonical back
+    // so the prompt's "3 angles" wording still has 3 images. Missing
+    // layeringRefBackUrl drops slot 4 — degrades to 5 refs (4 named + 1
+    // silent anchor).
     const back45L = fm.back45Left || fm.back!;
     const back45R = fm.back45Right || fm.back!;
     const layeringRefUrl = (bottomItem.layeringRefBackUrl as string | undefined);
     const layeringRefClean = layeringRefUrl ? layeringRefUrl.split('?')[0] : undefined;
+
+    const BASE_LABEL =
+      'BASE (Tier-2 model × shoe, back view). Authoritative source of truth for the rendered MODEL IDENTITY, body, pose, stance, hands, footwear, backdrop, lighting, framing, contact shadow. EVERY PIXEL OF THIS IMAGE IS PRESERVED EXCEPT the placeholder briefs / hot-pants area, which is REPLACED by the target trouser per IMAGES 2-4. The model in this image is THE ONE MODEL rendered in the output — no other body, no second instance.';
+    const GARMENT_LABEL =
+      'GARMENT-ONLY REFERENCE (fit-model wearing the target trouser, back view angle). Authoritative source of truth for the trouser wash, base colour, fabric texture and finish, back-pocket construction, back-yoke / waistband construction, fly / closure visible on back, belt-loop spacing, hem treatment, overall silhouette shape and width progression. IGNORE this image\'s MODEL IDENTITY, SKIN, BODY PROPORTIONS, POSE, STANCE, LEGS, FEET, FOOTWEAR, BACKDROP, LIGHTING, and any garments above the waist. Those properties come from IMAGE 1 only.';
+    const LAYERING_LABEL =
+      'LAYERING REFERENCE (G-Star ECOM back-view photo, possibly different fit model + possibly different wash). Authoritative source of truth EXCLUSIVELY for the trouser-hem-to-shoe geometric relationship: where the hem meets the shoe (covers / rests on / ends above / rolled cuff above), pant-fabric-outside / shoe-inside layer order. IGNORE this image\'s MODEL IDENTITY, garment wash / colour / fabric / fit / length / pockets / any non-hem detail, BODY, POSE, LEGS, and BACKDROP. Use ONLY the hem-shoe geometry.';
+
     refs = [
-      { url: matrixUrlCanonical, label: '' },
-      { url: fm.back!, label: '' },
-      { url: back45L, label: '' },
-      { url: back45R, label: '' },
-      ...(layeringRefClean ? [{ url: layeringRefClean, label: '' }] : []),
+      { url: matrixUrlCanonical, label: BASE_LABEL },
+      { url: fm.back!,           label: GARMENT_LABEL },
+      { url: back45L,            label: GARMENT_LABEL },
+      { url: back45R,            label: GARMENT_LABEL },
+      ...(layeringRefClean ? [{ url: layeringRefClean, label: LAYERING_LABEL }] : []),
+      { url: matrixUrlCanonical, label: '' }, // silent anti-twin anchor — empty label keeps it out of inventory
     ];
     if (!layeringRefClean) {
-      console.warn(`[matrixPaint] M02 bottom ${bottomId} has no layeringRefBackUrl — running 4-ref fallback. Re-run scripts/backfill-layering-refs.ts to populate.`);
+      console.warn(`[matrixPaint] M02 bottom ${bottomId} has no layeringRefBackUrl — running 5-ref fallback (4 named + 1 silent anchor). Re-run scripts/backfill-layering-refs.ts to populate.`);
     } else {
-      console.log(`[matrixPaint] M02 layeringRef: ...${layeringRefClean.slice(-60)}`);
+      console.log(`[matrixPaint] M02 layeringRef: ...${layeringRefClean.slice(-60)} (6 refs: 5 named + 1 silent anchor)`);
     }
   } else {
     // M01 (front, bottom-focus): Tier-2 matrix base + multi-front garment refs.
@@ -565,20 +678,34 @@ export async function matrixPaint(params: MatrixPaintParams): Promise<MatrixPain
     //
     // No Gemini shoe step — front view doesn't have the back-view
     // pant-over-shoe layering problem (toes-toward-camera renders cleanly).
-    // The M01 vault rev 23 prompt is unchanged.
+    //
+    // 2026-05-25: ByteDance v1 audit pattern restored on M01 too. Per-ref
+    // OUT-scoping labels + silent anti-twin anchor at the last slot. The
+    // M01 twin-bug regression test on F1+Midge (DEPLOYMENT_LOG line 212)
+    // confirmed 3/3 single model with this pattern even at 3+ refs.
     const m01FrontPrimary = fm.front || normalized.flatFrontUrl;
     const m01Angles = [
       fm.front45Left,
       fm.front45Right,
     ].filter((u): u is string => !!u);
-    refs = [
-      { url: matrixUrlCanonical, label: '' },
-      { url: m01FrontPrimary, label: '' },
-      ...m01Angles.map(url => ({ url, label: '' })),
+
+    const BASE_LABEL_M01 =
+      'BASE (Tier-2 model × shoe, front view). Authoritative source of truth for the rendered MODEL IDENTITY, body, pose, stance, hands, footwear, backdrop, lighting, framing, contact shadow. EVERY PIXEL OF THIS IMAGE IS PRESERVED EXCEPT the placeholder briefs / hot-pants area, which is REPLACED by the target trouser per the garment refs. The model in this image is THE ONE MODEL rendered in the output — no other body, no second instance.';
+    const FIT_LABEL_M01 =
+      'GARMENT-ONLY REFERENCE (fit-model wearing the target trouser, front view). Authoritative source of truth for the trouser wash, base colour, fabric texture and finish, fly / button / closure, front-pocket geometry, rise, hem treatment, overall silhouette shape and width progression. IGNORE this image\'s MODEL IDENTITY, SKIN, BODY PROPORTIONS, POSE, STANCE, LEGS, FEET, FOOTWEAR, BACKDROP, LIGHTING, and any garments above the waist. Those come from IMAGE 1 only.';
+    const FLAT_LABEL_M01 =
+      'GARMENT FLAT (no body). Authoritative source for the trouser construction and graphic detail visible on a flat photo — wash variation, fly stitching, rivet placement, pocket bag visibility, hardware. IGNORE the orientation / fit / drape distortion of a flat layout; the body-on garment shape comes from the fit-model refs.';
+
+    const m01Refs: Array<{ url: string; label: string }> = [
+      { url: matrixUrlCanonical, label: BASE_LABEL_M01 },
+      { url: m01FrontPrimary, label: FIT_LABEL_M01 },
+      ...m01Angles.map(url => ({ url, label: FIT_LABEL_M01 })),
       ...(normalized.flatFrontUrl && normalized.flatFrontUrl !== m01FrontPrimary
-        ? [{ url: normalized.flatFrontUrl, label: '' }]
+        ? [{ url: normalized.flatFrontUrl, label: FLAT_LABEL_M01 }]
         : []),
+      { url: matrixUrlCanonical, label: '' }, // silent anti-twin anchor
     ];
+    refs = m01Refs;
   }
 
   // Bottom-focus (the common path): load the prompt from the vault so
@@ -611,6 +738,14 @@ export async function matrixPaint(params: MatrixPaintParams): Promise<MatrixPain
     referenceImages: refs,
     aspectRatio: '1:1',
     apiKey: seedreamApiKey,
+    // forceInventory: deliver per-ref OUT-scoping labels to Seedream as a
+    // REFERENCE IMAGE INVENTORY block in the prompt. Required for the
+    // ByteDance v1 anti-twin pattern (LEARNING #89 + #101). 2026-05-25:
+    // enabled for top-focus too — now that top-focus pass-1 uses the same
+    // multi-ref TIER structure as bottom-focus, the inventory block must
+    // deliver the OUT-scoping labels (otherwise per-ref OUT-scoping is
+    // logging-only and the multi-ref ambiguity returns).
+    forceInventory: true,
   });
 
   let painted: Buffer = seedreamResult.imageData;
