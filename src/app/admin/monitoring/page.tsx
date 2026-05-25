@@ -112,9 +112,17 @@ export default function MonitoringPage() {
   }
 
   const s = data!.summary;
-  const workerHbTone: 'good' | 'warn' | 'bad' = s.workerHeartbeatAgeMinutes == null
-    ? 'warn'
-    : s.workerHeartbeatAgeMinutes <= 2 ? 'good' : s.workerHeartbeatAgeMinutes <= 5 ? 'warn' : 'bad';
+  // Heartbeat tone is mode-aware (2026-05-14). In job/tasks modes the worker
+  // is a short-lived Cloud Run Job that exits cleanly between batches —
+  // heartbeat-age in those modes measures "time since last batch ran", not
+  // "is the worker alive". Showing it red was misleading. Treat it as a
+  // neutral status indicator in those modes.
+  const workerHbTone: 'good' | 'warn' | 'bad' | 'neutral' =
+    s.workerMode !== 'inproc'
+      ? 'neutral'
+      : s.workerHeartbeatAgeMinutes == null
+        ? 'warn'
+        : s.workerHeartbeatAgeMinutes <= 2 ? 'good' : s.workerHeartbeatAgeMinutes <= 5 ? 'warn' : 'bad';
 
   return (
     <Shell>

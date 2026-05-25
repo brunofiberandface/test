@@ -41,34 +41,27 @@ export interface TeeEditResult {
   error?: string;
 }
 
-/** Shot types that should get tee-edit treatment.
+/** Shot types that get tee-edit treatment.
  *
- * M01/M02 are crops of M03/M04 (which are already tee-edited) — re-running
- * tee-edit on them would double-paint the top. M03/M04/M06 are full Seedream
- * generations rendered with a sports bra; they need the real top painted in.
+ * - M01/M02: only when focus = 'top'. Matrix-paint with top focus starts
+ *   from the Tier-2 fullBody view (which always has the sports-bra /
+ *   bare-chest placeholder, regardless of which slot is the focus), so the
+ *   top needs painting before the upper-body crop is taken. Matrix-paint
+ *   calls applyTeeEdit directly with focusSlot=undefined so the "skip on
+ *   top-focus" gate below doesn't fire.
+ * - M06: Seedream-rendered free-pose full-body with sports-bra placeholder.
+ *   focusSlot='top' still skips (focus jacket painted by Seedream directly).
  *
- * M05 (Pocket Detail) was originally excluded under the assumption that its
- * back-pocket close-up crop wouldn't show the upper body. In practice the M05
- * Seedream output renders a noticeable portion of the lower back / waistline /
- * shoulders, and Seedream regenerates the upper body WITHOUT the tee even
- * when given the post-tee-edit M03/M04 anchors as references (Seedream weighs
- * fit-model photos more heavily than anchor photos for outfit info, and the
- * fit-model photos for tops are taken without the tee yet). Result:
- * topless-above-waist M05 outputs (Bruno 2026-05-07: JwkvmgkVxUIkHGATlsyG +
- * aMKyujUYcQILzPjlQ9Mv). Adding M05 to this set so tee-edit also runs on it.
+ * M03/M04 retired. M05 (back-pocket close-up) renders the tee correctly
+ * natively from Seedream — tee-edit was reframing M05 to standard back view
+ * (Bruno-approved skip, 2026-05-11).
  */
-// 2026-05-11: removed M05. The rev 32 prompt + Track A cropped refs lets
-// Seedream render the tee correctly natively (validated H6Is/F9). Tee-edit's
-// re-render was reframing M05 to standard back view, defeating the tight
-// low-angle crop. Bruno-approved: ship Seedream-only output for M05.
-const TEE_EDIT_SHOTS: Set<ShotType> = new Set(['M03', 'M04', 'M06']);
+const TEE_EDIT_SHOTS: Set<ShotType> = new Set(['M01', 'M02', 'M06']);
 
-/** Aspect ratios per shot type */
+/** Aspect ratios per shot type. */
 const ASPECT_RATIOS: Record<string, string> = {
-  M01: '3:4',
-  M02: '3:4',
-  M03: '3:4',
-  M04: '3:4',
+  M01: '1:1',
+  M02: '1:1',
   M06: '3:4',
 };
 
@@ -100,60 +93,12 @@ export function needsTeeEdit(shotType: ShotType, seedreamModel?: string, focusSl
 /**
  * Build the V2 "layered under waistband" edit prompt.
  * This prompt was validated across 20+ style variants.
+ *
+ * Called for M01/M06 (front view) and M02 (back view) — matrix-paint
+ * top-focus + the M06 free-pose.
  */
 function buildEditPrompt(topDescription: string, shotType: ShotType): string {
-  // M06 is the free-pose front shot (mostly front-facing archetypes per the
-  // G-Star vault). Treat as 'front' view for tee-edit.
-  const view = shotType === 'M01' || shotType === 'M03' || shotType === 'M06' ? 'front' : 'back';
-
-  // M05 — STRICT FRAMING LOCK
-  // The default tee-edit prompt below tells Gemini "the top covers the entire
-  // torso from shoulders to below the waistband" — accurate for M03/M04
-  // (full-body) but WRONG for M05 (tight low-angle close-up where only a
-  // sliver of tee is visible above the waistband, no shoulders, no head).
-  // Gemini sees "shoulders to waistband torso" + "back view" and re-renders
-  // the entire image at standard back-view framing, destroying M05's
-  // low-camera buttock-central composition.
-  //
-  // M05-specific prompt: tell Gemini explicitly this is a tight low-angle
-  // close-up, only paint the bare-skin slice above the waistband, preserve
-  // everything else byte-equivalent. Validated 2026-05-11 against the
-  // H6Is/F9 fixture — preserves framing perfectly while painting the tee
-  // slice cleanly tucked into the jeans waistband.
-  if (shotType === 'M05') {
-    return `This is a TIGHT M05 PRODUCT CLOSE-UP. The SOURCE IMAGE shows a low-angle close-up of a model's back-hip / buttock area, with the camera positioned BELOW the buttock looking UPWARD. The framing is intentionally tight — buttock dominates the central composition, top of frame shows a sliver of bare back/skin above the waistband, bottom of frame is mid-thigh.
-
-═══ ABSOLUTELY CRITICAL: FRAMING LOCK ═══
-DO NOT REFRAME. DO NOT ZOOM OUT. DO NOT change the camera angle. DO NOT render a standard back view. The output frame MUST be byte-equivalent to the source image's framing:
-- Camera height: same (low, below buttock)
-- Camera angle: same (tilted upward looking at buttock)
-- Crop: same (waist-to-mid-thigh, buttock-central)
-- Body pose: same (three-quarter rotation, right hip forward)
-- Body orientation: same
-- Background: same studio backdrop
-- Model identity: same skin tone, same body shape, same proportions
-- Jeans: same color, wash, fit, pocket geometry, hem position
-- Everything below the waistband: BYTE-IDENTICAL to the source image
-
-═══ THE ONLY CHANGE ═══
-At the TOP of the frame (above the jeans waistband), there is currently a small slice of bare back skin visible. PAINT THAT BARE SKIN STRIP with the bottom edge of this top:
-
-${topDescription}
-
-The top is tucked into the jeans. Only the BOTTOM EDGE of the top is visible in this tight crop — the bottom hem of the tee disappears under the waistband. From the camera's view, we see the tee fabric going from the top edge of the frame down to where the jeans waistband begins. That's it. NO full tee visible. NO shoulders visible. NO arms visible. NO head visible. NO neckline visible.
-
-The visible portion of the tee is roughly the top 15-25% of the frame, from the top edge down to the jeans waistband. Match the tee's color, fabric, and texture from the TOP REFERENCE image.
-
-═══ WHAT NOT TO DO ═══
-- DO NOT render a full back view of the model wearing the tee.
-- DO NOT reframe to chest-height or eye-level camera.
-- DO NOT make the model stand straight up.
-- DO NOT change the buttock-central composition.
-- DO NOT add shoulders, arms, head, or neck.
-- DO NOT change the jeans or the buttock area.
-
-ONLY the bare-skin slice at the TOP of the source image becomes a slice of tee fabric. Everything else is preserved byte-equivalent.`;
-  }
+  const view = shotType === 'M02' ? 'back' : 'front';
 
   return `Edit this e-commerce studio photo. The model is currently wearing a simple black sports bra. Replace it with the top shown in the reference image.
 
@@ -224,16 +169,12 @@ export async function applyTeeEdit(params: TeeEditParams): Promise<TeeEditResult
     }
   }
 
-  // Get flat top reference image URL
+  // Get flat top reference image URL. M01/M06 are front; M02 is back. Prefer
+  // the matching-side flat, then fit-model angle, then any other image (Bruno
+  // 2026-05-07: jobs were skipping tee-edit when wardrobe tops only had
+  // fit-model angles, no flats — QcR5jfsRfznRpagzz1LN).
   const normalized = normalizeWardrobeItem(topItem);
-  // M06 is the free-pose front shot (mostly front-facing archetypes per the
-  // G-Star vault). M05 is the back-pocket close-up (back view). Treat the rest
-  // of the front/back assignments per the shot-type convention.
-  const view = shotType === 'M01' || shotType === 'M03' || shotType === 'M06' ? 'front' : 'back';
-  // Fall back order (Bruno 2026-05-07: jobs were skipping tee-edit when wardrobe
-  // tops only had fit-model angles, no flats — QcR5jfsRfznRpagzz1LN).
-  // Try flats first (cleanest for Gemini to read), then fit-model angles
-  // (still show the garment, just on a body), then any other image.
+  const view = shotType === 'M02' ? 'back' : 'front';
   const flatUrl = view === 'front'
     ? (normalized?.flatFrontUrl || topItem.flatFrontUrl || topItem.flatImageUrl
         || normalized?.fitModels?.front || topItem.fitModels?.front

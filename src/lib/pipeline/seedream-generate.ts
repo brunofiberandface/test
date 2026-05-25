@@ -61,8 +61,12 @@ export interface SeedreamGenerationContext {
   wardrobe: JobWardrobe;
   modelId: string;
   silhouette: { front: string; back: string };
-  m03AnchorUrl?: string;
-  m04AnchorUrl?: string;
+  /** URL of the just-rendered M02 (matrix-painted cropped back) image. Used as
+   *  the slot-0 anchor ref for bottom-focus M05 — the painted-back view is the
+   *  dominant visual reference for the back-pocket close-up. Set by route.ts
+   *  from job.m02AnchorUrl after M02 completes. Absent on the first M02 render
+   *  itself (M05 deps on M02 so this is always set by the time M05 runs). */
+  m02AnchorUrl?: string;
   apiKey?: string; // BytePlus API key override; falls back to env
   /** Optional Seedream model override. Defaults to SEEDREAM_MODEL env var or
    *  'seedream-4-5-251128'. Use 'seedream-5-0-260128' to call 5.0 Lite. */
@@ -119,23 +123,30 @@ async function refFromUrl(url: string, label: string): Promise<SeedreamReference
 }
 
 /**
- * M05 SMART-CROP HELPER (added 2026-05-11 with Track A).
+ * SMART-CROP HELPER (originally M05-only 2026-05-11, generalized 2026-05-13).
  *
  * Downloads `sourceUrl`, crops to vertical band [fromPct, toPct], uploads to
  * GCS at a content-addressed path, returns the cropped URL. Re-uses an
  * existing cropped object if already cached.
  *
- * Why: M05 framing was being dominated by the full-body model card + fit-model
+ * Why: ref framing was being dominated by the full-body model card + fit-model
  * refs (visual evidence > text instructions per LEARNING #89). Cropping these
- * refs to just the hip/buttock zone BEFORE Seedream sees them aligns the
+ * refs to just the relevant zone BEFORE Seedream sees them aligns the
  * visual + text signals — Seedream renders tight when refs are tight.
  *
- * Per-ref crops (validated against H6Is/F9):
- *   MODEL CARD BACK     → vertical 5-30%  (head/shoulders only — skin tone,
+ * Per-ref crops in production:
+ *   MODEL CARD FRONT    → vertical 0-30%  (M03 head/shoulders identity anchor
+ *                                          — counters fit-model identity bleed
+ *                                          when 3 fit-model angles outvote the
+ *                                          single full-body model card)
+ *   MODEL CARD BACK     → vertical 5-30%  (M05 head/shoulders — skin tone,
  *                                          NO compression-shorts styling)
- *   FIT MODEL BACK 45°  → vertical 25-60% (hip/buttock — garment + framing)
+ *   FIT MODEL BACK 45°  → vertical 25-60% (M05 hip/buttock — garment + framing)
  *
- * Cache: GCS path m05-cropped-refs/{sha1(sourceUrl|from|to)}.jpg
+ * Cache: GCS path cropped-refs/{sha1(sourceUrl|from|to)}.jpg. Renamed from
+ * m05-cropped-refs/ on 2026-05-13 when M03 started using the same helper —
+ * existing M05 cache entries remain valid under the old path; new entries go
+ * to the unified path. Both paths are read-only references by Seedream.
  */
 async function cropAndCacheRef(
   sourceUrl: string,
@@ -148,7 +159,7 @@ async function cropAndCacheRef(
 
   const clean = sourceUrl.split('?')[0];
   const key = crypto.createHash('sha1').update(`${clean}|${fromPct}|${toPct}`).digest('hex');
-  const gcsPath = `m05-cropped-refs/${key}.jpg`;
+  const gcsPath = `cropped-refs/${key}.jpg`;
   const publicUrl = `https://storage.googleapis.com/gstar-ai-studio-assets/${gcsPath}`;
 
   const storage = new Storage();
@@ -417,244 +428,8 @@ async function buildPrompt(prompt: LoadedPrompt, wardrobe: JobWardrobe, modelId:
   return finalPrompt;
 }
 
-// ── M03 — Full body front ──────────────────────────────────────────────
-async function seedreamM03(ctx: SeedreamGenerationContext, prompt: LoadedPrompt): Promise<SeedreamGenerationResult> {
-  const { angles: bottomAngles, flat: bottomFlat, item: focusItem } = await getFocusGarmentUrls(ctx.wardrobe, 'front');
-  const model = await getModel(ctx.modelId) as any;
-  const modelRefUrl = model?.referenceImageUrl || model?.cardImageUrl;
-  if (!modelRefUrl) throw new Error(`Model reference image not found for ${ctx.modelId}`);
+// ── M01/M02/M03/M04 retired 2026-05-17 — see matrix-paint.ts. ────────
 
-  const refs: SeedreamReferenceImage[] = [];
-  // Backdrop FIRST — most prominent slot.
-  refs.push(await refFromUrl(STUDIO_BACKDROP_URL, STUDIO_BACKDROP_LABEL));
-  refs.push(await refFromUrl(modelRefUrl, 'MODEL CARD (FRONT) — canonical, exclusive source of truth for the model\'s identity. Match the model shown in this card identically: every facial feature (eye shape, eye color, nose, mouth, brow shape), the natural facial expression and presence as captured here, skin tone with undertone, freckle pattern, hair color and texture, body proportions. The face and expression in this card are exactly correct — preserve them precisely when the model\'s face is rendered. Lighting on the rendered model is neutral — do not transfer warm key lighting from any other reference. STANCE, FOOT POSITION, HIP TILT, WEIGHT DISTRIBUTION, AND BODY POSE are NOT taken from this card — those come from the FIT MODEL angles. Do not copy the contrapposto, single-leg-weight, or any asymmetric stance shown in this card image.'));
-
-  if (ctx.focusSlot === 'top') {
-    // FOCUS — top garment refs. Without these, Seedream has no visual anchor
-    // for the focus jacket and renders the hem / sleeves / closures from
-    // text alone (00472 deploy bug — Bruno feedback May 10). Add top refs
-    // BEFORE bottom so the focus garment gets primary visual weight.
-    // Per Bruno: focus garment must always have flat + all 3 fit-model angles.
-    const top = await getTopGarmentUrls(ctx.wardrobe, 'front');
-    if (top?.flat) {
-      refs.push(await refFromUrl(top.flat, 'FOCUS TOP FLAT (FRONT) — exclusive source of truth for the focus top\'s color, fabric, length, hem position relative to the waist, closure type, sleeves, pockets, and branding details. Render the focus top exactly as shown in this flat — every detail.'));
-    }
-    const topAnglesToInclude = (top?.angles ?? []).slice(0, 3);
-    for (let i = 0; i < topAnglesToInclude.length; i++) {
-      refs.push(await refFromUrl(topAnglesToInclude[i], `FOCUS TOP FIT MODEL FRONT ANGLE ${i + 1} — focus garment on a fit model. Use ONLY for the focus top's fit, drape, hem behaviour, sleeve length and how the top sits on the body. SKIN TONE, COMPLEXION, IDENTITY, BACKDROP, FLOOR, and any garments worn below the waist are NOT taken from this image.`));
-    }
-    // Styling bottom — full visual ref set (flat + 3 angles) so jeans wash
-    // and fit are anchored visually, matching what bottom-focus jobs get.
-    // M03 has plenty of headroom: 1 backdrop + 1 model + 4 top + 4 bottom = 10
-    // refs at the BytePlus limit, so we keep all 4 bottom refs.
-    refs.push(await refFromUrl(bottomFlat, 'STYLING BOTTOM FLAT — the styling bottom (pants/jeans) for color, wash, fabric, fit. Not the focus garment — render accurately in support of the focus top, no extra detail or invented hardware.'));
-    for (let i = 0; i < bottomAngles.length; i++) {
-      refs.push(await refFromUrl(bottomAngles[i], `STYLING BOTTOM FIT MODEL FRONT ANGLE ${i + 1} — the styling bottom (pants/jeans) on a fit model for fit, drape, length, wash. SKIN TONE, COMPLEXION, IDENTITY, BACKDROP, KEY-LIGHT COLOR, and the top half of the outfit are NOT taken from this image.`));
-    }
-  } else {
-    // BOTTOM-FOCUS (default) — bottom is the hero, full ref set.
-    refs.push(await refFromUrl(bottomFlat, 'Garment Flat Front'));
-    for (let i = 0; i < bottomAngles.length; i++) {
-      refs.push(await refFromUrl(bottomAngles[i], `Fit Model Front Angle ${i + 1} — primary garment-fit AND STANCE reference. Use this image for: garment shape, fit, hem behavior, stitching, silhouette, AND THE MODEL'S STANCE — match the exact stance shown in THIS fit-model photo. Both legs drop STRAIGHT DOWN vertically from hip to floor (no outward angle from hip to ankle, legs do NOT widen or splay outward at the feet beyond the hip line), feet planted flat on the floor parallel to each other with approximately ONE FOOT-WIDTH of clear space between the inner edges of the two feet — i.e. the gap between the inner side of the left foot and the inner side of the right foot equals roughly the WIDTH (NOT the length) of one shoe (~10cm for an adult — narrow gap, feet near each other but not touching). NOT touching / sole-to-sole. NOT wider than hip-width. NOT crossed. NOT one foot in front of the other, weight 50/50 across both feet, hips centered and level (NO hip tilt, NO contrapposto, NO weight shift onto one leg), arms relaxed at the sides. SKIN TONE, COMPLEXION, BLUSH, UNDERTONE, KEY-LIGHT COLOR, AND BODY IDENTITY ARE NOT TAKEN FROM THIS IMAGE. The studio key light in this photo has its own particular color rendering — do not transfer it onto the rendered model or fabrics.`));
-    }
-  }
-  refs.push(...(await getStylingRefs(ctx.wardrobe, 'front', ctx.focusSlot)));
-
-  const finalPrompt = await buildPrompt(prompt, ctx.wardrobe, ctx.modelId, focusItem, 'front', ctx.silhouette, false, 'M03', ctx.model, ctx.focusSlot);
-  console.log(`[Seedream] M03: ${refs.length} refs (backdrop=slot 0, focus=${ctx.focusSlot || 'none'})`);
-
-  return generateSeedreamImage({
-    prompt: finalPrompt,
-    referenceImages: refs,
-    aspectRatio: (prompt.aspectOverride || APP_CONFIG.shots.M03.aspect) as '9:16' | '3:4' | '1:1',
-    apiKey: ctx.apiKey,
-    model: ctx.model,
-  });
-}
-
-// ── M04 — Full body back ───────────────────────────────────────────────
-//
-// 2026-05-08: Switched to TWO-PASS architecture (see seedream-twopass.ts).
-// Pass 1 renders model + sports bra + briefs + shoes (no jeans) as a base.
-// Pass 2 paints the jeans with a simple Bruno-locked prompt that gets the
-// hem-over-shoes interaction right (jeans cascade past tall boots to floor,
-// jeans drape naturally over sneakers — never resting "on top" of shoes).
-// The existing Gemini tee-edit step (in route.ts) runs after Pass 2 to paint
-// the actual top tucked into the waistband.
-//
-// M03/M06 keep the original single-pass path below (front-view two-pass had
-// inconsistent results in testing 2026-05-07).
-async function seedreamM04(ctx: SeedreamGenerationContext, prompt: LoadedPrompt): Promise<SeedreamGenerationResult> {
-  // Top-focus jobs (e.g. denim jacket as the hero) bypass the two-pass path.
-  // Two-pass is built around painting the bottom as the hero garment (Pass 1
-  // = bare-legs base, Pass 2 = paint jeans). When the top is the focus, we
-  // need the focus garment painted directly with full ref labels and the
-  // jacket-aware buildPrompt() — that's what the single-pass path does. The
-  // legacy single-pass also keeps the M04 prompt-vault entry as the source
-  // of truth for the back-view shot, which the two-pass dispatcher does not.
-  if (ctx.focusSlot === 'top') {
-    console.log(`[Seedream] M04: focus=top → routing through single-pass legacy path (skipping two-pass)`);
-    return seedreamM04SinglePass(ctx, prompt);
-  }
-
-  // Debug tag for Pass 1 intermediate filename — uses the BOTTOM (pants)
-  // designNumber so the debug folder reflects the actual garment being
-  // rendered (focus-based naming was misleading when focus was a top).
-  const bottomConfig = ctx.wardrobe['bottom' as keyof JobWardrobe];
-  const bottomItem = bottomConfig?.itemId ? await getWardrobeItem(bottomConfig.itemId) as any : null;
-  const debugTag = `${bottomItem?.designNumber || 'unknown'}_${ctx.modelId}_${Date.now()}`;
-
-  const { seedreamM04TwoPass } = await import('./seedream-twopass');
-  const out = await seedreamM04TwoPass({
-    wardrobe: ctx.wardrobe,
-    modelId: ctx.modelId,
-    apiKey: ctx.apiKey,
-    jobName: 'twopass',
-    shotTag: debugTag,
-  });
-  return { imageData: out.imageData, mimeType: out.mimeType };
-}
-
-// ── Legacy single-pass M04 kept for reference / fallback ───────────────────
-// Not currently called. Restore to seedreamM04 if two-pass needs to be rolled
-// back. (Renamed to seedreamM04SinglePass; keep the body intact.)
-async function seedreamM04SinglePass(ctx: SeedreamGenerationContext, prompt: LoadedPrompt): Promise<SeedreamGenerationResult> {
-  const { angles: bottomAngles, flat: bottomFlat, item: focusItem } = await getFocusGarmentUrls(ctx.wardrobe, 'back');
-  const model = await getModel(ctx.modelId) as any;
-  const modelRefUrl = model?.referenceImageUrl || model?.cardImageUrl;
-  if (!modelRefUrl) throw new Error(`Model reference image not found for ${ctx.modelId}`);
-  const backRefUrl = model?.backReferenceImageUrl;
-
-  const refs: SeedreamReferenceImage[] = [];
-  // Backdrop FIRST — see comment in seedreamM03 for rationale.
-  refs.push(await refFromUrl(STUDIO_BACKDROP_URL, STUDIO_BACKDROP_LABEL));
-  if (backRefUrl) {
-    refs.push(await refFromUrl(backRefUrl, 'MODEL CARD (BACK) — canonical, exclusive source of truth for the model\'s back-view identity. Match the model shown in this card identically: hair color and texture (back-view detail), skin tone with undertone, freckle pattern, body proportions, presence as captured here. Render the back of the model exactly as shown in this card. Lighting on the rendered model is neutral — do not transfer warm key lighting from any other reference. STANCE, FOOT POSITION, HIP TILT, WEIGHT DISTRIBUTION, AND BODY POSE are NOT taken from this card — those come from the FIT MODEL back angles. Do not copy any asymmetric or contrapposto stance shown in this card image.'));
-    refs.push(await refFromUrl(modelRefUrl, 'MODEL CARD (FRONT) — canonical, exclusive source of truth for the model\'s identity. Match the model shown in this card identically: every facial feature (eye shape, eye color, nose, mouth, brow shape), the natural facial expression and presence as captured here, skin tone with undertone, freckle pattern, hair color and texture, body proportions. The face and expression in this card are exactly correct — preserve them precisely when the model\'s face is rendered. Lighting on the rendered model is neutral — do not transfer warm key lighting from any other reference. STANCE, FOOT POSITION, HIP TILT, WEIGHT DISTRIBUTION, AND BODY POSE are NOT taken from this card — those come from the FIT MODEL angles. Do not copy the contrapposto, single-leg-weight, or any asymmetric stance shown in this card image.'));
-  } else {
-    refs.push(await refFromUrl(modelRefUrl, 'MODEL CARD (FRONT) — canonical, exclusive source of truth for the model\'s identity. Match the model shown in this card identically: every facial feature (eye shape, eye color, nose, mouth, brow shape), the natural facial expression and presence as captured here, skin tone with undertone, freckle pattern, hair color and texture, body proportions. The face and expression in this card are exactly correct — preserve them precisely when the model\'s face is rendered. Lighting on the rendered model is neutral — do not transfer warm key lighting from any other reference. STANCE, FOOT POSITION, HIP TILT, WEIGHT DISTRIBUTION, AND BODY POSE are NOT taken from this card — those come from the FIT MODEL angles. Do not copy the contrapposto, single-leg-weight, or any asymmetric stance shown in this card image.'));
-  }
-
-  if (ctx.focusSlot === 'top') {
-    // FOCUS — top garment back-view refs. Without these, Seedream has no
-    // back-view visual anchor for the focus jacket and renders the front of
-    // the jacket facing the camera (00472 bug — Bruno feedback May 10).
-    // Per Bruno: focus garment must always have flat + all 3 fit-model angles.
-    const top = await getTopGarmentUrls(ctx.wardrobe, 'back');
-    if (top?.flat) {
-      refs.push(await refFromUrl(top.flat, 'FOCUS TOP FLAT (BACK) — exclusive source of truth for the focus top\'s back-panel construction: back fabric, seam lines, yoke (if any), back-panel pockets, hood/collar back, branding label position, and hem position relative to the waist. Render the back of the focus top exactly as shown — every detail. Use the front-flat fallback only as a colour reference if a true back flat is not in the ref set.'));
-    }
-    const topAnglesToInclude = (top?.angles ?? []).slice(0, 3);
-    for (let i = 0; i < topAnglesToInclude.length; i++) {
-      refs.push(await refFromUrl(topAnglesToInclude[i], `FOCUS TOP FIT MODEL BACK ANGLE ${i + 1} — focus garment on a fit model from the back. Use ONLY for the focus top's back-side fit, drape, hem behaviour, sleeve back, how the top sits over the back of the body. SKIN TONE, COMPLEXION, IDENTITY, BACKDROP, FLOOR, and any garments worn below the waist are NOT taken from this image.`));
-    }
-    // Styling bottom — flat + 2 angles (drop 1 back angle to fit budget).
-    // M04 budget: 1 backdrop + 2 models + 4 top + 3 bottom + 0 leather = 10.
-    // Bruno: keep all 3 focus angles + flat; bottom takes the trim.
-    refs.push(await refFromUrl(bottomFlat, 'STYLING BOTTOM FLAT — the styling bottom (pants/jeans) for color, wash, fabric, fit. Not the focus garment — render accurately in support of the focus top, no extra detail or invented hardware.'));
-    const bottomAnglesToInclude = bottomAngles.slice(0, 2);
-    for (let i = 0; i < bottomAnglesToInclude.length; i++) {
-      refs.push(await refFromUrl(bottomAnglesToInclude[i], `STYLING BOTTOM FIT MODEL BACK ANGLE ${i + 1} — the styling bottom (pants/jeans) on a fit model from behind for fit, drape, length, hem-to-shoes interaction. SKIN TONE, COMPLEXION, IDENTITY, BACKDROP, KEY-LIGHT COLOR, and the top half of the outfit are NOT taken from this image.`));
-    }
-  } else {
-    // BOTTOM-FOCUS (default) — bottom is the hero, full ref set.
-    refs.push(await refFromUrl(bottomFlat, 'Garment Flat Back'));
-    for (let i = 0; i < bottomAngles.length; i++) {
-      refs.push(await refFromUrl(bottomAngles[i], `Fit Model Back Angle ${i + 1} — primary garment-fit AND STANCE reference. Use this image for: garment shape, fit, hem behavior, stitching, silhouette, AND THE MODEL'S STANCE — match the exact stance shown in THIS fit-model photo (back view). Both legs drop STRAIGHT DOWN vertically from hip to floor (no outward angle from hip to ankle, legs do NOT widen or splay outward at the feet beyond the hip line), feet planted flat on the floor parallel to each other with approximately ONE FOOT-WIDTH of clear space between the inner edges of the two feet — i.e. the gap between the inner side of the left foot and the inner side of the right foot equals roughly the WIDTH (NOT the length) of one shoe (~10cm for an adult — narrow gap, feet near each other but not touching). NOT touching / sole-to-sole. NOT wider than hip-width. NOT crossed. NOT one foot in front of the other, weight 50/50 across both feet, hips centered and level (NO hip tilt, NO contrapposto, NO weight shift onto one leg), arms relaxed at the sides. SKIN TONE, COMPLEXION, BLUSH, UNDERTONE, KEY-LIGHT COLOR, AND BODY IDENTITY ARE NOT TAKEN FROM THIS IMAGE. The studio key light in this photo has its own particular color rendering — do not transfer it onto the rendered model or fabrics.`));
-    }
-  }
-  // M04 rev 28.1: shoes ref restored. Rev 26 had removed it because that prompt
-  // said "shoes hidden behind cascading hem" and the visual ref pulled Seedream
-  // toward visible-shoes (shelf-on-shoe). Rev 28.1 drops the anti-shoes prompt
-  // language and defers footwear behavior to the per-garment {silhouette} —
-  // the visual ref is now consistent with the prompt's "matching the shoes
-  // reference imagery exactly" instruction and helps Seedream render the
-  // wardrobe's specific shoe shape and color faithfully.
-  refs.push(...(await getStylingRefs(ctx.wardrobe, 'back', ctx.focusSlot)));
-
-  // Inject leather + pocket label images as additional Seedance references
-  // via the labelAssets template library (alpha-masked PNGs in GCS). Falls
-  // back to legacy leatherLabelImageUrl when no template is set. Same
-  // pattern as M05 — visual refs make Seedance render the actual label
-  // appearance (shape, embossed lettering, color) accurately rather than
-  // letting it invent from text alone. M02 inherits this fidelity because
-  // it's a waist-line crop of M04.
-  //
-  // Skipped on top-focus: the leather brand patch is on the JEANS waistband,
-  // which is supporting context for a jacket-focus shot. Including the label
-  // ref would burn a 10-ref budget slot on a non-hero detail (when we already
-  // dropped 2 bottom angles to make room for top refs). Pocket-label warp
-  // tool still runs post-generation regardless of focus.
-  const labelUrls = await resolveLabelAssetUrls(focusItem);
-  if (labelUrls.leatherUrl && ctx.focusSlot !== 'top') {
-    refs.push(await refFromUrl(labelUrls.leatherUrl, 'LEATHER BRAND PATCH — exact appearance of the leather brand patch (shape, embossed lettering, leather grain, color, stitching). Position, size, and orientation follow the garment description / silhouette — DO NOT assume a fixed location.'));
-  }
-  // Pocket label intentionally NOT added as a Seedream ref. Per-Bruno
-  // architecture (Apr 30, 2026): pocket labels go through the warp tool
-  // (POST /api/shots/[id]/apply-pocket-label) post-generation, never via
-  // Seedance. Reasons: deterministic placement, no hallucinated label
-  // positions on garments without back-pocket geometry. The
-  // pocketLabelTemplateId on the wardrobe item is read by the warp tool only.
-
-  const finalPrompt = await buildPrompt(prompt, ctx.wardrobe, ctx.modelId, focusItem, 'back', ctx.silhouette, false, 'M04', ctx.model, ctx.focusSlot);
-  const labelTags: string[] = [];
-  if (labelUrls.leatherUrl) labelTags.push('leather');
-  if (labelUrls.pocketUrl) labelTags.push('pocket');
-  console.log(`[Seedream] M04 (single-pass): ${refs.length} refs${labelTags.length ? ` (incl. ${labelTags.join('+')} label)` : ''} focus=${ctx.focusSlot || 'none'}`);
-
-  return generateSeedreamImage({
-    prompt: finalPrompt,
-    referenceImages: refs,
-    aspectRatio: (prompt.aspectOverride || APP_CONFIG.shots.M04.aspect) as '9:16' | '3:4' | '1:1',
-    apiKey: ctx.apiKey,
-    model: ctx.model,
-  });
-}
-
-// ── M01 — Cropped front (focus-conditional crop of M03) ────────────────
-// Bottom-focus (jeans / pants): waist-line crop — head removed, full torso
-// + legs + feet visible, pants as the hero. (Per G-Star vault brief slide 2.)
-//
-// Top-focus (jacket / shirt): upper-body crop — head + torso + thighs to
-// roughly mid-femur visible, jacket as the hero. The waist-line crop would
-// frame out most of the focus garment.
-//
-// In both cases we crop from the already-finalized M03 anchor (model identity
-// + correct outfit). Same pixels = guaranteed consistency with M03. No
-// second Seedream gen.
-async function seedreamM01(ctx: SeedreamGenerationContext, _prompt: LoadedPrompt): Promise<SeedreamGenerationResult> {
-  if (!ctx.m03AnchorUrl) throw new Error('M01 requires M03 anchor — run M03 first');
-  const { cropFromFullBody } = await import('./elbow-crop');
-  const mode = ctx.focusSlot === 'top' ? 'upper-body' : 'waist';
-  console.log(`[Seedream] M01: ${mode} crop of M03 anchor (focus=${ctx.focusSlot || 'none'})`);
-  const cropped = await cropFromFullBody(ctx.m03AnchorUrl, mode);
-  return { imageData: cropped.imageData, mimeType: cropped.mimeType };
-}
-
-// ── M02 — Cropped back (focus-conditional crop of M04) ─────────────────
-// Mirror of M01.
-async function seedreamM02(ctx: SeedreamGenerationContext, _prompt: LoadedPrompt): Promise<SeedreamGenerationResult> {
-  if (!ctx.m04AnchorUrl) throw new Error('M02 requires M04 anchor — run M04 first');
-  const { cropFromFullBody } = await import('./elbow-crop');
-  const mode = ctx.focusSlot === 'top' ? 'upper-body' : 'waist';
-  console.log(`[Seedream] M02: ${mode} crop of M04 anchor (focus=${ctx.focusSlot || 'none'})`);
-  const cropped = await cropFromFullBody(ctx.m04AnchorUrl, mode);
-  return { imageData: cropped.imageData, mimeType: cropped.mimeType };
-}
-
-// ── M05 — Back pocket detail ───────────────────────────────────────────
-// Per Bruno: the fit model's left hip/pocket is the best reference for the
-// pocket close-up — AI anchors add noise. Originally stripped to 2 refs
-// (fit model back + back45Right), but that meant Seedance had no source for
-// the AI model's skin tone, so M05 was rendering with the FIT model's skin
-// (typically white) on jobs that selected a non-white AI model.
-//
-// Fix: prepend the AI model's BACK reference image when available. Adds one
-// ref (3 → 4 base refs, plus 0–2 label refs). Front model ref is still
-// excluded — that's the noisy one for back-pocket framing.
-//
-// ROLLBACK: set Cloud Run env var M05_MODEL_BACK_REF=false (no redeploy
-// needed — picks up on next request). Default behavior is ON.
 async function seedreamM05(ctx: SeedreamGenerationContext, prompt: LoadedPrompt): Promise<SeedreamGenerationResult> {
   const isTopFocus = ctx.focusSlot === 'top';
 
@@ -741,7 +516,26 @@ async function seedreamM05(ctx: SeedreamGenerationContext, prompt: LoadedPrompt)
 
   const includeModelBackRefFlag = process.env.M05_MODEL_BACK_REF !== 'false';
   let modelBackRefAdded = false;
+  let m02AnchorAdded = false;
   const refs: SeedreamReferenceImage[] = [];
+
+  // Slot 0: the just-rendered M02 (matrix-painted cropped back of the model
+  // wearing the actual jeans + top + shoes). Dominant visual anchor — locks
+  // identity, exact-garment construction, exact-shoe geometry, and the
+  // model's actual back-hip silhouette in the rendered outfit. The M02 view
+  // is waist-down 1:1 4K, which the close-up reframes/zooms into.
+  if (ctx.m02AnchorUrl) {
+    refs.push(await refFromUrl(ctx.m02AnchorUrl,
+      'M02 ANCHOR — the just-rendered cropped-back view of the model wearing ' +
+      'this exact outfit (jeans + top + shoes). Use as the dominant reference ' +
+      'for: identity (skin tone, body proportions), the jeans (exact colour, ' +
+      'wash, fabric, pocket geometry, hem behaviour), the shoes (style + ' +
+      'position), and the model\'s back-hip silhouette. The M05 close-up ' +
+      'zooms into the back-right pocket region of this same outfit. CAMERA ' +
+      'ANGLE, FRAMING and POSE for THIS shot are tighter / lower than the ' +
+      'M02 anchor — those come from the M05 prompt + the fit-model crop ref.'));
+    m02AnchorAdded = true;
+  }
 
   if (includeModelBackRefFlag) {
     const model = await getModel(ctx.modelId) as any;
@@ -750,14 +544,14 @@ async function seedreamM05(ctx: SeedreamGenerationContext, prompt: LoadedPrompt)
       // Track A: crop model card BACK to TOP 30% (head/shoulders) to avoid
       // copying the model card's compression-shorts styling into the lower body.
       const cropped = await cropAndCacheRef(modelBackRefUrl, 0.05, 0.30);
-      refs.push(await refFromUrl(cropped, 'MODEL CARD BACK — HEAD AND SHOULDERS CROP. Source of truth for skin tone with undertone, hair color (back-view), and body proportions reference. CAMERA ANGLE, POSE, FRAMING for THIS shot are NOT taken from this card.'));
+      refs.push(await refFromUrl(cropped, 'MODEL CARD BACK — HEAD AND SHOULDERS CROP. Secondary identity reinforcement for skin tone with undertone, hair color (back-view), and body proportions reference. CAMERA ANGLE, POSE, FRAMING for THIS shot are NOT taken from this card.'));
       modelBackRefAdded = true;
     }
   }
 
   // Track A: crop fit-model BACK 45° to vertical 25-60% (hip/buttock zone).
   const fitBack45RCropped = await cropAndCacheRef(fitModels.back45Right, 0.25, 0.60);
-  refs.push(await refFromUrl(fitBack45RCropped, 'FIT MODEL BACK 45° RIGHT — HIP / BACK-POCKET CROP. Primary garment-fit reference for back-hip pocket geometry, stitching, pocket construction. The rendered M05 frame should match this crop\'s tight framing. SKIN TONE, COMPLEXION, IDENTITY, BACKDROP are NOT taken from this image.'));
+  refs.push(await refFromUrl(fitBack45RCropped, 'FIT MODEL BACK 45° RIGHT — HIP / BACK-POCKET CROP. High-detail garment-fit reference for back-hip pocket geometry, stitching, pocket construction. The rendered M05 frame should match this crop\'s tight framing. SKIN TONE, COMPLEXION, IDENTITY, BACKDROP are NOT taken from this image.'));
 
   if (item.flatBackUrl) {
     refs.push(await refFromUrl(item.flatBackUrl, 'FLAT BACK — clean back-view product shot of the garment (no model). Source of truth for the garment\'s back-panel construction: fabric color, wash, seam lines, pocket construction.'));
@@ -769,12 +563,42 @@ async function seedreamM05(ctx: SeedreamGenerationContext, prompt: LoadedPrompt)
   const labelUrls = await resolveLabelAssetUrls(item);
 
   // Build prompt — use the loaded promptVault prompt (rev 33) as-is.
-  const finalPrompt = await buildPrompt(
+  let finalPrompt = await buildPrompt(
     prompt,
     ctx.wardrobe, ctx.modelId, item, 'back', ctx.silhouette, false, 'M05', ctx.model, ctx.focusSlot,
   );
 
+  // 2026-05-13 FIX: append a no-bare-skin guard. The vault prompt says "a
+  // thin slice of the tucked top is visible … no more than 10-15%" — that's
+  // permissive (upper bound), not mandatory. When Seedream drifts, it goes
+  // to 0% and renders bare back / nude upper torso (Bruno caught on
+  // j7RnJwgHfCTfEzgTXjpI, intermittent).
+  //
+  // Important: this guard does NOT change framing, crop, camera, or pocket
+  // hero proportions — those stay as defined by the vault prompt (back-right
+  // pocket 40-50% of frame, upper-thigh bottom edge, upper body / shoulders
+  // / head out of frame). The ONLY change is what fills the small space
+  // above the waistband at the top edge: it must be the tucked-top's fabric
+  // hem (same thin sliver the vault already allows), NEVER bare skin.
+  finalPrompt += `
+
+═══ MANDATORY — NO BARE SKIN ABOVE THE WAISTBAND ═══
+This guard does NOT change the framing, crop, camera position, or pocket-hero proportions described above — those stay exactly as specified. The hero is still the back-right pocket; the bottom of frame is still upper-to-mid-thigh; upper body / shoulders / head are still out of frame. The ONLY thing this section locks down is what's rendered in the small region above the waistband at the top edge of the frame.
+
+In that region, the visible content MUST be the fabric hem of the tucked-in top — same thin sliver the framing already allows — NOT bare skin. The model is wearing a tucked-in top throughout this shot; treat the top as long enough to reach below the waistband and be tucked in, so the only thing visible above the waistband (within the existing crop) is the top's fabric.
+
+DO NOT zoom out, reframe, or include more of the top to satisfy this — keep the same tight crop. Just ensure the small slice above the waistband is fabric, not skin.
+
+FAILURE MODES — ABSOLUTELY WRONG:
+- bare back, bare upper torso, bare shoulders, or any nudity in the small region above the waistband.
+- the model rendered topless or without any garment above the waistband.
+- bare skin visible at the top of the frame instead of the tucked top's fabric.
+- a gap of bare skin between the top's hem and the waistband.
+- zooming out or reframing to fit more of the top — keep the same crop, just swap skin for fabric in the same region.`;
+
   const tagSegments: string[] = [];
+  if (m02AnchorAdded) tagSegments.push('+M02_ANCHOR');
+  else tagSegments.push('!NO_M02_ANCHOR');
   if (modelBackRefAdded) tagSegments.push('+MODEL_BACK');
   else if (!includeModelBackRefFlag) tagSegments.push('+MODEL_BACK_DISABLED');
   console.log(`[Seedream] M05 bottom-focus: ${refs.length} refs, prompt rev=${prompt.revision}${tagSegments.length ? ' ' + tagSegments.join(' ') : ''}`);
@@ -822,10 +646,6 @@ export async function generateSeedreamShot(
   prompt: LoadedPrompt,
 ): Promise<SeedreamGenerationResult> {
   switch (shotType) {
-    case 'M03': return seedreamM03(ctx, prompt);
-    case 'M04': return seedreamM04(ctx, prompt);
-    case 'M01': return seedreamM01(ctx, prompt);
-    case 'M02': return seedreamM02(ctx, prompt);
     case 'M05': return seedreamM05(ctx, prompt);
     case 'M06': return seedreamM06(ctx, prompt);
     default: throw new Error(`Unknown shot type for Seedream: ${shotType}`);

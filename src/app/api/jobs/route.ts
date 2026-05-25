@@ -12,9 +12,11 @@ import {
 import { downloadGarmentImage } from '@/lib/gcs';
 import { runSilhouetteForWardrobe } from '@/lib/pipeline/silhouette';
 import { APP_CONFIG } from '@/lib/config';
-import type { ShotType, JobWardrobe, FitModelAngles } from '@/types';
+import type { JobWardrobe, FitModelAngles, JobStatus } from '@/types';
 import { normalizeWardrobeItem } from '@/lib/wardrobe-compat';
 import { triggerWorker } from '@/lib/worker/trigger';
+import { isMatrixCellComplete } from '@/lib/qa/shoe-matrix';
+import { getCurrentBatchJob, submitSingleCellBatch } from '@/lib/qa/shoe-matrix-batch';
 
 function getInternalBase(): string {
   const port = process.env.PORT || '3000';
@@ -22,24 +24,49 @@ function getInternalBase(): string {
 }
 
 // GET /api/jobs
+// Query params:
+//   includeArchived=true            — include archived jobs in the result
+//   cursor=<ms>                     — pagination cursor: createdAt-ms of the
+//                                     LAST job in the previous page. Omit
+//                                     for first page (newest 50).
+//   limit=<n>                       — page size, default 50, max 200.
+//   fetchAll=true                   — fetch the ENTIRE collection in one
+//                                     call (no pagination). Used by the
+//                                     dashboard when the user has any
+//                                     search filter active — search should
+//                                     match against the full DB, not just
+//                                     the currently-paginated slice. Caps
+//                                     at limit=5000 to avoid runaway loads
+//                                     on collections that have grown.
+// Response:
+//   { jobs: [...], hasMore: bool, nextCursor: <ms> | null }
 export async function GET(req: NextRequest) {
   try {
     const { searchParams } = new URL(req.url);
     const includeArchived = searchParams.get('includeArchived') === 'true';
+    const cursorParam = searchParams.get('cursor');
+    const limitParam = searchParams.get('limit');
+    const fetchAll = searchParams.get('fetchAll') === 'true';
+    const cursorMs = cursorParam ? Number(cursorParam) : undefined;
+    const limit = fetchAll ? 5000 : (limitParam ? Number(limitParam) : undefined);
 
-    const allJobs = await listJobs();
+    const { jobs: allJobs, hasMore, nextCursorMs } = await listJobs(undefined, { cursorMs, limit });
     const jobs = includeArchived ? allJobs : allJobs.filter((j: any) => !j.archived);
 
-    // Auto-fix stuck jobs
+    // Auto-fix stuck jobs. Ignore retired shotTypes (M03/M04) — legacy job
+    // docs may carry shot rows for those types that will never reach 'done'
+    // because the worker no longer dispatches them.
     const stuckJobs = jobs.filter((j: any) => j.status === 'generating');
     if (stuckJobs.length > 0) {
       const { listShots } = await import('@/lib/firestore');
+      const activeShotTypes = new Set<string>(APP_CONFIG.shotTypes);
       await Promise.all(stuckJobs.map(async (job: any) => {
         try {
           const jobId = job.jobId || job.id;
           const shots = await listShots(jobId);
-          if (shots.length === 0) return;
-          const allDone = shots.every((s: any) => s.status === 'done' || s.status === 'approved');
+          const activeShots = shots.filter((s: any) => activeShotTypes.has(s.shotType));
+          if (activeShots.length === 0) return;
+          const allDone = activeShots.every((s: any) => s.status === 'done' || s.status === 'approved');
           if (allDone) {
             await updateJobStatus(jobId, 'review');
             job.status = 'review';
@@ -111,20 +138,26 @@ export async function GET(req: NextRequest) {
             const jobId = job.jobId || job.id;
             const shots = await listShots(jobId);
             const approvedCount = shots.filter((s: any) => s.status === 'approved').length;
+            const preApprovedCount = shots.filter((s: any) => s.status !== 'approved' && s.wasApproved === true).length;
             // "Done" for progress purposes = shot has produced an image
             // (status 'done' OR 'approved'). Reviewers see the count of
             // shots that successfully rendered.
             const doneCount = shots.filter((s: any) => s.status === 'done' || s.status === 'approved').length;
             job.approvedCount = approvedCount;
+            job.preApprovedCount = preApprovedCount;
             job.doneCount = doneCount;
             job.totalShots = shots.length;
             // Stable shot-type order for the thumbnail list
             const SHOT_ORDER = ['M01', 'M02', 'M03', 'M04', 'M05', 'M06'];
+            // Show approved AND pre-approved shots as thumbnails. wasApproved
+            // distinguishes the two visually in the UI (amber border for
+            // pre-approved, neutral for approved).
             job.approvedShots = shots
-              .filter((s: any) => s.status === 'approved')
+              .filter((s: any) => s.status === 'approved' || (s.wasApproved === true && s.status === 'done'))
               .map((s: any) => ({
                 shotId: s.shotId || s.id,
                 shotType: s.shotType,
+                wasApproved: s.status !== 'approved' && s.wasApproved === true,
                 // Prefer PLP/PDP variants (smaller files) for the dashboard
                 // thumbnails — full grey/white masters are 4K and slow to
                 // load just to render an 8×10 thumb. Falls back to the master
@@ -141,7 +174,7 @@ export async function GET(req: NextRequest) {
       } catch { /* non-blocking enrichment */ }
     }));
 
-    return NextResponse.json({ jobs });
+    return NextResponse.json({ jobs, hasMore, nextCursor: nextCursorMs });
   } catch (error) {
     console.error('Error listing jobs:', error);
     return NextResponse.json({ error: 'Failed to list jobs' }, { status: 500 });
@@ -182,13 +215,17 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: 'Exactly one wardrobe item must be marked as focus' }, { status: 400 });
     }
 
-    // Get active prompt revisions
+    // Get active prompt revisions. As of 2026-05-17 matrix-paint M01/M02
+    // also load from the vault (Seedream pipeline) — same regression-safe
+    // pattern as M05/M06.
     const promptRevisions: Record<string, number> = {};
     for (const st of APP_CONFIG.shotTypes) {
-      const active = await getActivePrompt(st);
+      // Matrix-paint shots use the Seedream pipeline specifically.
+      const pipeline = (st === 'M01' || st === 'M02') ? 'seedream' as const : undefined;
+      const active = await getActivePrompt(st, undefined, pipeline);
       if (!active) {
         return NextResponse.json(
-          { error: `No active prompt found for ${st}. Upload prompts to the vault first.` },
+          { error: `No active prompt found for ${st}${pipeline ? ` (pipeline=${pipeline})` : ''}. Upload prompts to the vault first.` },
           { status: 400 }
         );
       }
@@ -263,38 +300,89 @@ export async function POST(req: NextRequest) {
     }
 
     // ── Create shot records ──
-    // All 5 shots created as 'pending'. The worker processes them in dependency order.
+    // All active shotTypes get a 'pending' shot doc. Worker processes them
+    // in dependency order. For matrix-paint shots (M01/M02) promptRevision
+    // is 0 since they bypass the vault.
     const shotIds: string[] = [];
     for (const shotType of APP_CONFIG.shotTypes) {
       const shotId = await createShot({
         jobId,
         modelId,
         shotType,
-        prompt: '', // prompt loaded from vault at generation time
-        promptRevision: promptRevisions[shotType],
+        prompt: '', // prompt loaded from vault at generation time (or hardcoded for matrix shots)
+        promptRevision: promptRevisions[shotType] ?? 0,
         status: 'pending',
       });
       shotIds.push(shotId);
     }
 
-    // Update job status and enqueue
-    await updateJobStatus(jobId, 'generating');
-    const enqueueResult = await enqueueJob(jobId, jobName || jobId);
-    console.log(`[Job] Enqueued: slot=${enqueueResult.slot}, position=${enqueueResult.position}`);
+    // ── Matrix-cell readiness gate ─────────────────────────────────────────
+    // M01/M02 depend on the (shoe × model) Tier-2 cell being fully rendered.
+    // If it's not, park the job in 'awaiting-matrix' and (best-effort) kick
+    // off a single-cell batch render. Worker tick polls the cell + resumes
+    // the job when all 4 views land.
+    const cellReady = await isMatrixCellComplete(w.shoe.itemId, modelId);
+
+    let jobStatus: JobStatus = 'generating';
+    let enqueueResult: { slot: number | null; position: number } | null = null;
+    let awaitingCellBatchName: string | undefined;
+
+    if (cellReady) {
+      jobStatus = 'generating';
+      await updateJobStatus(jobId, jobStatus);
+      enqueueResult = await enqueueJob(jobId, jobName || jobId);
+      console.log(`[Job] Matrix cell ready — enqueued: slot=${enqueueResult.slot}, position=${enqueueResult.position}`);
+    } else {
+      jobStatus = 'awaiting-matrix';
+      console.log(`[Job] Matrix cell missing for (${w.shoe.itemId} × ${modelId}) — parking job in awaiting-matrix`);
+
+      // Try to submit a single-cell batch if no other batch is live.
+      try {
+        const existingBatch = await getCurrentBatchJob();
+        const live = existingBatch && (existingBatch.state === 'PENDING' || existingBatch.state === 'RUNNING');
+        if (!live) {
+          const apiKey = process.env.GEMINI_API_KEY;
+          if (apiKey) {
+            const submitResult = await submitSingleCellBatch(w.shoe.itemId, modelId, apiKey);
+            awaitingCellBatchName = submitResult.name;
+            console.log(`[Job] Submitted single-cell batch ${submitResult.name} for missing cell`);
+          } else {
+            console.warn('[Job] GEMINI_API_KEY not set — cannot submit single-cell batch. Job will wait for an external batch to land the cell.');
+          }
+        } else {
+          console.log(`[Job] Batch ${existingBatch.name} is ${existingBatch.state} — job will wait for it to finish before its own batch can be submitted`);
+        }
+      } catch (submitErr) {
+        console.error('[Job] Single-cell batch submit failed (non-blocking — worker will retry):', submitErr);
+      }
+
+      await updateJob(jobId, {
+        status: jobStatus,
+        awaitingCell: {
+          shoeId: w.shoe.itemId,
+          modelId,
+          parkedAt: Date.now(),
+          ...(awaitingCellBatchName ? { batchName: awaitingCellBatchName } : {}),
+        },
+      });
+    }
 
     // ── Respond then fire worker ──
     const response = NextResponse.json({
       success: true,
       jobId,
       shotsCreated: shotIds.length,
-      slot: enqueueResult.slot,
-      position: enqueueResult.position,
+      status: jobStatus,
+      ...(enqueueResult ? { slot: enqueueResult.slot, position: enqueueResult.position } : {}),
+      ...(jobStatus === 'awaiting-matrix' ? { awaitingCell: { shoeId: w.shoe.itemId, modelId, batchName: awaitingCellBatchName } } : {}),
     });
 
     // Fire worker kick AFTER building response — DO NOT AWAIT.
     // Branches on WORKER_MODE env var: 'inproc' (default) → in-process worker,
     // 'job' → triggers gstar-worker-job Cloud Run Job.
-    triggerWorker('job-create').catch(() => { /* already logged inside helper */ });
+    // For awaiting-matrix jobs the worker tick will scan + (eventually) resume
+    // the job once the cell lands. For ready jobs it dispatches shots normally.
+    triggerWorker(jobStatus === 'awaiting-matrix' ? 'job-create-awaiting-matrix' : 'job-create').catch(() => { /* already logged inside helper */ });
 
     return response;
   } catch (error) {

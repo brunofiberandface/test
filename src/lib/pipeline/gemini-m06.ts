@@ -33,6 +33,14 @@ import { getM06Pose, type M06Pose } from '@/lib/m06-poses';
 import { getM06TopPose, pickM06TopPose, type M06TopPose } from '@/lib/m06-top-poses';
 import { generateImage, type ReferenceImage } from '@/lib/vertex';
 import { buildIdentityHeadCrop } from './identity-head-crop';
+import {
+  loadPrompt,
+  injectSilhouette,
+  injectStylingDescriptions,
+  injectGarmentType,
+  injectGender,
+  injectM06Context,
+} from './prompt-loader';
 
 /** Inlined from seedream-generate.ts:getFocusGarmentUrls — pulls bottom-item
  *  flat front + 3 fit-model front angles. M06 always uses bottom (jeans). */
@@ -172,6 +180,8 @@ export async function generateM06WithGemini(ctx: GeminiM06Context): Promise<Gemi
   // no explicit textual anchor. Same fallback chain as top-focus + shoe.
   const bottomConfig = ctx.wardrobe['bottom' as keyof JobWardrobe];
   let wardrobeBottomDescription = '';
+  let wardrobeBottomName = 'bottom garment';
+  let wardrobeBottomSilhouette = '';
   if (bottomConfig?.itemId) {
     const bottomItem = await getWardrobeItem(bottomConfig.itemId) as any;
     if (bottomItem) {
@@ -179,9 +189,17 @@ export async function generateM06WithGemini(ctx: GeminiM06Context): Promise<Gemi
         || bottomItem.description
         || bottomItem.name
         || '';
+      wardrobeBottomName = bottomItem.name || wardrobeBottomName;
+      // Silhouette gives Gemini the WIDTH / LENGTH / FLOOR-DISTANCE spec.
+      // Without it, M06 was rendering generic black wide-leg pants for
+      // palazzo / cargo / culotte items (Bruno 2026-05-17: F9 wrap-over
+      // trouser + M2 cargo trouser both showed low garment fidelity).
+      wardrobeBottomSilhouette = (bottomItem.silhouetteFront as string)
+        || (bottomItem.silhouetteBack as string)
+        || '';
     }
   }
-  console.log(`[GeminiM06] wardrobe bottom: ${wardrobeBottomDescription ? `"${wardrobeBottomDescription.slice(0, 60)}..."` : '(image-only)'}`);
+  console.log(`[GeminiM06] wardrobe bottom: "${wardrobeBottomName}" — ${wardrobeBottomDescription ? `desc=${wardrobeBottomDescription.length}c` : 'no desc'} ${wardrobeBottomSilhouette ? `silhouette=${wardrobeBottomSilhouette.length}c` : 'no silhouette'}`);
 
   // 2026-05-12 FIX: surface model gender + identity description so Gemini
   // doesn't drift to a generic Caucasian editorial face on male / non-default
@@ -238,7 +256,7 @@ export async function generateM06WithGemini(ctx: GeminiM06Context): Promise<Gemi
     refs.push({
       buffer: flatImg.buffer,
       mimeType: flatImg.mimeType,
-      label: `IMAGE 3 — GARMENT FLAT. Source for the jeans' color, wash, fabric, seams, hardware, and pockets.`,
+      label: `IMAGE 3 — GARMENT FLAT (${wardrobeBottomName}). Source for the garment's EXACT type, color, fabric, seams, hardware, and pockets. Render THIS garment exactly — if it's a culotte, render a culotte; if it's a cargo trouser, render cargo; if it's a wrap-over palazzo, render that. Do NOT default to jeans.`,
     });
   }
 
@@ -248,89 +266,33 @@ export async function generateM06WithGemini(ctx: GeminiM06Context): Promise<Gemi
     refs.push({
       buffer: a.buffer,
       mimeType: a.mimeType,
-      label: `IMAGE ${4 + i} — FIT MODEL ANGLE ${i + 1}. Source for jean fit, drape, and silhouette only. The pose and identity in this image are NOT used. The pose for this render comes from IMAGE 1 (or text description).`,
+      label: `IMAGE ${4 + i} — FIT MODEL ANGLE ${i + 1} (${wardrobeBottomName}). Source for garment fit, drape, length, and silhouette only. The pose and identity in this image are NOT used. The pose for this render comes from IMAGE 1 (or text description).`,
     });
   }
 
-  // Build canonical M06 prompt
-  const finalPrompt = `Photorealistic studio e-commerce photograph, 1:1 square, full body, light grey backdrop (#D9DAD2). Soft diffused studio lighting, white-balanced 5500K. Sharp focus, ultra-high detail.
+  // Load M06 vault prompt (rev 17+) + inject all per-job placeholders. The
+  // {top_description} fallback is handled here: when no wardrobe top is set,
+  // the substituted text is the plain-black-sports-bra clothing-isolation
+  // block (mirrors the original conditional logic from the inline prompt).
+  const loadedPrompt = await loadPrompt('M06', undefined, 'seedream');
+  const TOP_NO_WARDROBE_FALLBACK =
+    'The model\'s UPPER BODY wears ONLY a plain black athletic sports bra (basic athletic style, no logo, no detail, no print). NOTHING else on the upper body. NO t-shirt, NO long-sleeve top, NO oversized top, NO jacket, NO knit, NO cardigan, NO turtleneck, NO bomber. The arms are bare (skin showing). The midriff is bare (skin showing). The shoulders are bare (skin showing).';
+  const topDescriptionForPrompt = wardrobeTopDescription
+    ? `The model's UPPER BODY wears: ${wardrobeTopDescription}. Match this top description EXACTLY — color, fabric, neckline/collar, sleeves, hem, fit, hardware (buttons/zippers), and any branding details called out in the description. The arms, midriff, and shoulders are clothed by this top per the description (NOT bare unless the description explicitly specifies sleeveless / cropped / open-front).`
+    : TOP_NO_WARDROBE_FALLBACK;
+  // Identity description: trim to first line / 280 chars (matches the prior
+  // inline behaviour to avoid bloating the prompt with multi-paragraph bios).
+  const trimmedModelDescription = modelDescription
+    ? modelDescription.split('\n')[0].slice(0, 280)
+    : '';
 
-═══ FRAMING — MANDATORY ═══
-FULL-BODY composition with HEADROOM. The ENTIRE model is visible inside the frame from the very top of the head (including any hairstyle volume — top of the hair, crown, top of a ponytail / bun / updo) DOWN to the soles of the feet (heels touching the floor). There MUST be approximately 8-12% clear background ABOVE the top of the head before the frame's top edge — NEVER let the head, hair, scalp, or hairstyle volume touch or pass the top of the frame. There MUST be approximately 5-8% clear floor BELOW the heels before the frame's bottom edge — the heels never touch the bottom edge. The subject is centered horizontally. Reserve roughly equal background to the left and right of the body.
-
-If the chosen pose would cause cropping, ZOOM OUT — make the model smaller within the frame rather than crop any part of the body.
-
-═══ IDENTITY (from IMAGE 2 + IMAGE 2B ONLY) ═══
-The rendered model is the SAME PERSON as in IMAGE 2 and IMAGE 2B — a ${modelGender} model with these specific attributes${modelDescription ? `: ${modelDescription.split('\n')[0].slice(0, 280)}` : ''}. Exact same skin tone with the SAME undertone and depth as IMAGE 2B (do NOT shift toward editorial warmth, do NOT shift paler or darker), exact same complexion, exact same hair color, hair length, and hair texture, exact same facial features, body proportions, and ${modelGender === 'male' ? 'facial-hair / beard pattern' : 'face structure'}. The model in IMAGE 1 (if present) is a DIFFERENT person whose pose is being copied — the rendered model's identity does NOT take ANY attributes from IMAGE 1. If IMAGE 1's model has lighter skin, different hair, different ethnicity, or a different gender, the rendered model still has IMAGE 2 + IMAGE 2B's exact identity. The rendered model is ${modelGender.toUpperCase()} — never invent a different gender.
-
-═══ POSE (from IMAGE 1 / text description) ═══
-The model in the rendered output is in EXACTLY the body pose specified below. Specifically:
-
-1. **BODY ROTATION DEGREE — literal**: If a strict frontal stance (body squared to camera) is described, the rendered model is also strictly frontal — do NOT add a 3/4 turn. If a 30°, 45°, 60°, or 75° rotation away from camera is described, render that EXACT degree of rotation — do NOT soften toward frontal. Match the rotation precisely.
-
-2. **HAND PLACEMENT — literal, no mirroring**: If the LEFT hand is in a pocket and the RIGHT hand is at the side, render the LEFT hand in the pocket and the RIGHT hand at the side. Do NOT flip or mirror.
-
-3. **HANDS HIDDEN BEHIND BODY**: If hands are NOT visible from the front (tucked behind the body, behind the back, or in back pockets), the rendered model's hands are also HIDDEN behind the body — only the upper arms are visible falling slightly back from the shoulders.
-
-4. **HEAD AND NECK ANGLE — copy precisely**: If the head is turned over the shoulder back toward the camera while the body faces away, render that exact head turn. The head can rotate independently of the body.
-
-5. **GAZE DIRECTION — copy precisely**: Match the gaze direction described (at camera, upward off-lens, over shoulder, etc.). Do NOT default to a forward-camera gaze if the spec says otherwise.
-
-6. **ASYMMETRY AND WEIGHT SHIFT**: Copy any subtle asymmetry — weight on one leg, slight hip tilt, slight diagonal lean. Do NOT smooth the pose toward perfect symmetry.
-
-═══ POSE DESCRIPTION ═══
-Pose archetype: ${pose.label}
-${pose.description}
-
-═══ JEANS — THE HERO GARMENT (from IMAGE 3 + FIT MODEL ANGLES) ═══
-The model wears the jeans shown in IMAGE 3 (GARMENT FLAT) and the FIT MODEL ANGLES. These are the focal garment in this shot — render them with MAXIMUM fidelity.
-
-${wardrobeBottomDescription ? `Jeans description (reinforcement, treat as authoritative): ${wardrobeBottomDescription}\n\n` : ''}Match the jeans EXACTLY:
-- Color and wash: the precise tone, contrast, and fading pattern shown in IMAGE 3. NO magenta / red / pink sheen, NO editorial color cast, NO glossy fashion-photography wash drift. The denim is matte, the wash is true to IMAGE 3.
-- Hem treatment: if the description above or IMAGE 3 shows a ROLLED hem (cuffed at the ankle), the rendered jeans have a ROLLED HEM — not a clean unrolled hem, not a raw hem, not a frayed hem. If the description shows a cropped raw hem, render that. Match the hem treatment LITERALLY from IMAGE 3 and the description.
-- Fit profile: silhouette, leg opening, rise, and break exactly as shown in the FIT MODEL ANGLES.
-- Hardware: button fly vs zip fly, rivet count and placement, coin-pocket presence, back-pocket shape and arc stitching, brand patch position — all as shown in IMAGE 3.
-- Fabric finish: matte cotton denim, natural weave texture. NO satin sheen, NO leather-look, NO patent shine.
-
-CRITICAL — the jeans in IMAGE 1 (POSE REFERENCE) are NOT the target jeans. IGNORE the bottom garment in IMAGE 1 completely (different wash, different cut, different model). The rendered model's jeans are EXCLUSIVELY the garment in IMAGE 3 + FIT MODEL ANGLES + the description above.
-
-${wardrobeTopDescription
-  ? `═══ TOP — MANDATORY (from wardrobe) ═══
-The model's UPPER BODY wears: ${wardrobeTopDescription}.
-
-Match this top description EXACTLY — color, fabric, neckline/collar, sleeves, hem, fit, hardware (buttons/zippers), and any branding details called out in the description. The arms, midriff, and shoulders are clothed by this top per the description (NOT bare unless the description explicitly specifies sleeveless / cropped / open-front).
-
-CLOTHING ISOLATION: The clothing visible in IMAGE 1 (if present) is NOT the rendered model's clothing. IGNORE everything the IMAGE 1 model wears on the upper body. The rendered upper body wears EXACTLY the top described above — nothing else, nothing extra.`
-  : `═══ TOP — MANDATORY (clothing isolation) ═══
-The model's UPPER BODY wears ONLY a plain black athletic sports bra (basic athletic style, no logo, no detail, no print). NOTHING else on the upper body. NO t-shirt, NO long-sleeve top, NO oversized top, NO jacket, NO knit, NO cardigan, NO turtleneck, NO bomber. The arms are bare (skin showing). The midriff is bare (skin showing). The shoulders are bare (skin showing).
-
-CLOTHING ISOLATION: The clothing visible in IMAGE 1 (if present) is NOT the rendered model's clothing. IGNORE everything the IMAGE 1 model wears on the upper body. The rendered upper body is bare arms + plain black sports bra ONLY.`
-}
-
-═══ FOOTWEAR — MANDATORY (from wardrobe) ═══
-${wardrobeShoeDescription
-  ? `The model wears: ${wardrobeShoeDescription}. Match this footwear description EXACTLY — material, color, sole shape, height, lacing/buckles, branding. The footwear shown in IMAGE 1 (if present) is NOT the rendered footwear — IGNORE that and render EXACTLY the shoes described above. The model is NEVER barefoot.`
-  : `The model wears appropriate, simple footwear matching the outfit. The model is NEVER barefoot. The footwear in IMAGE 1 (if present) is NOT the rendered footwear.`
-}
-
-═══ STUDIO ═══
-Backdrop: clean light-grey studio sweep, no scuffs, no texture, no marks. Floor: continuous extension of the backdrop with a faint contact shadow under the feet.
-
-═══ FAILURE MODES TO AVOID ═══
-- WRONG: rendering a different model identity than IMAGE 2 + IMAGE 2B (any face, skin tone, or hair mismatch — skin tone in particular must match IMAGE 2B exactly).
-- WRONG: mirroring the hands.
-- WRONG: rendering hands in front pockets when the spec says hidden behind the body.
-- WRONG: rendering the head facing forward when the spec says the head turns back.
-- WRONG: rendering a direct camera gaze when the spec says the gaze is upward off-lens.
-- WRONG: rendering a top other than ${wardrobeTopDescription ? 'the top described in the TOP section above' : 'the plain black sports bra'}.
-- WRONG: barefoot.
-- WRONG: any part of the head, hair, scalp, or hairstyle being cut off, cropped, or touching the top edge of the frame. The head MUST sit at least 8% below the top edge with clear background visible above it.
-- WRONG: heels or feet cut off, cropped, or touching the bottom edge. There MUST be clear floor visible below the heels.
-- WRONG: jeans wash drifting from IMAGE 3 — no magenta / red / pink sheen, no glossy editorial cast on the denim. The denim is MATTE with the EXACT wash shown in IMAGE 3.
-- WRONG: hem treatment differing from IMAGE 3 / the description above. If a rolled / cuffed hem is shown or described, the rendered jeans have a rolled hem.
-- WRONG: rendering the jeans from IMAGE 1 (POSE REFERENCE) instead of IMAGE 3. IMAGE 1's bottoms are NEVER the target.
-
-The pose MUST match the spec. The identity MUST match IMAGE 2 + IMAGE 2B (${modelGender} model, exact skin tone). The top MUST be ${wardrobeTopDescription ? 'the top described in the TOP section above' : 'a plain black sports bra'}. The jeans MUST match IMAGE 3 + FIT MODEL ANGLES${wardrobeBottomDescription ? ' + the description above' : ''} (wash, hem treatment, fit, hardware — all literal, no editorial drift). The footwear MUST be ${wardrobeShoeDescription ? 'the footwear described in the FOOTWEAR section above' : 'appropriate simple shoes'}. These are non-negotiable.`;
+  let finalPrompt = loadedPrompt.generationPrompt;
+  finalPrompt = injectGender(finalPrompt, (modelGender === 'male' ? 'male' : 'female') as 'male' | 'female');
+  finalPrompt = injectGarmentType(finalPrompt, wardrobeBottomName);
+  finalPrompt = injectSilhouette(finalPrompt, wardrobeBottomSilhouette);
+  finalPrompt = injectStylingDescriptions(finalPrompt, topDescriptionForPrompt, wardrobeShoeDescription);
+  finalPrompt = injectM06Context(finalPrompt, pose.label, pose.description, trimmedModelDescription, wardrobeBottomDescription);
+  console.log(`[GeminiM06] Loaded vault prompt M06/seedream/rev${loadedPrompt.revision}, ${finalPrompt.length} chars`);
 
   console.log(`[GeminiM06] Calling Gemini-3-pro-image-preview (${refs.length} refs, pose=${pose.id})...`);
   const t0 = Date.now();

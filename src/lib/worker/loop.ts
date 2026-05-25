@@ -29,8 +29,13 @@ import {
   listShots,
   updateJobStatus,
   shotsCol,
+  jobsCol,
+  enqueueJob,
 } from '@/lib/firestore';
+import { FieldValue } from '@google-cloud/firestore';
 import { APP_CONFIG } from '@/lib/config';
+import { isMatrixCellComplete, VIEWS } from '@/lib/qa/shoe-matrix';
+import { qaShoeMatrixCol } from '@/lib/firestore';
 
 // ── Constants ──
 const SHOT_TIMEOUT_MS = 540_000;  // 9 min per shot
@@ -168,7 +173,12 @@ async function getEligibleShotsForJob(jobId: string): Promise<EligibleShot[]> {
 
 async function isJobComplete(jobId: string): Promise<boolean> {
   const shots = await listShots(jobId);
-  return shots.length > 0 && shots.every(
+  // Filter out retired shotTypes (M03/M04) — legacy jobs may have shot docs
+  // for them but the worker never dispatches those types. Counting them as
+  // outstanding work would block job completion forever.
+  const activeShotTypes = new Set<string>(APP_CONFIG.shotTypes);
+  const activeShots = shots.filter((s: any) => activeShotTypes.has(s.shotType));
+  return activeShots.length > 0 && activeShots.every(
     (s: any) => s.status === 'done' || s.status === 'approved' || s.status === 'failed'
   );
 }
@@ -308,6 +318,84 @@ async function processShot(shot: EligibleShot, geminiKey: string, bytePlusKey: s
   }
 }
 
+// ── Awaiting-matrix resume ────────────────────────────────────────────────
+//
+// Stage 4 (2026-05-17): jobs that were created against a missing Tier-2
+// (shoe × model) cell sit in status='awaiting-matrix' with `awaitingCell`
+// pointing at the cell. Each worker tick scans those jobs; for each whose
+// cell is now complete, flip the job to 'generating', clear awaitingCell,
+// and enqueue it for normal processing.
+//
+// Worker doesn't drain batches — the existing /api/qa/shoe-matrix/batch-check
+// endpoint handles that and triggers the worker on completion. This scan is
+// lightweight: one query + one isMatrixCellComplete per parked job.
+async function resumeAwaitingMatrixJobsTick(): Promise<{ resumed: number; waiting: number }> {
+  let resumed = 0;
+  let waiting = 0;
+
+  // Self-healing: before we check for ready cells, sweep `batch-pending`
+  // cells that actually have all 4 images and promote them to 'done'.
+  // Defends against the batch-check status-promotion bug (2026-05-19,
+  // shoe-matrix-batch.ts:643) where cells whose final views landed in a
+  // different batch-check call from their result-line processing would
+  // stay 'batch-pending' forever. Cheap query — rare for many cells to
+  // be in this state at once.
+  try {
+    const pending = await qaShoeMatrixCol.where('status', '==', 'batch-pending').get();
+    for (const cellSnap of pending.docs) {
+      const data = cellSnap.data() as { viewsCompleted?: string[]; images?: Record<string, string>; archived?: boolean; blocked?: boolean };
+      if (data.archived || data.blocked) continue;
+      const completed = new Set(data.viewsCompleted || []);
+      const allImages = VIEWS.every(v => completed.has(v) && !!data.images?.[v]);
+      if (allImages) {
+        await cellSnap.ref.update({ status: 'done', updatedAt: new Date() });
+        console.log(`[Worker] Promoted stale batch-pending cell ${cellSnap.id} → done (self-healing sweep)`);
+      }
+    }
+  } catch (sweepErr) {
+    console.warn('[Worker] batch-pending self-healing sweep failed:', sweepErr);
+  }
+
+  try {
+    const snap = await jobsCol.where('status', '==', 'awaiting-matrix').get();
+    for (const doc of snap.docs) {
+      const data = doc.data();
+      const cell = data.awaitingCell as { shoeId?: string; modelId?: string; parkedAt?: number } | undefined;
+      if (!cell?.shoeId || !cell?.modelId) {
+        console.warn(`[Worker] awaiting-matrix job ${doc.id} has no awaitingCell — marking failed`);
+        await doc.ref.update({ status: 'failed', error: 'awaitingCell missing on awaiting-matrix job', updatedAt: new Date() });
+        continue;
+      }
+      let ready = false;
+      try {
+        ready = await isMatrixCellComplete(cell.shoeId, cell.modelId);
+      } catch (err) {
+        console.warn(`[Worker] isMatrixCellComplete failed for job ${doc.id}:`, err);
+      }
+      if (!ready) {
+        waiting++;
+        continue;
+      }
+      try {
+        await doc.ref.update({
+          status: 'generating',
+          awaitingCell: FieldValue.delete(),
+          updatedAt: new Date(),
+        });
+        await enqueueJob(doc.id, (data.jobName as string) || doc.id);
+        resumed++;
+        console.log(`[Worker] Resumed awaiting-matrix job ${doc.id.substring(0,8)} — cell (${cell.shoeId}_${cell.modelId}) landed`);
+      } catch (resumeErr) {
+        console.error(`[Worker] Failed to resume awaiting-matrix job ${doc.id}:`, resumeErr);
+        // Leave in awaiting-matrix; next tick retries.
+      }
+    }
+  } catch (queryErr) {
+    console.warn('[Worker] awaiting-matrix scan failed:', queryErr);
+  }
+  return { resumed, waiting };
+}
+
 // ── Job finalization ──
 async function checkAndFinalizeJob(jobId: string): Promise<void> {
   if (await isJobComplete(jobId)) {
@@ -357,14 +445,29 @@ export async function runWorkerLoop(opts: RunWorkerLoopOptions = {}): Promise<Ru
     let idleCycles = 0;
 
     while (idleCycles < MAX_IDLE_CYCLES) {
+      // Stage 4 — promote awaiting-matrix jobs whose cells just landed.
+      // Cheap: one indexed query + per-doc cell check. Worker is otherwise
+      // blind to these jobs (they're not in the queue slots until resumed).
+      const awaitingResult = await resumeAwaitingMatrixJobsTick();
+      if (awaitingResult.resumed > 0 || awaitingResult.waiting > 0) {
+        console.log(`[Worker:${workerName}] awaiting-matrix scan: resumed=${awaitingResult.resumed}, still-waiting=${awaitingResult.waiting}`);
+      }
+
       const state = await getQueueState();
       const activeSlots = state.slots.filter(s => s !== null);
 
       if (activeSlots.length === 0 && runningShots.size === 0) {
-        idleCycles++;
-        if (idleCycles >= MAX_IDLE_CYCLES) {
-          console.log(`[Worker:${workerName}] Idle timeout — exiting`);
-          break;
+        // If awaiting-matrix jobs are still parked, keep ticking — their cells
+        // might land between idle cycles. Without this the worker would exit
+        // after 5 min and the jobs would stall until an external trigger.
+        if (awaitingResult.waiting === 0) {
+          idleCycles++;
+          if (idleCycles >= MAX_IDLE_CYCLES) {
+            console.log(`[Worker:${workerName}] Idle timeout — exiting`);
+            break;
+          }
+        } else {
+          idleCycles = 0;  // keep alive while waiting for matrix cells
         }
         await new Promise(r => setTimeout(r, IDLE_CHECK_MS));
         continue;

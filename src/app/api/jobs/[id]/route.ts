@@ -17,12 +17,17 @@ export async function GET(
     const shots = await listShots(id);
 
     // ── Auto-fix stuck job status ──
-    // If job is 'generating'/'uploading' but all shots are in terminal states, advance it
+    // If job is 'generating'/'uploading' but all ACTIVE shots are in terminal
+    // states, advance it. Retired shotTypes (M03/M04) on legacy jobs are
+    // ignored — the worker never dispatches them so they'd block forever.
+    const { APP_CONFIG } = await import('@/lib/config');
+    const activeShotTypes = new Set<string>(APP_CONFIG.shotTypes);
+    const activeShots = (shots as any[]).filter(s => activeShotTypes.has(s.shotType));
     const stuckStatuses = ['generating', 'uploading'];
-    if (stuckStatuses.includes(job.status) && shots.length > 0) {
+    if (stuckStatuses.includes(job.status) && activeShots.length > 0) {
       const terminalStatuses = ['done', 'approved'];
-      const allTerminal = shots.every((s: any) => terminalStatuses.includes(s.status));
-      const allApproved = shots.every((s: any) => s.status === 'approved');
+      const allTerminal = activeShots.every((s: any) => terminalStatuses.includes(s.status));
+      const allApproved = activeShots.every((s: any) => s.status === 'approved');
 
       if (allApproved) {
         await updateJobStatus(id, 'complete');

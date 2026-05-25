@@ -27,7 +27,11 @@ import {
 } from './prompt-loader';
 import { getWardrobeItem } from '@/lib/firestore';
 import { normalizeWardrobeItem } from '@/lib/wardrobe-compat';
-import { positionalCompositeTop, blurBelowCut } from './composite-back';
+import { detectTwinDiptych } from './composite-back';
+// Other composite-back utilities (positionalCompositeTop, blurBelowCut,
+// compositeBackBySimilarity) are kept in `composite-back.ts` but no longer
+// called from matrix-paint as of 2026-05-25 — see the comment block above
+// `paintTeeHemStrip`.
 import type { JobWardrobe, FocusSlot, ShotType } from '@/types';
 
 export type MatrixPaintShot = 'M01' | 'M02';
@@ -202,12 +206,55 @@ Sits at the same height as the placeholder waistband in IMAGE 1. Render the wais
 }
 
 /**
- * Strip-paint: replace the bare-skin midriff above the jeans waistband with
- * a slice of tucked-in tee fabric. Validated 2026-05-17 against the F9 ×
- * Midge Slim Straight Jeans output — front + back both tuck cleanly on jeans
- * (the firm denim waistband + belt loops + button give Gemini a clear "tuck
- * under here" anchor; the earlier hot-pants test was inconclusive because the
- * soft athletic waistband didn't anchor the tuck).
+ * ════════════════════════════════════════════════════════════════════════
+ * ⛔ PROTECTED PRODUCTION SURFACE — DO NOT MODIFY WITHOUT READING:
+ *    gstar/PRODUCTION_BASELINE_M01_M02.md
+ *
+ * This function is the locked-in production tee-paint step. Multiple
+ * sessions have rebuilt it from scratch trying to "improve" it; every
+ * such rebuild destroyed the working state. The baseline doc lists the
+ * specific anti-patterns (positional composite, modal cropped branching,
+ * pre-blur Gemini input, "frame is a CROP" language) that look reasonable
+ * in isolation but break tucked behaviour. Before touching anything here:
+ *   1. Read PRODUCTION_BASELINE_M01_M02.md end-to-end.
+ *   2. Run scripts/test-m02-tier2-arch.ts on job CuRXwWG85vAUS7PTnM8y
+ *      with --topId=SmDwms72D1CsLLaDqXCH (Brown tshirt regression).
+ *   3. Get Bruno's explicit approval after showing him before/after.
+ * ════════════════════════════════════════════════════════════════════════
+ *
+ * Strip-paint: replace the bare-skin midriff above the trouser waistband with
+ * a tucked-in tee, painted by Gemini-3-pro-image-preview.
+ *
+ * 2026-05-25 RESTORED to the May 23 architecture (job jfBNPM2hKtJaep6qIEM0
+ * was the validated reference: 3/3 single-model, 3/3 tucked, clean output).
+ *
+ * Architecture:
+ *   - Single V2 "layered under waistband + LENGTH OVERRIDE" prompt. The V2
+ *     wording was validated 20+ style variants on the historical M03/M04 +
+ *     matrix-paint paths. The waist-down adaptation here keeps the V2
+ *     language verbatim and lets Gemini render the upper portion of the
+ *     visible body (torso + visible sleeves at the sides) — that natural
+ *     visible coverage is what forces "tucked" geometrically (fabric covers
+ *     shoulders-to-waistband → hem has nowhere to go except under the
+ *     waistband).
+ *   - NO modal branching. The cropped/untucked branches added 2026-05-24/25
+ *     introduced more failure modes than they fixed. If a top is "cropped",
+ *     the LENGTH OVERRIDE in this prompt explicitly defeats that fit
+ *     descriptor and renders tucked anyway. Brand intent for an ECOM product
+ *     shot of jeans is tucked.
+ *   - NO positional composite. Adding the cut-and-composite step 2026-05-25
+ *     restricted Gemini's painting zone to ~8% of the frame, which destroyed
+ *     the geometric forcing function and produced 1/3 tucked (vs 3/3 prior).
+ *     Gemini's full output is returned directly. The slight pant-quality
+ *     softening Gemini introduces is acceptable per the May 23 baseline.
+ *   - NO "DO NOT REFRAME" / "frame is a crop" language. The May 23 prompt
+ *     did not constrain Gemini's framing and Gemini reliably kept the
+ *     waist-down crop; over-constraining the framing in later revisions was
+ *     unnecessary.
+ *
+ * The `topRenderingHint` parameter is kept in the signature for forward
+ * compatibility — currently logged but not consumed. If cropped/untucked
+ * support is reintroduced later it can re-enter as a prompt branch.
  */
 export async function paintTeeHemStrip(
   paintedBottomBuffer: Buffer,
@@ -225,176 +272,49 @@ export async function paintTeeHemStrip(
   const topBuf = Buffer.from(await topResp.arrayBuffer());
   const topMime = topResp.headers.get('content-type') || 'image/jpeg';
 
-  // Classify the rendering mode from the hint (default = tucked).
-  // 'cropped' — natural hem above the waistband, visible bare midriff between hem and waistband.
-  // 'untucked' — hem drapes over the waistband, no visible midriff.
-  // 'tucked' — fabric continues to waistband, no visible hem (legacy default).
-  const hintLower = (topRenderingHint || '').toLowerCase();
-  let mode: 'cropped' | 'untucked' | 'tucked';
-  if (/^\s*cropped/.test(hintLower)) mode = 'cropped';
-  else if (/full-?length,\s*untucked/.test(hintLower)) mode = 'untucked';
-  else mode = 'tucked';
-  console.log(`[paintTeeHemStrip] ${shotType} mode=${mode} hint="${(topRenderingHint || '').slice(0, 80)}"`);
+  if (topRenderingHint) {
+    console.log(`[paintTeeHemStrip] ${shotType} (hint="${topRenderingHint.slice(0, 80)}" — currently ignored; V2 tucked mode is the only branch)`);
+  } else {
+    console.log(`[paintTeeHemStrip] ${shotType} V2 tucked`);
+  }
 
-  const renderingBlock = mode === 'cropped'
-    ? `═══ TOP IS CROPPED — NATURAL HEM RULE ═══
-This top is CROPPED. Its natural hem ends ABOVE the trouser waistband — there is a clearly visible BARE-SKIN GAP between the bottom of the top and the top of the trouser waistband. This is the intended look for the garment.
-
-Hint from the brand: ${topRenderingHint}
-
-Geometry — non-negotiable:
-- The bottom hem of the top sits at the model's NAVEL level (mid-back / lumbar area on a back view), measurably ABOVE the trouser waistband.
-- A clean horizontal hem line is visible.
-- BETWEEN that hem and the trouser waistband: a CONTINUOUS STRIP of BARE SKIN (lower back / lumbar / midriff) is fully visible — width approximately 6-10% of the total frame height. This skin strip MUST be present and unambiguous, not a thin sliver.
-- The top's fabric does NOT touch, overlap, or rest on the waistband. ZERO contact between top fabric and waistband.
-- The hem is clean and finished — no fraying, no irregularity — unless the description says otherwise.
-
-DO NOT tuck the top into the trouser. DO NOT extend the top's fabric down to the waistband. DO NOT render the top's hem closer than ~6% of frame height above the waistband — there must be a clear gap of bare skin.`
-    : mode === 'untucked'
-    ? `═══ TOP IS UNTUCKED — DRAPED OVER WAISTBAND ═══
-This top is FULL-LENGTH and worn UNTUCKED. Its hem falls OVER the trouser waistband, draping loosely. No midriff is visible.
-
-Hint from the brand: ${topRenderingHint}
-
-Specifically:
-- The top's fabric extends from the top of the frame DOWN over the trouser waistband.
-- The waistband is partially or fully covered by the top's fabric.
-- A clean horizontal hem line is visible somewhere below the waistband (where the top ends on the hip).
-- NO bare midriff visible.
-- NO tucking — the top is NOT tucked into the waistband.`
-    : `═══ TUCKING — THE CRITICAL RULE ═══
-The top is TUCKED INTO the bottom garment. This means:
-- The tee fabric goes DOWN and DISAPPEARS UNDER the bottom garment's waistband edge.
-- The bottom garment's waistband sits ON TOP OF the tee fabric — the waistband is the ABOVE layer.
-- There is NO visible bottom hem of the tee. NO horizontal "fabric end line" at any height above the waistband. The tee continues smoothly DOWNWARD and the LAST visible pixel of tee fabric is the one that meets the TOP EDGE of the waistband.
-- At the waistband, the visible boundary is the waistband edge itself (tee fabric above → bottom-garment fabric below). NOT an extra "tee hem resting above the waistband".
-
-Picture how a real tucked-in t-shirt looks: tee fabric goes down, gets covered by the waistband, pants/culotte/etc continue below. ONE horizontal transition at the waistband, not two.`;
-
-  const outputBlock = mode === 'cropped'
-    ? `═══ WHAT THE OUTPUT LOOKS LIKE ═══
-Top of frame down to hem of cropped top: tee fabric (matching COLOUR, FABRIC TEXTURE, FINISH from IMAGE 2).
-Then a CLEAN HORIZONTAL HEM (the cropped tee's finished hem edge).
-Then BARE MIDRIFF SKIN (lower back area), continuing the natural skin tone of the visible body region above the waistband.
-Then the trouser waistband at the bottom of this strip.
-No full tee body visible. NO shoulders, NO chest, NO neckline, NO sleeves, NO head.`
-    : mode === 'untucked'
-    ? `═══ WHAT THE OUTPUT LOOKS LIKE ═══
-Top of frame: tee fabric (matching COLOUR, FABRIC TEXTURE, FINISH from IMAGE 2).
-The fabric continues DOWN OVER the waistband area, draping loosely.
-A clean horizontal hem visible somewhere on/below the waistband area.
-NO bare midriff.
-No full tee body visible. NO shoulders, NO chest, NO neckline, NO sleeves, NO head.`
-    : `═══ WHAT THE OUTPUT LOOKS LIKE ═══
-Top of frame: tee fabric (matching COLOUR, FABRIC TEXTURE, FINISH from IMAGE 2). The fabric continues unbroken from the top edge of the frame DOWN to the waistband. NO full tee visible. NO shoulders, NO chest, NO neckline, NO sleeves, NO head.`;
-
-  const failureBlock = mode === 'cropped'
-    ? `═══ FAILURE MODES — ABSOLUTELY WRONG ═══
-- WRONG: hem touching, overlapping, or sitting flush against the waistband.
-- WRONG: hem within 2% of frame height of the waistband (must be a clear, unambiguous skin gap of 6-10% frame height).
-- WRONG: the top fabric extending all the way down to the waistband (this is a TUCKED look, not a cropped look).
-- WRONG: NO bare midriff visible (cropped tops show a clear strip of skin between hem and waistband).
-- WRONG: any pocket-like stitching, embroidery, or seam pattern on the body of the top that is not explicitly described in the top description.
-- WRONG: rendering a full back / front view of the model.
-- WRONG: reframing to chest-height or eye-level camera.
-- WRONG: changing the bottom garment, waistband, footwear, floor, or background.`
-    : mode === 'untucked'
-    ? `═══ FAILURE MODES — ABSOLUTELY WRONG ═══
-- WRONG: top fabric tucked into the waistband.
-- WRONG: bare midriff visible between top hem and waistband (this top drapes OVER the waistband, no midriff visible).
-- WRONG: rendering a full back / front view of the model.
-- WRONG: reframing to chest-height or eye-level camera.
-- WRONG: changing the bottom garment, waistband, footwear, floor, or background.`
-    : `═══ FAILURE MODES — ABSOLUTELY WRONG ═══
-- WRONG: a horizontal hem line / fabric edge visible ABOVE the waistband.
-- WRONG: tee hanging loose / draping OVER the waistband with its hem visible.
-- WRONG: a "gap" of bare skin between the tee hem and the waistband.
-- WRONG: tee bottom edge sitting just above the waistband (this is the untucked look — the tee must DISAPPEAR UNDER the waistband, NOT rest on top of it).
-- WRONG: rendering a full back / front view of the model.
-- WRONG: reframing to chest-height or eye-level camera.
-- WRONG: changing the bottom garment, waistband, footwear, floor, or background.
-- WRONG: leaving any bare skin in the strip above the waistband.`;
-
-  // TUCKED mode uses the OLD V2 "layered under waistband + LENGTH OVERRIDE"
-  // language (validated 20+ style variants on full-body M03/M04 historically)
-  // ADAPTED for the waist-down framing — the V2 assumed Gemini saw shoulders
-  // and a sports-bra; in our waist-down view Gemini only sees bare midriff +
-  // waistband + pants. Without explicit "this is a CROP — fabric continues
-  // OFF the top of the frame" language, Gemini interprets the visible strip
-  // as a cropped-tee and renders a top hem inside it. The expanded prompt
-  // below defines the framing as a crop and forbids ANY visible hem.
-  //
-  // CROPPED + UNTUCKED keep the current modal renderingBlock/outputBlock/
-  // failureBlock structure.
-  const prompt = mode === 'tucked'
-    ? `Edit this e-commerce studio photo. The image is a waist-down ${side.toUpperCase()} VIEW product shot — the camera is cropped at mid-back / mid-torso level. THE MODEL'S BODY AND THE UPPER PORTION OF ANY GARMENT CONTINUE UPWARD OFF THE TOP OF THE FRAME. Only the lower portion of the torso (the lumbar / lower-back region above the waistband) is visible.
-
-Above the trouser waistband, the model's lower torso is currently visible as bare skin. PAINT THAT STRIP with tucked-in tee fabric, using the TOP REFERENCE image for the fabric's colour, texture, weave, and finish.
-
-THE TOP IS TUCKED INTO THE TROUSERS. In this frame:
-- The visible tee region is a CONTINUOUS strip of fabric. NO hem, NO finished edge, NO horizontal seam visible anywhere within the frame.
-- The fabric extends UPWARD OFF THE TOP OF THE FRAME (the top edge of the output cuts through tee fabric, mid-back). NO top hem visible — the fabric simply leaves the frame at the top.
-- The fabric extends DOWNWARD and DISAPPEARS UNDER the trouser waistband. The trouser waistband sits ON TOP of the tee fabric. NO bottom hem visible — it is hidden behind the waistband.
-- The waistband line is clean, unbroken, and is the dominant horizontal transition in this region (NOT a tee hem above it, NOT a tee hem on it).
-
-LENGTH OVERRIDE: Regardless of any "cropped", "short", "boxy", "hits at hip", "ends above waistband", or similar fit descriptor in the TOP TO PAINT text below, render the tee at full tucked length with NO VISIBLE HEMS in this frame. The fit descriptor describes the garment's off-body silhouette — NOT how it is worn here. In this product shot, the tee is tucked, period.
+  // V2 "layered under waistband + LENGTH OVERRIDE" prompt — verbatim from
+  // the May 23 working state (job jfBNPM2hKtJaep6qIEM0 produced 3/3 tucked
+  // single-model). Originally validated in `seedream-tee-edit.ts` across
+  // 20+ style variants. Lightly adapted for the waist-down framing.
+  const prompt = `Edit this e-commerce studio photo. The model is currently shown waist-down with bare skin visible above the trouser waistband (midriff strip). Replace that bare strip with the top shown in the TOP REFERENCE image, painted as a tucked-in shirt.
 
 TOP TO PAINT: ${topDescription}
 
+CRITICAL LAYERING INSTRUCTION:
+The top covers the entire torso from shoulders to below the waistband. The bottom of the top is hidden UNDER the trousers — the trouser waistband sits ON TOP of the shirt fabric. The shirt is completely tucked in with no fabric hanging over or bunching above the waistband. The waistband line is clean and unbroken.
+
+LENGTH OVERRIDE: Regardless of any "cropped", "short", "boxy", "hits at hip", or similar fit descriptor in the TOP TO PAINT text, render the top at full tucked length with the bottom disappearing under the trouser waistband. Fit descriptors in that text describe the garment's off-body silhouette, not how it is worn on this model.
+
+VIEW: This is a ${side} view. Paint the top as it would appear from the ${side}.
+
 PRESERVE EVERYTHING ELSE EXACTLY:
-- Same model — visible skin (arms, hands if visible at sides), body proportions, pose, stance
-- Same trousers (color, wash, fit, waistband, pockets, stitching, hem)
-- Same shoes (style, color, position, contact shadow)
-- Same background (light-grey studio sweep), lighting, framing, composition
+- Same model — features, structure. Do not alter the head or face.
+- Same hair — color, length, cut, parting, styling
+- Same skin tone, body pose, body proportions
+- Same trousers (color, wash, fit, hem, pockets, stitching)
+- Same shoes
+- Same background (warm light-grey studio sweep)
+- Same lighting (bright even studio)
+- Same overall framing and composition
 
-Only change: replace the bare-skin lower-torso strip with a CONTINUOUS tucked-in fabric strip. NO hem visible anywhere — fabric extends off the top of the frame, fabric disappears under the waistband at the bottom. The waistband is the only horizontal transition.`
-    : `This is a TIGHT WAIST-DOWN PRODUCT SHOT, 1:1 SQUARE, 4K resolution, ${side.toUpperCase()} VIEW. The frame shows the model's lower-back / hip / leg region wearing a bottom garment (pants, culotte, skirt, etc — whatever is in the source image). The bottom of the frame is the floor with the footwear; the top of the frame is the model's lower torso / midriff / waist area. Above the bottom garment's waistband there is currently a small slice of BARE SKIN (midriff).
-
-═══ ABSOLUTELY CRITICAL: FRAMING LOCK ═══
-DO NOT REFRAME. DO NOT ZOOM OUT. DO NOT change the camera angle. DO NOT extend the frame upward to show more of the body. The output frame MUST be byte-equivalent to the source image's framing:
-- Camera height, angle, crop: same (waist-down, feet at bottom edge, mid-torso at top edge)
-- Body pose, stance, foot position: same
-- Background: same studio backdrop
-- Model identity, skin tone, body shape, proportions: same
-- BOTTOM GARMENT (whatever its type, colour, fabric, stitching, pockets, waistband, hem, etc): BYTE-IDENTICAL to the source image
-- Footwear, floor, contact shadow: BYTE-IDENTICAL to the source image
-- Arms / hands (if visible at the sides): same — preserve skin tone
-
-═══ THE ONLY CHANGE — TOP FABRIC IN THE MIDRIFF STRIP ═══
-At the TOP of the frame, above the bottom garment's waistband, there is currently a strip of BARE SKIN (the model's midriff). PAINT THAT STRIP based on this top:
-
-${topDescription}
-
-${renderingBlock}
-
-${outputBlock}
-
-${failureBlock}
-
-ONLY the bare-skin midriff strip at the TOP of the source image becomes the top per the rendering rules above. Everything else is byte-equivalent.`;
-
-  // cutFraction selection:
-  //   - tucked: 0.08 — Gemini's zone covers bare-skin midriff + waistband +
-  //     a thin sliver below. Tight zone minimises pocket-bleed risk since
-  //     the V2 prompt explicitly tells Gemini the tee disappears UNDER the
-  //     waistband (no need for a larger painting area below).
-  //   - cropped: 0.10 — Gemini's zone covers the bare midriff + the thin
-  //     waistband strip (cropped tee hem ends above the waistband).
-  //   - untucked: 0.15 — Gemini's zone extends further below so the
-  //     untucked hem can drape over the waistband region.
-  const cutFraction = mode === 'tucked' ? 0.08 : mode === 'cropped' ? 0.10 : 0.15;
-  console.log(`[paintTeeHemStrip] ${shotType} mode=${mode} cutFraction=${cutFraction}`);
+Only change: replace the bare-skin midriff with the described top, tucked into the trousers.`;
 
   const refs: ReferenceImage[] = [
     {
       buffer: paintedBottomBuffer,
       mimeType: 'image/png',
-      label: `SOURCE IMAGE — waist-down ${side} view of the model in a bottom garment. PRESERVE every pixel except the bare-skin strip above the waistband.`,
+      label: 'SOURCE IMAGE — model in trousers, bare midriff above waistband. Replace the bare midriff with the top, tucked in.',
     },
     {
       buffer: topBuf,
       mimeType: topMime,
-      label: 'TOP REFERENCE — flat image of the top to paint as a hem strip per the rendering rules.',
+      label: 'TOP REFERENCE — flat image of the top to paint onto the model.',
     },
   ];
 
@@ -407,17 +327,7 @@ ONLY the bare-skin midriff strip at the TOP of the source image becomes the top 
     apiKey: geminiApiKey,
   });
 
-  // Positional composite: above cutFraction Gemini wins, below it Seedream
-  // wins. Feathered transition (~1% of frame height) hides the seam. This
-  // GUARANTEES no pocket bleed, no pant softening, and no twin-ghost
-  // bleeding through from the seedream stage into the tee zone.
-  const t0 = Date.now();
-  const composited = await positionalCompositeTop(paintedBottomBuffer, result.imageData, {
-    cutFraction,
-  });
-  const dt = ((Date.now() - t0) / 1000).toFixed(2);
-  console.log(`[paintTeeHemStrip] ${shotType} positional composite applied in ${dt}s (cut=${cutFraction})`);
-  return { imageData: composited, mimeType: 'image/png' };
+  return { imageData: result.imageData, mimeType: result.mimeType };
 }
 
 export async function matrixPaint(params: MatrixPaintParams): Promise<MatrixPaintResult> {
@@ -622,6 +532,16 @@ export async function matrixPaint(params: MatrixPaintParams): Promise<MatrixPain
       console.log(`[matrixPaint] M01 top-focus: ${refs.length} refs (${refs.length - 1} named + 1 silent anchor)`);
     }
   } else if (isBack) {
+    // ════════════════════════════════════════════════════════════════════
+    // ⛔ PROTECTED PRODUCTION SURFACE — see gstar/PRODUCTION_BASELINE_M01_M02.md
+    // M02 ref construction is locked. The 6-ref ByteDance v1 pattern below
+    // (5 named refs with per-ref OUT-scoping labels + silent slot-6 anchor,
+    // delivered via forceInventory) is the validated single-model baseline.
+    // Dropping the silent anchor or the per-ref labels brings twin rates
+    // back to ~33%. See LEARNING #107 + the anti-patterns list in the
+    // baseline doc.
+    // ════════════════════════════════════════════════════════════════════
+    //
     // M02 bottom-focus (rev 32, 2026-05-25): ByteDance v1 audit pattern
     // restored. 5 named refs + 1 silent anchor = 6 refs total.
     //
@@ -733,20 +653,55 @@ export async function matrixPaint(params: MatrixPaintParams): Promise<MatrixPain
     console.log(`[matrixPaint] ${shotType} loaded vault prompt rev=${loaded.revision}`);
   }
 
-  const seedreamResult = await generateSeedreamImage({
-    prompt: promptText,
-    referenceImages: refs,
-    aspectRatio: '1:1',
-    apiKey: seedreamApiKey,
-    // forceInventory: deliver per-ref OUT-scoping labels to Seedream as a
-    // REFERENCE IMAGE INVENTORY block in the prompt. Required for the
-    // ByteDance v1 anti-twin pattern (LEARNING #89 + #101). 2026-05-25:
-    // enabled for top-focus too — now that top-focus pass-1 uses the same
-    // multi-ref TIER structure as bottom-focus, the inventory block must
-    // deliver the OUT-scoping labels (otherwise per-ref OUT-scoping is
-    // logging-only and the multi-ref ambiguity returns).
-    forceInventory: true,
-  });
+  // ════════════════════════════════════════════════════════════════════════
+  // ⛔ PROTECTED PRODUCTION SURFACE — see gstar/PRODUCTION_BASELINE_M01_M02.md
+  // The Seedream-pass-1 retry loop below is the validated defense against
+  // residual ~20% twin rate. Removing detectTwinDiptych or reducing
+  // MAX_TWIN_ROLLS brings twins back into production. Tunable values
+  // (thresholds, max attempts) need a regression-test pass before changing.
+  // ════════════════════════════════════════════════════════════════════════
+  //
+  // Seedream pass-1 with twin-detect + re-roll. The rev-32 ByteDance audit
+  // defenses (per-ref OUT-scoping labels via forceInventory + silent slot-6
+  // anchor + GLOBAL_RULES vault prompt) reduce the twin rate but don't
+  // eliminate it (~20% residual on M02 multi-ref). detectTwinDiptych samples
+  // the centre column at mid-frame: a single centred model has the pant
+  // there (denim-blue + mid-luminance), a twin layout has studio background
+  // there (light + neutral). When a twin is detected we re-roll up to
+  // MAX_TWIN_ROLLS times; if still twin, ship anyway and let the reviewer
+  // re-run from the UI.
+  const MAX_TWIN_ROLLS = 3;
+  let seedreamResult: Awaited<ReturnType<typeof generateSeedreamImage>> | null = null;
+  for (let attempt = 1; attempt <= MAX_TWIN_ROLLS; attempt++) {
+    seedreamResult = await generateSeedreamImage({
+      prompt: promptText,
+      referenceImages: refs,
+      aspectRatio: '1:1',
+      apiKey: seedreamApiKey,
+      // forceInventory: deliver per-ref OUT-scoping labels to Seedream as a
+      // REFERENCE IMAGE INVENTORY block in the prompt. Required for the
+      // ByteDance v1 anti-twin pattern (LEARNING #89 + #101).
+      forceInventory: true,
+    });
+    // Skip detection for top-focus — top-focus uses a tighter ref set and
+    // hasn't exhibited the diptych failure mode.
+    if (isTopFocus) break;
+    const det = await detectTwinDiptych(seedreamResult.imageData);
+    if (!det.isTwin) {
+      if (attempt > 1) {
+        console.log(`[matrixPaint] ${shotType} twin re-roll: passed on attempt ${attempt} (luminance=${det.luminance.toFixed(0)}, blueDom=${det.blueDominance.toFixed(0)})`);
+      }
+      break;
+    }
+    if (attempt < MAX_TWIN_ROLLS) {
+      console.warn(`[matrixPaint] ${shotType} twin DETECTED on attempt ${attempt}/${MAX_TWIN_ROLLS} (luminance=${det.luminance.toFixed(0)}, blueDom=${det.blueDominance.toFixed(0)}) — re-rolling Seedream`);
+    } else {
+      console.error(`[matrixPaint] ${shotType} twin DETECTED on final attempt ${attempt}/${MAX_TWIN_ROLLS} (luminance=${det.luminance.toFixed(0)}, blueDom=${det.blueDominance.toFixed(0)}) — shipping anyway, reviewer should re-run`);
+    }
+  }
+  if (!seedreamResult) {
+    throw new Error(`[matrixPaint] ${shotType}: Seedream produced no result after ${MAX_TWIN_ROLLS} attempts`);
+  }
 
   let painted: Buffer = seedreamResult.imageData;
   let mimeType = seedreamResult.mimeType;

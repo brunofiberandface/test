@@ -43,7 +43,7 @@ import { qaShoeMatrixCol, getModel, getWardrobeItem } from '@/lib/firestore';
 import { FieldValue, Firestore } from '@google-cloud/firestore';
 import { Storage } from '@google-cloud/storage';
 import { uploadGeneratedImage } from '@/lib/gcs';
-import { VIEWS, type ViewKey } from './shoe-matrix';
+import { VIEWS, type ViewKey, type CellStatus } from './shoe-matrix';
 
 const BATCH_INPUT_PREFIX = 'batch-inputs/qa-shoe-matrix';
 const BATCH_OUTPUT_PREFIX = 'batch-outputs/qa-shoe-matrix';
@@ -641,13 +641,30 @@ export async function checkBatch(apiKey: string): Promise<{ state: BatchState; p
   console.log(`[checkBatch] streamed ${(bytesRead / 1024 / 1024).toFixed(1)}MB, seen ${totalLinesSeen} lines, overBudget=${overBudget}`);
 
   // Mark cells whose 4 views are all in.
-  for (const cellId of touchedCellIds) {
-    const cellSnap = await qaShoeMatrixCol.doc(cellId).get();
-    if (!cellSnap.exists) continue;
-    const data = cellSnap.data() as { viewsCompleted?: ViewKey[] };
+  //
+  // 2026-05-19 fix: scan ALL cells in `batch-pending`, not only those touched
+  // in this batch-check pass. Previously this loop iterated `touchedCellIds`
+  // (cells with NEW result lines processed in THIS call). When a batch-check
+  // call spans multiple Cloud Run requests (OOM avoidance + 13-min budget),
+  // the FINAL views of a cell can land in one call and the status-promotion
+  // loop runs in another — and if the promotion-call's `touchedCellIds`
+  // doesn't include this cell (because its result lines are already in
+  // `processedKeys`), the status stays at 'batch-pending' permanently.
+  //
+  // Cells then look complete (all 4 images present, viewsCompleted full)
+  // but `isMatrixCellComplete` returns false (gates on status==='done')
+  // so awaiting-matrix jobs sit parked forever. Hit Bruno on
+  // AfSmRKxuKvaV4jXsLFcY (CONTOR 3D WIDE WMN × F3).
+  //
+  // Scanning all batch-pending cells is cheap (few cells in this state at
+  // any moment) and idempotent.
+  const pendingSnap = await qaShoeMatrixCol.where('status', '==', 'batch-pending').get();
+  for (const cellSnap of pendingSnap.docs) {
+    const data = cellSnap.data() as { viewsCompleted?: ViewKey[]; images?: Record<string, string> };
     const completedSet = new Set(data.viewsCompleted || []);
-    const status: 'done' | 'partial' = completedSet.size === VIEWS.length ? 'done' : 'partial';
-    await qaShoeMatrixCol.doc(cellId).update({ status });
+    const allImagesPresent = VIEWS.every(v => completedSet.has(v) && !!data.images?.[v]);
+    const status: 'done' | 'partial' = allImagesPresent ? 'done' : 'partial';
+    await cellSnap.ref.update({ status });
   }
 
   // Persist progress. We've drained everything only if we read the entire
@@ -702,6 +719,81 @@ export async function getCurrentBatchJob(): Promise<BatchJobDoc | null> {
 export async function clearBatchJob(): Promise<void> {
   const db = new Firestore();
   await db.collection('system').doc(BATCH_JOB_DOC_ID).delete();
+}
+
+/**
+ * True iff a batch is currently in flight or has finished but not yet been
+ * fully drained. submitSingleCellBatch refuses to overwrite a live batch.
+ */
+function isBatchLive(state: BatchState | undefined): boolean {
+  return state === 'PENDING' || state === 'RUNNING';
+}
+
+/**
+ * Submit a single (shoe × model) cell as a 4-entry batch (one per view).
+ *
+ * Used by the job-create flow when a job is selected against a missing
+ * matrix cell — we kick off the cell's batch and park the job in
+ * 'awaiting-matrix' until the cell lands.
+ *
+ * Throws if a batch is already in flight (caller should check via
+ * getCurrentBatchJob first and either wait or piggyback).
+ */
+export async function submitSingleCellBatch(
+  shoeId: string,
+  modelId: string,
+  apiKey: string,
+): Promise<{ name: string; totalRequests: number }> {
+  const existing = await getCurrentBatchJob();
+  if (existing && isBatchLive(existing.state)) {
+    throw new Error(
+      `submitSingleCellBatch: batch ${existing.name} is still ${existing.state}; ` +
+      `caller must check getCurrentBatchJob first and wait for the existing batch.`,
+    );
+  }
+  // Mark cell as batch-pending so the matrix UI shows it's queued.
+  const id = `${shoeId}_${modelId}`;
+  await qaShoeMatrixCol.doc(id).set(
+    {
+      shoeId,
+      modelId,
+      status: 'batch-pending' as CellStatus,
+      blocked: false,
+      archived: false,
+      createdAt: FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp(),
+    },
+    { merge: true },
+  );
+  const entries: BatchEntry[] = VIEWS.map(view => ({
+    cellId: id,
+    shoeId,
+    modelId,
+    view,
+    requestKey: `${id}::${view}`,
+  }));
+  console.log(`[submitSingleCellBatch] submitting 4 entries for ${id}`);
+  return submitBatch(entries, apiKey);
+}
+
+/**
+ * Lightweight state-only poll of the current batch — does NOT drain.
+ *
+ * Returns the Firestore-tracked state (refreshed from the local doc, not
+ * re-fetched from Google). For draining results, call checkBatch via the
+ * batch-check endpoint. Worker loop uses this to log progress without
+ * blocking on the 13-min drain budget.
+ */
+export async function pollBatchState(): Promise<{
+  state: BatchState;
+  progress: { done: number; total: number };
+} | null> {
+  const job = await getCurrentBatchJob();
+  if (!job) return null;
+  return {
+    state: job.state,
+    progress: { done: job.completedRequests, total: job.totalRequests },
+  };
 }
 
 // Type-export convenience for endpoints that need to know constants.

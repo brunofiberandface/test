@@ -229,11 +229,47 @@ export async function getJob(jobId: string) {
   };
 }
 
-export async function listJobs(creatorEmail?: string) {
-  let query = jobsCol.orderBy('createdAt', 'desc').limit(50);
+/**
+ * List jobs, newest first, with cursor-based pagination.
+ *
+ * options.cursorMs — pass the createdAt-ms of the LAST job in the previous
+ *   page to fetch the next page (uses Firestore .startAfter for efficient
+ *   pagination; doesn't scan skipped docs the way offset does).
+ * options.limit  — page size, default 50.
+ *
+ * Returns { jobs, hasMore, nextCursorMs } where nextCursorMs is the cursor
+ * to pass on the next call (null when there's no more data).
+ *
+ * Backward compat: callers that don't care about pagination just destructure
+ * .jobs — the 50-default is preserved.
+ */
+export interface ListJobsOptions {
+  cursorMs?: number;
+  limit?: number;
+}
+
+export interface ListJobsResult {
+  jobs: any[];
+  hasMore: boolean;
+  nextCursorMs: number | null;
+}
+
+export async function listJobs(creatorEmail?: string, options: ListJobsOptions = {}): Promise<ListJobsResult> {
+  // Default 50 (dashboard initial page). Cap at 5000 — keeps the /api/jobs
+  // ?fetchAll=true path safe even if the collection grows; the dashboard
+  // hits this when a search filter is active and needs to scan the full DB.
+  const limit = Math.max(1, Math.min(5000, options.limit ?? 50));
+  let query: FirebaseFirestore.Query = jobsCol.orderBy('createdAt', 'desc');
   if (creatorEmail) query = query.where('creatorEmail', '==', creatorEmail);
-  const snap = await query.get();
-  return snap.docs.map(d => {
+  if (options.cursorMs && Number.isFinite(options.cursorMs)) {
+    const { Timestamp } = await import('@google-cloud/firestore');
+    query = query.startAfter(Timestamp.fromMillis(options.cursorMs));
+  }
+  // Fetch limit + 1 so we can detect hasMore without an extra query.
+  const snap = await query.limit(limit + 1).get();
+  const docs = snap.docs.slice(0, limit);
+  const hasMore = snap.docs.length > limit;
+  const jobs = docs.map(d => {
     const data = d.data();
     return {
       id: d.id,
@@ -242,6 +278,64 @@ export async function listJobs(creatorEmail?: string) {
       updatedAt: data.updatedAt?.toDate?.() ? data.updatedAt.toDate().toISOString() : data.updatedAt,
     };
   });
+  const lastDoc = docs[docs.length - 1];
+  const nextCursorMs = (hasMore && lastDoc)
+    ? (lastDoc.data().createdAt?.toMillis?.() ?? null)
+    : null;
+  return { jobs, hasMore, nextCursorMs };
+}
+
+/**
+ * Aggregate counts for the dashboard stats. Returns total active jobs +
+ * per-status buckets. Uses Firestore .count() aggregations — much cheaper
+ * than fetching all docs (no read of the full collection, returns a single
+ * count per query).
+ *
+ * Status buckets match the dashboard filter chips:
+ *   generating — generating | uploading | queued
+ *   review     — review
+ *   completed  — complete | completed
+ *   archived   — archived === true (separate from active)
+ *
+ * "Active" = NOT archived. The total returned here is the active total.
+ * Pre-2026-05-13 the dashboard counted from the currently-loaded page only,
+ * which showed wrong numbers as soon as pagination was introduced.
+ */
+export async function getJobCounts(): Promise<{
+  total: number;
+  generating: number;
+  review: number;
+  completed: number;
+  archived: number;
+}> {
+  // Single-pass scan: read all job docs once and bucket locally. Tried
+  // parallel aggregate count() queries first but they over-counted —
+  // archived docs retain their previous status (e.g. status='review'),
+  // so a status-only aggregate double-counts them. A composite query
+  // `where status==X AND archived!=true` would require a Firestore index
+  // per status; not worth it at this collection size (~200 docs).
+  //
+  // We only fetch the two fields we need (`status`, `archived`) via
+  // select() to keep transfer small. Total round-trip ~150-300ms.
+  const snap = await jobsCol.select('status', 'archived').get();
+  const counts = { total: 0, generating: 0, review: 0, completed: 0, archived: 0 };
+  for (const d of snap.docs) {
+    const data = d.data() as { status?: string; archived?: boolean };
+    const isArchived = data.archived === true;
+    if (isArchived) {
+      counts.archived++;
+      continue;  // archived jobs aren't counted in active buckets
+    }
+    const s = (data.status || '').toLowerCase();
+    if (s === 'generating' || s === 'uploading' || s === 'queued') counts.generating++;
+    else if (s === 'review') counts.review++;
+    else if (s === 'complete' || s === 'completed') counts.completed++;
+    // Active total = sum of all visible (non-archived) statuses. Status
+    // values we don't recognize (e.g. 'failed', 'pending') still count
+    // toward total because the dashboard's "All" view shows them.
+    counts.total++;
+  }
+  return counts;
 }
 
 export async function updateJobStatus(jobId: string, status: string) {

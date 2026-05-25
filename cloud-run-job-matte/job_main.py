@@ -10,6 +10,13 @@ Inputs (env vars set by the invoking gstar-ai-studio service):
   SRC_GCS_URL         — gs:// URL of the source PNG to mat
   DST_WHITE_GCS_URL   — gs:// URL to write the white-bg deliverable
   DST_GREY_GCS_URL    — gs:// URL to write the brand-grey-bg deliverable
+  DST_MATTE_GCS_URL   — (optional) gs:// URL to write the RGBA subject matte
+                        (transparent background, alpha edges from rembg). The
+                        Node side uses this to recomposite the crisp subject
+                        on top of the Gemini grounding-shadow regen output —
+                        the regen softens denim texture even though it adds a
+                        better grounding shadow. Composite avoids both downsides
+                        (Bruno 2026-05-18).
   DISABLE_SHADOW      — "true"/"1" to skip cast + heel layers (M05 close-up, no feet)
 
 Reuses subject_matte.py (the working POC from the previous session) for all the
@@ -55,6 +62,7 @@ def main() -> int:
     src_url = os.environ.get("SRC_GCS_URL")
     white_url = os.environ.get("DST_WHITE_GCS_URL")
     grey_url = os.environ.get("DST_GREY_GCS_URL")
+    matte_url = os.environ.get("DST_MATTE_GCS_URL")  # optional — RGBA subject
     disable_shadow = os.environ.get("DISABLE_SHADOW", "").lower() in ("1", "true", "yes")
 
     if not src_url or not white_url or not grey_url:
@@ -64,6 +72,7 @@ def main() -> int:
     log(f"src={src_url}")
     log(f"white={white_url}")
     log(f"grey={grey_url}")
+    log(f"matte={matte_url or '(skip)'}")
     log(f"disable_shadow={disable_shadow}")
 
     client = storage.Client()
@@ -125,6 +134,15 @@ def main() -> int:
             canvas.convert("RGB").save(out_path, format="PNG", optimize=False)
             out_files.append((name, out_path, _url))
             log(f"composed '{name}' → {out_path}")
+
+        # Optional: also save the RGBA matte itself (subject on transparent bg).
+        # Used by Node to recomposite the crisp subject on top of the Gemini
+        # grounding-shadow regen — see docstring at top.
+        if matte_url:
+            matte_path = tempfile.mktemp(suffix="_matte.png")
+            matte.save(matte_path, format="PNG", optimize=False)
+            out_files.append(("matte", matte_path, matte_url))
+            log(f"saved RGBA matte → {matte_path}")
 
         log(f"matte + composite done in {time.time()-t0:.1f}s")
     except Exception as e:

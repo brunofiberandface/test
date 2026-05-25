@@ -17,6 +17,7 @@ import { NextRequest } from 'next/server';
 import { FieldValue } from '@google-cloud/firestore';
 import { getJob, listShots, shotsCol, enqueueJob, updateJobStatus } from '@/lib/firestore';
 import { triggerWorker } from '@/lib/worker/trigger';
+import { APP_CONFIG } from '@/lib/config';
 
 
 export async function POST(
@@ -33,9 +34,27 @@ export async function POST(
     });
   }
 
-  const shots = await listShots(jobId);
-  if (shots.length === 0) {
+  const shotsRaw = await listShots(jobId);
+  if (shotsRaw.length === 0) {
     return new Response(JSON.stringify({ error: 'Job has no shots to rerun' }), {
+      status: 400,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+
+  // Skip retired shotTypes (M03/M04) — legacy jobs may have shot docs for
+  // them, but the worker no longer dispatches those types. Resetting them
+  // to 'pending' would leave them queued forever and block the job from
+  // ever completing.
+  const activeShotTypes = new Set<string>(APP_CONFIG.shotTypes);
+  const shots = (shotsRaw as any[]).filter(s => activeShotTypes.has(s.shotType || ''));
+  const skipped = shotsRaw.length - shots.length;
+  if (skipped > 0) {
+    const skippedTypes = (shotsRaw as any[]).filter(s => !activeShotTypes.has(s.shotType || '')).map(s => s.shotType).join(', ');
+    console.log(`[RerunSeedream] Skipping ${skipped} legacy shot(s) (retired shotType): ${skippedTypes}`);
+  }
+  if (shots.length === 0) {
+    return new Response(JSON.stringify({ error: 'Job has no active shotTypes to rerun (all are retired)' }), {
       status: 400,
       headers: { 'Content-Type': 'application/json' },
     });
@@ -50,19 +69,31 @@ export async function POST(
   // this, a shot previously set to 5.0 by the per-shot rerun would stay on 5.0
   // even after a "Rerun with Seedream 4.5" — the per-shot field wins precedence
   // over the env var in generate/route.ts.
+  // Flag previously-approved shots with wasApproved=true so the UI can show
+  // a "Pre-approved — Re-approve" badge on the new version (reviewer can
+  // quickly re-bless after eyeballing). Cleared on next approval.
   const batch = (await import('@/lib/firestore')).db.batch();
+  let preApprovedCount = 0;
   for (const shot of shots) {
     const ref = shotsCol.doc(shot.id);
-    batch.update(ref, {
+    const update: Record<string, unknown> = {
       provider: 'seedream',
       seedreamModel: FieldValue.delete(),  // force fallback to 4.5 default
       status: 'pending',
       progressStep: '',
       progressPct: 0,
       updatedAt: new Date(),
-    });
+    };
+    if ((shot as { status?: string }).status === 'approved') {
+      update.wasApproved = true;
+      preApprovedCount++;
+    }
+    batch.update(ref, update);
   }
   await batch.commit();
+  if (preApprovedCount > 0) {
+    console.log(`[RerunSeedream] Flagged ${preApprovedCount} previously-approved shot(s) with wasApproved=true`);
+  }
 
   // Clear job-level anchor URLs so M03/M04 reruns regenerate them cleanly
   // and M01/M02/M05 pick up the new Seedream anchors in the dependency chain.

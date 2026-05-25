@@ -33,8 +33,10 @@ export type PipelineStage =
   | 'shoeedit'
   | 'label'
   | 'upscaled'
-  | 'matte-grey'
-  | 'matte-white'
+  | 'matte-raw-grey'    // rembg + procedural shadow only (pre Gemini regen)
+  | 'matte-raw-white'   // rembg + composite to white (pre Gemini regen)
+  | 'matte-grey'        // after Gemini grounding-shadow regen
+  | 'matte-white'       // after Gemini grounding-shadow regen
   | 'final';
 
 export interface SaveStageArgs {

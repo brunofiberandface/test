@@ -179,3 +179,47 @@ export function injectGender(prompt: string, gender: 'male' | 'female'): string 
 export function injectGarmentType(prompt: string, garmentType: string): string {
   return prompt.replace(/{garment_type}/g, garmentType || 'Pants');
 }
+
+/**
+ * Inject matrix-paint-specific placeholders into a generation prompt.
+ * Replaces:
+ *   {bottom_description} — full Opus garment description block (multi-paragraph)
+ *   {shoe_name}          — short wardrobe shoe item name (vs {shoes_description} long Opus text)
+ *
+ * Used by `matrixPaint()` when loading M01 / M02 prompts from the vault. The
+ * existing `injectStylingDescriptions` handles {shoes_description}; this
+ * complements it with the long bottom-description block + short shoe name.
+ */
+export function injectMatrixContext(
+  prompt: string,
+  bottomDescription: string,
+  shoeName: string,
+): string {
+  return prompt
+    .replace(/{bottom_description}/g, bottomDescription || 'as described in the garment references above')
+    .replace(/{shoe_name}/g, shoeName || 'footwear');
+}
+
+/**
+ * Inject M06-specific placeholders into a generation prompt.
+ * Replaces:
+ *   {pose_label}        — selected pose label (e.g. "Effortless Natural Standing")
+ *   {pose_description}  — selected pose body-geometry text from m06-poses.ts
+ *   {model_description} — model's identity description text
+ *   {bottom_description}— full Opus garment description (also handled by injectMatrixContext)
+ *
+ * Used by `generateM06WithGemini()` when loading the M06 bottom-focus vault prompt.
+ */
+export function injectM06Context(
+  prompt: string,
+  poseLabel: string,
+  poseDescription: string,
+  modelDescription: string,
+  bottomDescription: string,
+): string {
+  return prompt
+    .replace(/{pose_label}/g, poseLabel || 'Standing portrait')
+    .replace(/{pose_description}/g, poseDescription || 'The model stands relaxed, facing the camera.')
+    .replace(/{model_description}/g, modelDescription || 'a model')
+    .replace(/{bottom_description}/g, bottomDescription || 'as described in the garment references above');
+}

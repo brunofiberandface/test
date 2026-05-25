@@ -403,6 +403,41 @@ export async function getCellById(id: string): Promise<ShoeMatrixCell | null> {
   return snapToCell(doc as FirebaseFirestore.QueryDocumentSnapshot);
 }
 
+/**
+ * Look up a single Tier-2 view URL. Returns null if the cell doesn't exist,
+ * is archived/blocked, or the requested view hasn't been rendered yet.
+ *
+ * Used by the new-job matrix-paint pipeline (Stage 2) as the base image for
+ * M01/M02. Caller is responsible for triggering a missing-cell batch when
+ * this returns null.
+ */
+export async function getMatrixView(
+  shoeId: string,
+  modelId: string,
+  view: ViewKey,
+): Promise<string | null> {
+  const cell = await getCellById(cellId(shoeId, modelId));
+  if (!cell || cell.archived || cell.blocked) return null;
+  return cell.images?.[view] ?? null;
+}
+
+/**
+ * True iff the cell exists, isn't archived/blocked, and has all 4 views
+ * populated. Used at job creation (Stage 4) to decide whether to proceed
+ * straight to generation or queue a missing-cell batch and park the job
+ * in 'awaiting-matrix' state.
+ */
+export async function isMatrixCellComplete(
+  shoeId: string,
+  modelId: string,
+): Promise<boolean> {
+  const cell = await getCellById(cellId(shoeId, modelId));
+  if (!cell || cell.archived || cell.blocked) return false;
+  if (cell.status !== 'done') return false;
+  const completed = new Set(cell.viewsCompleted ?? []);
+  return VIEWS.every(v => completed.has(v) && !!cell.images?.[v]);
+}
+
 export async function setBlocked(
   shoeId: string,
   modelId: string,

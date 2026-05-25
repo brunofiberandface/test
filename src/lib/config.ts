@@ -17,11 +17,16 @@ export const APP_CONFIG = {
   imageSize: '4K' as const,
 
   // Shot types
-  shotTypes: ['M01', 'M02', 'M03', 'M04', 'M05', 'M06'] as const,
+  // M03/M04 retired 2026-05-17 — Tier-2 matrix paint pipeline replaces them.
+  // M03/M04 entries remain in the `shots` map + in the ShotType union so legacy
+  // jobs still display correctly, but new jobs never create M03/M04 shot docs.
+  shotTypes: ['M01', 'M02', 'M05', 'M06'] as const,
 
   // Shot dependency chain
-  // M03 first → M04 (needs M03) → M01 (crops M03) + M02 (crops M04) → M05 (needs M03 + M04) → M06 (independent free pose, runs after the e-comm hero set)
-  shotOrder: ['M03', 'M04', 'M01', 'M02', 'M05', 'M06'] as const,
+  // M01 + M02 are independent matrix-paint operations (Tier-2 legs view +
+  // Seedream jeans paint + Gemini tee-edit). M05 needs M02 (pocket detail
+  // anchors off M02's back crop). M06 is the independent free pose.
+  shotOrder: ['M01', 'M02', 'M05', 'M06'] as const,
 
   // Shot metadata
   shots: {
@@ -29,15 +34,12 @@ export const APP_CONFIG = {
     // images (e.g. 3301-regular-tapered 2000×2000 native square renders). Native
     // generation at 1:1 → upscale to 4000×4000 in the generate route. Switched
     // May 1 2026 from '3:4'.
-    M01: { name: 'Cropped Front', aspect: '1:1' as const, dependsOn: ['M03'] as const, view: 'front' as const },
-    M02: { name: 'Cropped Back', aspect: '1:1' as const, dependsOn: ['M04'] as const, view: 'back' as const },
+    M01: { name: 'Cropped Front', aspect: '1:1' as const, dependsOn: [] as const, view: 'front' as const },
+    M02: { name: 'Cropped Back', aspect: '1:1' as const, dependsOn: [] as const, view: 'back' as const },
+    // M03/M04 retired — entries kept for legacy job display only.
     M03: { name: 'Full Body Front', aspect: '1:1' as const, dependsOn: [] as const, view: 'front' as const },
-    // M04 deps were ['M03'] historically (stale — M04 generation never read m03AnchorUrl).
-    // Dropped Apr 30 2026 along with the per-shot parallel refactor so M03+M04+M06
-    // can all run from T=0 in parallel. Both shots share the same model identity refs
-    // so identity drift is not a concern.
     M04: { name: 'Full Body Back', aspect: '1:1' as const, dependsOn: [] as const, view: 'back' as const },
-    M05: { name: 'Pocket Detail', aspect: '1:1' as const, dependsOn: ['M03', 'M04'] as const, view: 'back' as const },
+    M05: { name: 'Pocket Detail', aspect: '1:1' as const, dependsOn: ['M02'] as const, view: 'back' as const },
     M06: { name: 'Free Pose', aspect: '1:1' as const, dependsOn: [] as const, view: 'front' as const },
   },
 

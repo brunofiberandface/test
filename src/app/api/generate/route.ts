@@ -1,33 +1,26 @@
 /**
- * Shot generation endpoint — v3 multi-pass pipeline.
+ * Shot generation endpoint — 2026-05-17 Tier-2 pipeline.
  *
- * Full-body shots (M03/M04) use a 5-pass pipeline:
- *   Phase 1 — Dressed base with foot proportion correction:
- *     Pass 1: Flash generate model + shoes (minimal refs → better proportions)
- *     Pass 2: Sharp foot resize (shrink oversized feet)
- *     Pass 3: Flash heal ankle alignment (fix Sharp artifacts)
- *     Pass 4: Sharp background warm grey correction
- *   Phase 2 — Final garment generation:
- *     Pass 5: Flash generate with dressed base anchor + garment refs
+ * Per-shot routing:
+ *   M01 / M02 — matrix-paint (Tier-2 cell base + Seedream jeans paint)
+ *   M05       — Seedream single-pass (pocket-detail back close-up)
+ *   M06       — Seedream → Gemini tee-edit (free-pose full body)
  *
- * Cropped/detail shots (M01/M02/M05) use single-pass as before.
- * Shot dependency chain: M03 → M04 → M01/M02 → M05.
+ * Post-generation: leather label composite (M02 only) → matte + backdrop
+ * variants (M01/M02/M06) → deliverable formatting (PDP + PLP for all 4).
+ *
+ * M03 / M04 retired 2026-05-17 — replaced by the Tier-2 matrix.
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { updateShot, getJob, updateJob, shotsCol, listShots, updateJobStatus } from '@/lib/firestore';
 import { uploadGeneratedImage } from '@/lib/gcs';
 import { saveStage, type PipelineStage } from '@/lib/pipeline/stage-recorder';
-import { generateShot, generateM03WithDressedBase, generateM04WithDressedBase, getDressedBaseInputs, type GenerationContext } from '@/lib/pipeline/generate';
 import { generateSeedreamShot, type SeedreamGenerationContext } from '@/lib/pipeline/seedream-generate';
 import { applyTeeEdit, needsTeeEdit } from '@/lib/pipeline/seedream-tee-edit';
-// V2 shoe-edit: Imagen 3 inpaint with bottom-strip mask. The V1 (gemini-shoe-edit)
-// regenerated pixels and airbrushed denim texture; preserved for reference.
-import { applyShoeEdit, needsShoeEdit } from '@/lib/pipeline/imagen-shoe-edit';
+import { matrixPaint } from '@/lib/pipeline/matrix-paint';
+import { APP_CONFIG } from '@/lib/config';
 import { produceBackdropVariants } from '@/lib/subject-matte';
 import { loadPrompt, loadPromptById } from '@/lib/pipeline/prompt-loader';
-import { footResize } from '@/lib/pipeline/foot-resize';
-import { generateDressedBase } from '@/lib/pipeline/dressed-base-pipeline';
-import { APP_CONFIG } from '@/lib/config';
 import { applyAutoHybridLabel } from '@/lib/label-auto';
 import { getFocusSlot, type ShotType, type GenerationProvider } from '@/types';
 
@@ -74,26 +67,21 @@ export async function POST(req: NextRequest) {
       shotData?.provider || job?.provider || 'gemini';
     console.log(`[Generate] ${shotType} using provider=${provider}`);
 
-    // Load prompt — use alternative if specified, otherwise golden vault
-    // Pass pipeline so Seedream jobs get Seedream-specific prompts from the vault
+    // Load prompt — use alternative if specified, otherwise golden vault.
+    // Matrix-paint shots (M01/M02) have their prompt hardcoded in matrix-paint.ts
+    // and do not consume vault prompts, so we skip the loader for them. The
+    // alternativePrompt override still works if set explicitly.
     await reportProgress('Loading prompt', 8);
     const pipeline: 'gemini' | 'seedream' | undefined = provider === 'seedream' ? 'seedream' : undefined;
+    const isMatrixShot = shotType === 'M01' || shotType === 'M02';
     const prompt = alternativePromptId
       ? await loadPromptById(alternativePromptId)
-      : await loadPrompt(shotType as ShotType, undefined, pipeline);
+      : isMatrixShot
+        ? null
+        : await loadPrompt(shotType as ShotType, undefined, pipeline);
     if (alternativePromptId) {
       console.log(`[Generate] Using alternative prompt: ${alternativePromptLabel || alternativePromptId}`);
     }
-
-    // Build generation context
-    const ctx: GenerationContext = {
-      wardrobe: job.wardrobe,
-      modelId: job.modelId,
-      silhouette: job.silhouetteAnalysis || { front: '', back: '' },
-      m03AnchorUrl: job.m03AnchorUrl,
-      m04AnchorUrl: job.m04AnchorUrl,
-      apiKey,
-    };
 
     let finalImageData: Buffer;
     // Recorded on the shot doc so reruns / tee-edit / future audit can tell
@@ -123,11 +111,64 @@ export async function POST(req: NextRequest) {
     let teeEditApplied: boolean | undefined;
     let teeEditError: string | undefined;
 
-    if (provider === 'seedream') {
-      // ── Seedream path — single-pass for all shots, no dressed base ──
+    // ── M01/M02 matrix-paint pipeline (Tier-2 base + Seedream jeans paint) ──
+    // Provider-agnostic — overrides job.provider for these two shots. M01/M02
+    // no longer crop from M03/M04 (which are retired). They generate
+    // independently from the (model × shoe) Tier-2 cell rendered ahead of time.
+    //
+    // Always: Tier-2 fullBody view → Seedream paints jeans → Gemini tee-edit
+    // paints top → sharp-crop to one of two modes:
+    //   bottom / shoe / none → 'waist' crop (waistband + 5% headroom → feet,
+    //     showing the tucked tee hem above the jeans waistband).
+    //   top                  → 'upper-body' crop (head → mid-femur, no feet).
+    //     matrixUpperBodyCrop flag disables the cast shadow in the matte step.
+    let matrixUpperBodyCrop = false;
+    if (shotType === 'M01' || shotType === 'M02') {
+      const matrixFocusSlot = getFocusSlot(job.wardrobe) ?? undefined;
+      await reportProgress(`Matrix paint (fullBody → jeans → tee-edit → ${matrixFocusSlot === 'top' ? 'upper-body' : 'waist'} crop)`, 20);
+      const result = await matrixPaint({
+        shotType: shotType as 'M01' | 'M02',
+        modelId: job.modelId,
+        wardrobe: job.wardrobe,
+        focusSlot: matrixFocusSlot,
+        seedreamApiKey: seedreamApiKey || process.env.BYTEPLUS_API_KEY,
+        geminiApiKey: apiKey,
+      });
+      console.log(`[Generate] ${shotType} matrix-paint complete (base=…${result.matrixBaseUrl.slice(-60)}, ${result.imageData.length} bytes, upperBody=${result.isUpperBodyCrop}, teeEdited=${result.teeEdited})`);
+      finalImageData = result.imageData;
+      usedSeedreamModel = result.seedreamModel;
+      matrixUpperBodyCrop = result.isUpperBodyCrop;
+      if (result.teeEdited) {
+        teeEditApplied = true;
+      } else if (result.teeEditError) {
+        teeEditApplied = false;
+        teeEditError = result.teeEditError;
+      }
+      // Rev 30 (2026-05-24): two-stage save for the matrix path. The
+      // Gemini extend-hem-over-shoe step is gone (Seedream paints the
+      // trouser directly onto a pre-shod Tier-2 base), so there's no
+      // 'shoeedit' stage to record. `seedream` is the raw Seedream paint;
+      // `teeedit` is the post-strip-paint + composite-back final.
+      //
+      // If strip-paint didn't run (no top in wardrobe), the seedream
+      // pixels ARE the final and saving 'teeedit' would be a duplicate
+      // tile — so we elide.
+      if (result.preStripPaintBuffer) {
+        await recordStage('seedream', result.preStripPaintBuffer);
+        await recordStage('teeedit', finalImageData);
+      } else {
+        await recordStage('seedream', finalImageData);
+      }
+
+    } else {
+      // ── Seedream path — single-pass for M05/M06, no dressed base ──
+      // The legacy provider='gemini' path was retired with M03/M04 — it was
+      // structurally tied to those shots and had no working M05/M06 path of
+      // its own. All non-matrix shots now go through Seedream regardless of
+      // job.provider; the `provider` field is kept on the doc for audit only.
       // Model selected by SEEDREAM_MODEL env var (4.5 default; flip to 5.0 in
       // Cloud Run console). Optional per-job override via job.seedreamModel.
-      // Label composite (below) still runs on M02/M04 Seedream output.
+      // Label composite (below) still runs on M02 Seedream output.
       await reportProgress('Generating image (Seedream)', 15);
       // Precedence: shot.seedreamModel (per-shot rerun) > job.seedreamModel
       // (job-level rerun) > SEEDREAM_MODEL env var default. The "Rerun with
@@ -144,8 +185,7 @@ export async function POST(req: NextRequest) {
         wardrobe: job.wardrobe,
         modelId: job.modelId,
         silhouette: job.silhouetteAnalysis || { front: '', back: '' },
-        m03AnchorUrl: job.m03AnchorUrl,
-        m04AnchorUrl: job.m04AnchorUrl,
+        m02AnchorUrl: job.m02AnchorUrl,  // M05 dominant anchor — set by route after M02 lands
         apiKey: seedreamApiKey || process.env.BYTEPLUS_API_KEY,
         model: seedreamModelOverride,  // undefined → uses SEEDREAM_MODEL env var default
         m06PoseId: (job as { m06PoseId?: string }).m06PoseId,  // M06-only — undefined falls back to default
@@ -153,20 +193,15 @@ export async function POST(req: NextRequest) {
         m06TopPoseId: (shotData as { m06TopPoseId?: string })?.m06TopPoseId,  // M06 top-focus only — undefined = random pick (t01-t05)
         focusSlot,  // 'top' | 'bottom' | 'shoe' | undefined
       };
-      const result = await generateSeedreamShot(shotType as ShotType, seedreamCtx, prompt);
+      // prompt is non-null here — only M01/M02 (matrix shots) skip the loader,
+      // and those don't reach the seedream branch (intercepted by matrix-paint).
+      const result = await generateSeedreamShot(shotType as ShotType, seedreamCtx, prompt!);
       const usedModel = result.model;  // resolved by seedream-client (override OR env)
       usedSeedreamModel = usedModel;
       console.log(`[Generate] ${shotType} Seedream generated (${result.imageData.length} bytes, model=${usedModel})`);
       finalImageData = result.imageData;
 
-      // M04 two-pass: bubble Pass 1 URL into the gallery. Two-pass already
-      // wrote Pass 1 to GCS for Pass 2 to reference by URL; we just record
-      // the URL on pipelineStages here (no duplicate upload).
-      if (result.pass1Url) {
-        pipelineStages['pass1'] = result.pass1Url;
-      }
-
-      // ── Gemini tee-edit: replace sports bra with real top (M01-M04 only) ──
+      // ── Gemini tee-edit: replace sports bra with real top (M06 only) ──
       // Seedream 4.5 renders with a sports bra to avoid body seam artifacts.
       // Gemini then paints the real top using the flat image + Opus description.
       // Seedream 5.0+ handles tucked-in tops natively, so tee-edit is skipped.
@@ -197,90 +232,21 @@ export async function POST(req: NextRequest) {
           }
           teeEditApplied = false;
         }
-
-        // ── Gemini shoe-edit (post-tee-edit) ──────────────────────────────
-        // Repositions the footwear UNDER the cascading hem, extends the hem
-        // to floor level. Fixes the "boots fully visible / pants stop at boot
-        // top" regression that Seedream cannot resolve via prompting alone
-        // (silhouette PART B is hardcoded against bare-feet/sneaker
-        // proportions and contradicts tall-boot geometry). Non-blocking: on
-        // failure, the tee-edited image is kept as-is.
-        if (needsShoeEdit(shotType as ShotType)) {
-          const shoeResult = await applyShoeEdit({
-            sourceImage: finalImageData,
-            wardrobe: job.wardrobe,
-            shotType: shotType as ShotType,
-            apiKey,
-          });
-          if (shoeResult.edited) {
-            console.log(`[Generate] ${shotType} shoe-edit applied (${shoeResult.imageData.length} bytes)`);
-            finalImageData = shoeResult.imageData;
-            await recordStage('shoeedit', finalImageData);
-          } else if (shoeResult.error) {
-            console.error(`[Generate] ${shotType} shoe-edit FAILED after retries: ${shoeResult.error}`);
-          } else {
-            console.log(`[Generate] ${shotType} shoe-edit skipped (no shoe item or missing ref)`);
-          }
-        }
-      }
-    } else {
-      // ── Gemini path (production default) — dressed base for M03/M04, single-pass others ──
-      const isFullBody = shotType === 'M03' || shotType === 'M04';
-      if (isFullBody) {
-        console.log(`[Generate] ${shotType} using dressed base pipeline`);
-        const view = shotType === 'M03' ? 'front' as const : 'back' as const;
-
-        // Phase 1: Generate dressed base with corrected foot proportions
-        await reportProgress('Generating dressed base', 10);
-        const dressedBaseInputs = await getDressedBaseInputs(ctx);
-
-        const dressedBase = await generateDressedBase({
-          modelRefImage: dressedBaseInputs.modelRefImage,
-          shoesRefImage: dressedBaseInputs.shoesRefImage,
-          shoesDescription: dressedBaseInputs.shoesDescription,
-          view,
-          aspectRatio: prompt.aspectOverride || APP_CONFIG.shots[shotType as keyof typeof APP_CONFIG.shots].aspect,
-          openShoes: dressedBaseInputs.openShoes,
-          apiKey,
-          onProgress: reportProgress,
-        });
-
-        console.log(`[Generate] ${shotType} dressed base ready (${(dressedBase.timings.total / 1000).toFixed(1)}s)`);
-
-        // Phase 2: Generate final image with dressed base + garment refs
-        await reportProgress('Generating final image', 58);
-
-        const result = shotType === 'M03'
-          ? await generateM03WithDressedBase(ctx, prompt, dressedBase.imageData)
-          : await generateM04WithDressedBase(ctx, prompt, dressedBase.imageData);
-
-        console.log(`[Generate] ${shotType} final image generated (${result.imageData.length} bytes)`);
-        finalImageData = result.imageData;
-
-      } else {
-        // ── Standard single-pass generation ──
-        await reportProgress('Generating image', 15);
-        const result = await generateShot(shotType as ShotType, ctx, prompt);
-        console.log(`[Generate] ${shotType} generated successfully (${result.imageData.length} bytes)`);
-        finalImageData = result.imageData;
       }
     }
 
-    // ── Auto hybrid leather-label composite (3-tier, Option B) ─────────────
-    // Pocket anchor homography + saved corners from labelStyles → shader.
-    // Only runs for M02/M04, requires ENABLE_HYBRID_LABEL_AUTO != 0 and a
-    // complete {template, style, colorway} triple. All failure modes skip
-    // silently and return the original image — see src/lib/label-auto.ts.
-    // Rollback: set ENABLE_HYBRID_LABEL_AUTO=0 on the Cloud Run service.
-    if (shotType === 'M02' || shotType === 'M04') {
-      await reportProgress('Applying leather label', 78);
-      finalImageData = await applyAutoHybridLabel({
-        imageBuffer: finalImageData,
-        shotType: shotType as ShotType,
-        job,
-      });
-      await recordStage('label', finalImageData);
-    }
+    // Rev 30 (2026-05-24): leather-label composite step retired for M02.
+    // The label is now rendered directly by Seedream in the matrix-paint
+    // step (slot 1-4 fit-model angles + slot 4 ECOM ref all show the
+    // leather brand patch in its correct position), and the composite-back
+    // step keeps the Seedream patch crisp through strip-paint. Running an
+    // additional homography-warp shader on top introduced more drift than
+    // it fixed.
+    //
+    // Rollback if needed: re-introduce the applyAutoHybridLabel block here
+    // gated on shotType === 'M02'. The helper itself
+    // (src/lib/label-auto.ts) is unchanged.
+    void applyAutoHybridLabel; // keep import live in case of revert
 
     // ── Square upscale to 4000×4000 (G-Star brand spec) ─────────────────────
     // Seedream renders at 2048×2048 native (1:1). We upscale to 4000×4000
@@ -310,15 +276,17 @@ export async function POST(req: NextRequest) {
 
     // ── Subject matte + backdrop variants ──────────────────────────────────
     // Shot type policy:
-    //   M03/M04/M06 — matte + cast shadow + heel contact + composite onto white & grey
+    //   M01/M02/M06 — matte + cast shadow + heel contact + composite onto white & grey
     //   M05         — SKIP (2026-05-11, Bruno-approved). Track A (cropped refs)
     //                 + rev 32 prompt produces a clean grey-backdrop M05 from
     //                 Seedream alone. Matte step was adding cutout artifacts
     //                 (xray softness without alpha_matting, jagged edges with).
-    //                 13-unit grey delta vs M03 master accepted as imperceptible
-    //                 for the detail-shot use case.
-    //   M01/M02     — SKIP at this layer (they crop from M03/M04 grey master via
-    //                 cropWaistFromFullBody, naturally inheriting the new look)
+    //                 13-unit grey delta vs other masters accepted as
+    //                 imperceptible for the detail-shot use case.
+    //
+    // M01/M02 added to the matte set on 2026-05-17 with the Tier-2 matrix-paint
+    // pipeline: they are now standalone 1:1 4K shots (not crops of M03/M04),
+    // so they need their own matte/white-master rather than inheriting.
     //
     // The grey master REPLACES the raw Seedream output as the primary imageUrl,
     // so the results page, PDP/PLP, and downstream consumers all see the new look.
@@ -330,10 +298,25 @@ export async function POST(req: NextRequest) {
     console.log(`[Generate] ${shotType} entering matte block (finalImageData=${finalImageData.length} bytes)`);
     let whiteMasterUrl: string | undefined;
     {
-      const SHADOW_SHOTS = new Set(['M03', 'M04', 'M06']);
+      const SHADOW_SHOTS = new Set(['M01', 'M02', 'M06']);
       const NO_SHADOW_SHOTS = new Set<string>();  // M05 removed 2026-05-11 — see comment block above
+      // 2026-05-22: M06 needs the rembg + composite + procedural-shadow output,
+      // but NOT the Gemini grounding-shadow regen step. Gemini's regen drifts
+      // the subject framing (head cropped at top of frame, feet shifted) even
+      // with the knockout fix applied. Procedural shadow from the Python matte
+      // job is sufficient. Add M06 to SKIP_GEMINI_SHADOW so it still matte's +
+      // produces backdrop variants but Gemini doesn't touch the output.
+      const SKIP_GEMINI_SHADOW = new Set(['M06']);
       const shouldMatte = SHADOW_SHOTS.has(shotType as string) || NO_SHADOW_SHOTS.has(shotType as string);
-      console.log(`[Generate] ${shotType} shouldMatte=${shouldMatte}`);
+      // Top-focus matrix-paint M01/M02 outputs an upper-body crop (head →
+      // mid-femur). No feet means the procedural foot-cast-shadow would render
+      // floating mid-thigh — disable shadow but still produce white/grey
+      // variants from rembg matte.
+      const disableShadow =
+        NO_SHADOW_SHOTS.has(shotType as string) ||
+        SKIP_GEMINI_SHADOW.has(shotType as string) ||
+        matrixUpperBodyCrop;
+      console.log(`[Generate] ${shotType} shouldMatte=${shouldMatte} disableShadow=${disableShadow}`);
       if (shouldMatte) {
         const version_for_white = body.version || 1;
         const jobName_for_white = job.jobName || job.jobId;
@@ -341,7 +324,7 @@ export async function POST(req: NextRequest) {
           await reportProgress('Matting + backdrop variants', 87);
           console.log(`[Generate] ${shotType} calling produceBackdropVariants…`);
           const variants = await produceBackdropVariants(finalImageData, {
-            disableShadow: NO_SHADOW_SHOTS.has(shotType as string),
+            disableShadow,
           });
           console.log(`[Generate] ${shotType} produceBackdropVariants returned ${variants ? 'success' : 'null'}`);
           if (variants) {
@@ -352,7 +335,15 @@ export async function POST(req: NextRequest) {
             // version history) work off the cleaned/composited version.
             finalImageData = variants.greyBuffer;
             console.log(`[Generate] ${shotType} backdrop variants ready (white=${(variants.whiteBuffer.length/1024).toFixed(0)}KB grey=${(variants.greyBuffer.length/1024).toFixed(0)}KB)`);
-            // Save both matte variants for stage-gallery inspection.
+            // Save final matte stages for the debug viewer. Dropped the
+            // matte-raw-grey / matte-raw-white intermediates (2026-05-18
+            // cleanup): they were rembg + procedural-shadow snapshots BEFORE
+            // the Gemini grounding-shadow regen — useful when debugging the
+            // matte service itself, but production reviewers compare seedream
+            // → teeedit → label → matte-grey/white, so the intermediates
+            // were noise. Each saved stage = a GCS PUT, so this also trims
+            // per-shot cost. Re-enable if grounding-shadow regen artifacts
+            // become a recurring debug target.
             await recordStage('matte-grey', variants.greyBuffer);
             await recordStage('matte-white', variants.whiteBuffer);
           } else {
@@ -365,42 +356,6 @@ export async function POST(req: NextRequest) {
     }
     console.log(`[Generate] ${shotType} exiting matte block`);
 
-    // ── M01/M02 white-crop ─────────────────────────────────────────────────
-    // M01/M02 don't go through the matte pipeline (they crop from M03/M04 grey
-    // master and inherit the matted look). To produce their white-bg sibling,
-    // we crop the same way from the parent's white anchor — pure sharp work,
-    // no API calls. Falls back gracefully when the parent predates the matte
-    // pipeline (no m03WhiteAnchorUrl / m04WhiteAnchorUrl on the job doc).
-    //
-    // Crop mode mirrors the grey-master crop in seedreamM01/M02: 'upper-body'
-    // for top-focus jobs (jacket as hero), 'waist' for bottom-focus. Without
-    // this branch the white-bg M01/M02 would render waist-down even when the
-    // grey-bg sibling is upper-body, breaking the toggle.
-    {
-      const CROP_FROM_WHITE_PARENT = new Set(['M01', 'M02']);
-      if (CROP_FROM_WHITE_PARENT.has(shotType as string)) {
-        const whiteAnchorUrl = shotType === 'M01' ? job.m03WhiteAnchorUrl : job.m04WhiteAnchorUrl;
-        if (whiteAnchorUrl) {
-          try {
-            const { cropFromFullBody } = await import('@/lib/pipeline/elbow-crop');
-            const whiteFocusSlot = getFocusSlot(job.wardrobe);
-            const whiteCropMode = whiteFocusSlot === 'top' ? 'upper-body' : 'waist';
-            console.log(`[Generate] ${shotType} cropping from white parent (${whiteCropMode}, focus=${whiteFocusSlot || 'none'})…`);
-            const whiteCropped = await cropFromFullBody(whiteAnchorUrl, whiteCropMode);
-            const version_for_white = body.version || 1;
-            const jobName_for_white = job.jobName || job.jobId;
-            const whiteName = `${job.modelId}_${shotType}_v${version_for_white}_white.png`;
-            whiteMasterUrl = await uploadGeneratedImage(jobName_for_white, whiteName, whiteCropped.imageData);
-            console.log(`[Generate] ${shotType} white crop ready (${(whiteCropped.imageData.length / 1024).toFixed(0)}KB) → ${whiteName}`);
-          } catch (cropErr) {
-            console.error(`[Generate] ${shotType} white-crop failed (non-blocking):`, cropErr);
-          }
-        } else {
-          console.log(`[Generate] ${shotType}: parent has no white anchor — skipping white master`);
-        }
-      }
-    }
-
     await reportProgress('Uploading image', 90);
 
     // Upload to GCS
@@ -408,10 +363,12 @@ export async function POST(req: NextRequest) {
     const filename = `${job.modelId}_${shotType}_v${version}.png`;
     const jobName = job.jobName || job.jobId;
     const imageUrl = await uploadGeneratedImage(jobName, filename, finalImageData);
-    // Mirror as the 'final' stage so the gallery has a stable last URL even
-    // when the primary imageUrl gets rewritten by later regens. Same file
-    // contents, separate path under {jobName}/debug.
-    pipelineStages['final'] = imageUrl;
+    // Dropped the 'final' stage pointer (2026-05-18 cleanup): it was set to
+    // imageUrl, producing a duplicate "8. Final" tile in the debug viewer.
+    // The viewer already renders imageUrl as the primary image; the pointer
+    // added no new information. Removing keeps the stages dialog focused on
+    // actual transform steps. Re-add as `pipelineStages['final'] = imageUrl`
+    // if a downstream consumer needs a stable original-output URL.
     // When matting succeeded, this primary upload IS the grey master.
     // greyMasterUrl is derived inline at the Firestore-write site below.
 
@@ -435,27 +392,19 @@ export async function POST(req: NextRequest) {
       console.error(`[Generate] Version history save failed:`, vhErr);
     }
 
-    // Save anchor URLs for dependency chain (M03/M04 are sources for M01/M02 crops).
-    // We also persist the white-bg sibling URL when the matte pipeline ran on this
-    // shot, so M01/M02 can crop a parallel white-bg variant in lockstep with grey.
-    if (shotType === 'M03') {
-      await updateJob(jobId, {
-        m03AnchorUrl: imageUrl,
-        ...(whiteMasterUrl ? { m03WhiteAnchorUrl: whiteMasterUrl } : {}),
-      });
-      console.log(`[Generate] M03 anchor saved (white=${whiteMasterUrl ? 'set' : 'none'})`);
-    } else if (shotType === 'M04') {
-      await updateJob(jobId, {
-        m04AnchorUrl: imageUrl,
-        ...(whiteMasterUrl ? { m04WhiteAnchorUrl: whiteMasterUrl } : {}),
-      });
-      console.log(`[Generate] M04 anchor saved (white=${whiteMasterUrl ? 'set' : 'none'})`);
+    // ── M02 anchor save ────────────────────────────────────────────────────
+    // M05 depends on M02 (see APP_CONFIG.shots.M05.dependsOn). The worker
+    // dispatches M05 only after M02 hits 'done'; M05's seedreamCtx reads
+    // job.m02AnchorUrl as its dominant ref. Persist the just-uploaded M02
+    // URL so the M05 generate call (a separate request) finds it on the job.
+    if (shotType === 'M02') {
+      await updateJob(jobId, { m02AnchorUrl: imageUrl });
+      console.log(`[Generate] M02 anchor saved → ${imageUrl.slice(-60)}`);
     }
 
     // ── Deliverable formatting ─────────────────────────────────────────────
-    // For deliverable shot types (M01, M02, M05, M06) — but NOT for M03/M04
-    // which are intermediates — produce the brand-spec PDP (4000×4000) and
-    // PLP (1500×2025) variants and upload them as siblings.
+    // For deliverable shot types (M01, M02, M05, M06) produce the brand-spec
+    // PDP (4000×4000) and PLP (1500×2025) variants and upload them as siblings.
     // Non-blocking: a formatter failure must not fail the shot.
     let pdpUrl: string | undefined;
     let plpUrl: string | undefined;
@@ -504,15 +453,19 @@ export async function POST(req: NextRequest) {
       ...(Object.keys(pipelineStages).length ? { pipelineStages } : {}),
     });
 
-    // Check if all shots done → move job to 'review'
+    // Check if all shots done → move job to 'review'. Retired shotTypes
+    // (M03/M04) on legacy jobs are ignored — the worker never dispatches
+    // them so they'd never reach 'done' status.
     try {
       const allShots = await listShots(jobId);
-      const allDone = allShots.length > 0 && allShots.every(
+      const activeShotTypes = new Set<string>(APP_CONFIG.shotTypes);
+      const activeShots = allShots.filter((s: any) => activeShotTypes.has(s.shotType));
+      const allDone = activeShots.length > 0 && activeShots.every(
         (s: any) => s.status === 'done' || s.status === 'approved'
       );
       if (allDone) {
         await updateJobStatus(jobId, 'review');
-        console.log(`[Generate] All shots done — job ${jobId} moved to review`);
+        console.log(`[Generate] All active shots done — job ${jobId} moved to review`);
       }
     } catch (statusErr) {
       console.error('[Generate] Job status check failed:', statusErr);

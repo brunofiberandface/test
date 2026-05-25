@@ -124,23 +124,34 @@ export interface ElbowCropResult {
 }
 
 /**
- * Crop a full-body image to an elbow-down 3:4 frame.
+ * Crop a full-body image to a mode-specific frame (elbow / chin / chest /
+ * waist / upper-body). Accepts either a public URL or a raw Buffer.
  *
- * @param sourceUrl Publicly fetchable URL of the full-body source image.
- * @param apiKey    Optional Gemini API key override (falls back to GEMINI_API_KEY env).
+ * @param source  Publicly fetchable URL of the source image, OR a raw Buffer
+ *                (skips the network download — used by matrix-paint top-focus
+ *                which already holds the painted full-body in memory).
+ * @param apiKey  Optional Gemini API key override (falls back to GEMINI_API_KEY env).
  */
 export async function cropFromFullBody(
-  sourceUrl: string,
+  source: string | Buffer,
   mode: CropMode = 'chin',
   apiKey?: string,
 ): Promise<ElbowCropResult> {
   const preset = PRESETS[mode];
-  // 1. Download source
-  console.log(`[${preset.label}] Downloading source: ${sourceUrl.substring(0, 80)}...`);
-  const resp = await fetch(sourceUrl, { signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS) });
-  if (!resp.ok) throw new Error(`[${preset.label}] Source fetch failed: ${resp.status}`);
-  const sourceBuf = Buffer.from(await resp.arrayBuffer());
-  const sourceMime = resp.headers.get('content-type') || 'image/png';
+  // 1. Resolve source bytes
+  let sourceBuf: Buffer;
+  let sourceMime: string;
+  if (Buffer.isBuffer(source)) {
+    sourceBuf = source;
+    sourceMime = 'image/png';
+    console.log(`[${preset.label}] Source: in-memory buffer (${(sourceBuf.length / 1024).toFixed(0)}KB)`);
+  } else {
+    console.log(`[${preset.label}] Downloading source: ${source.substring(0, 80)}...`);
+    const resp = await fetch(source, { signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS) });
+    if (!resp.ok) throw new Error(`[${preset.label}] Source fetch failed: ${resp.status}`);
+    sourceBuf = Buffer.from(await resp.arrayBuffer());
+    sourceMime = resp.headers.get('content-type') || 'image/png';
+  }
 
   // 2. Measure
   const metadata = await sharp(sourceBuf).metadata();

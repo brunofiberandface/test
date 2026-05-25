@@ -22,6 +22,13 @@ import { getQueueInfo } from '@/lib/worker/tasks';
 
 const STUCK_GENERATING_MS = 900_000;   // 15 min
 const STUCK_HEARTBEAT_MS = 420_000;    // 7 min (5 was false-positiving during long Seedream calls)
+const STUCK_HEARTBEAT_JOB_MODE_MS = 1_800_000; // 30 min — in job/tasks mode the
+                                               // worker exits cleanly between
+                                               // batches, so the heartbeat is
+                                               // naturally stale 1-15 min. 30
+                                               // min without progress is the
+                                               // real "Cloud Run Job stuck /
+                                               // trigger failing" symptom.
 const FAILURE_WINDOW_MS = 3_600_000;   // 1h
 
 interface HealthAlert {
@@ -116,10 +123,42 @@ export async function GET() {
   const completedLast24h = completedJobs.filter(j => j.ms > 0 && now - j.ms <= 86_400_000).length;
 
   // Alerts
-  if (activeSlots.length > 0 && heartbeatAgeMs > STUCK_HEARTBEAT_MS) {
+  //
+  // Heartbeat alert is MODE-AWARE (2026-05-14):
+  //   - `inproc`: worker is a long-lived HTTP request; heartbeat updates
+  //     continuously while alive → stale = worker died (real alert).
+  //   - `job` / `tasks`: worker is a short-lived Cloud Run Job that exits
+  //     cleanly between batches. Heartbeat = timestamp of last job exit.
+  //     A "stale" heartbeat in this mode is the NORMAL between-batches state,
+  //     NOT a sign of failure. Firing this alert in job mode was causing
+  //     repeated false-positive "Worker may be dead" alarms every 5 min while
+  //     the system was healthy (Bruno screenshot 2026-05-14: active=1,
+  //     inflight=0, 0 failures, 6 jobs/24h — healthy, just between batches).
+  //
+  //     The real "stuck" symptom in job/tasks modes is already covered by
+  //     the `stuck` shots alert below (shots in 'generating' >15 min). That
+  //     alert fires only on actual progress halt, not on intermittent
+  //     heartbeat.
+  if (workerMode === 'inproc' && activeSlots.length > 0 && heartbeatAgeMs > STUCK_HEARTBEAT_MS) {
     alerts.push({
       severity: 'critical',
       message: `Worker heartbeat stale: ${Math.round(heartbeatAgeMs / 60_000)} min old (active slots: ${activeSlots.length}). Worker may be dead.`,
+    });
+  }
+  // Job / tasks mode: fire ONLY on a much larger threshold AND only when
+  // there are no shots in flight (because in-flight = worker is actively
+  // running, regardless of heartbeat freshness vs threshold). 30 min with
+  // an active slot and nothing in flight = something genuinely blocking
+  // shot progression (Cloud Run Job trigger failing, queue stuck, etc).
+  if (
+    (workerMode === 'job' || workerMode === 'tasks') &&
+    activeSlots.length > 0 &&
+    inflight.length === 0 &&
+    heartbeatAgeMs > STUCK_HEARTBEAT_JOB_MODE_MS
+  ) {
+    alerts.push({
+      severity: 'critical',
+      message: `${workerMode} worker idle ${Math.round(heartbeatAgeMs / 60_000)} min with active slot(s) and no shots in flight — job pipeline may be stuck.`,
     });
   }
   if (workerMode === 'tasks' && tasksInfo && !tasksInfo.ok) {

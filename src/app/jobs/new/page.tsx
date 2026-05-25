@@ -722,7 +722,7 @@ function NewJobContent() {
 
               <div className="px-5 py-3 flex justify-between">
                 <span className="text-sm text-neutral-500">Shots</span>
-                <span className="text-sm font-medium text-neutral-900">6 shots — M03 + M04 + M06 in parallel; M01, M02, M05 follow</span>
+                <span className="text-sm font-medium text-neutral-900">4 shots — M01, M02, M06 in parallel; M05 follows M02</span>
               </div>
               <div className="px-5 py-3 flex justify-between">
                 <span className="text-sm text-neutral-500">M06 Pose</span>

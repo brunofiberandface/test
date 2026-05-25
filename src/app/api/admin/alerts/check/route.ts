@@ -44,7 +44,32 @@ async function recordFired(hash: string, alert: HealthAlert): Promise<void> {
   }, { merge: true });
 }
 
-async function postToWebhook(alerts: HealthAlert[]): Promise<{ ok: boolean; status?: number; err?: string }> {
+function isHeartbeatAlert(a: HealthAlert): boolean {
+  return /worker heartbeat stale/i.test(a.message);
+}
+
+/**
+ * Attempt auto-recovery for the heartbeat alert. Returns the recovery result
+ * so the caller can adjust the Slack message text. Idempotent — safe to call
+ * even when no recovery is needed.
+ */
+async function tryAutoHeal(baseUrl: string): Promise<{ ok: boolean; message: string } | null> {
+  try {
+    const resp = await fetch(`${baseUrl}/api/admin/worker/recover`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    });
+    const data = await resp.json().catch(() => ({}));
+    return { ok: !!data.ok, message: data.message || `HTTP ${resp.status}` };
+  } catch (e) {
+    return { ok: false, message: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+async function postToWebhook(
+  alerts: HealthAlert[],
+  autoHeal: { ok: boolean; message: string } | null,
+): Promise<{ ok: boolean; status?: number; err?: string }> {
   const url = process.env.ALERT_WEBHOOK_URL;
   if (!url) return { ok: false, err: 'ALERT_WEBHOOK_URL not set' };
   if (process.env.ALERT_WEBHOOK_DISABLED === '1') return { ok: false, err: 'disabled by env' };
@@ -53,8 +78,27 @@ async function postToWebhook(alerts: HealthAlert[]): Promise<{ ok: boolean; stat
   // /slack endpoint), and any webhook accepting plain JSON {text}.
   const sevEmoji = { critical: '🔴', warn: '🟡', info: '🔵' } as const;
   const lines = alerts.map(a => `${sevEmoji[a.severity]} *${a.severity.toUpperCase()}*: ${a.message}`);
-  const dashboardUrl = (process.env.INTERNAL_BASE_URL || 'https://gstar-ai-studio-674145888056.europe-west1.run.app') + '/admin/monitoring';
-  const text = `*gstar-ai-studio alert* (${alerts.length})\n${lines.join('\n')}\n<${dashboardUrl}|Open monitoring dashboard>`;
+  const baseUrl = process.env.INTERNAL_BASE_URL || 'https://gstar-ai-studio-674145888056.europe-west1.run.app';
+  const dashboardUrl = `${baseUrl}/admin/monitoring`;
+  const recoverUrl = `${baseUrl}/api/admin/worker/recover`;
+
+  // If we attempted auto-heal for a heartbeat alert, prepend the outcome so
+  // the message tells the user the system has already attempted to fix it.
+  let autoHealLine = '';
+  if (autoHeal) {
+    autoHealLine = autoHeal.ok
+      ? `\n🟢 *AUTO-RECOVERED*: ${autoHeal.message}`
+      : `\n⚠️ *AUTO-RECOVERY FAILED*: ${autoHeal.message}`;
+  }
+
+  // Always include the tap-to-recover link when any heartbeat-related alert
+  // is in the batch — it's mobile-friendly and idempotent.
+  const showRecoverLink = alerts.some(isHeartbeatAlert);
+  const recoverLine = showRecoverLink
+    ? `\n<${recoverUrl}|🔧 Tap to recover worker>`
+    : '';
+
+  const text = `*gstar-ai-studio alert* (${alerts.length})\n${lines.join('\n')}${autoHealLine}\n<${dashboardUrl}|Open monitoring dashboard>${recoverLine}`;
 
   try {
     const resp = await fetch(url, {
@@ -102,15 +146,33 @@ async function runCheck() {
     }
   }
 
+  // ── AUTO-HEAL (2026-05-14) ──────────────────────────────────────────────
+  // When the heartbeat alert is present, the worker is most likely dead and
+  // the singleton lock is preventing fresh claims. Call the recover endpoint
+  // before posting to Slack so Bruno sees ONE message: "Auto-recovered" —
+  // instead of repeated "Worker may be dead" alarms every 5 min until he
+  // gets to a laptop. The recovery is idempotent; if the worker is actually
+  // healthy, the brief disruption self-resolves on the next heartbeat tick.
+  //
+  // We run auto-heal on the SCANNED alerts (not just the toFire dedupe'd
+  // subset) — a previously-fired heartbeat alert that got skipped as dupe
+  // still indicates the worker is dead and still needs recovery.
+  let autoHeal: { ok: boolean; message: string } | null = null;
+  const hasHeartbeatAlert = alerts.some(a => /worker heartbeat stale/i.test(a.message));
+  if (hasHeartbeatAlert) {
+    autoHeal = await tryAutoHeal(base);
+  }
+
   let webhookResult: { ok: boolean; status?: number; err?: string } | null = null;
   if (toFire.length > 0) {
-    webhookResult = await postToWebhook(toFire);
+    webhookResult = await postToWebhook(toFire, autoHeal);
   }
 
   return {
     ok: true,
     alertsFired: fired,
     alertsSkippedAsDupe: skipped,
+    autoHeal,
     webhookResult,
   };
 }

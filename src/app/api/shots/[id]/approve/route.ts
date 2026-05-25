@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { updateShot, shotsCol, updateJobStatus, listShots } from '@/lib/firestore';
+import { FieldValue } from '@google-cloud/firestore';
+import { shotsCol, updateJobStatus, listShots } from '@/lib/firestore';
 
 // POST /api/shots/[id]/approve
 export async function POST(
@@ -8,7 +9,14 @@ export async function POST(
 ) {
   try {
     const { id } = await params;
-    await updateShot(id, { status: 'approved' });
+    // Approve + clear wasApproved (set during rerun to flag "previously approved").
+    // Direct doc().update() so FieldValue.delete is accepted (updateShot's
+    // typed signature doesn't model the field).
+    await shotsCol.doc(id).update({
+      status: 'approved',
+      wasApproved: FieldValue.delete(),
+      updatedAt: new Date(),
+    });
 
     // Check if all shots for the job are now approved → mark job complete
     try {

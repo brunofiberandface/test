@@ -19,8 +19,10 @@ export async function POST(
     const baseName = original.jobName || 'Job';
     const cleanBase = baseName.replace(/ Clone \d+$/, '');
 
-    // Find highest clone number
-    const allJobs = await listJobs();
+    // Find highest clone number. listJobs() now returns { jobs, hasMore, ... }
+    // — clone-name resolution only needs the recent 50 so the default page is
+    // fine (clone names rarely span months of history).
+    const { jobs: allJobs } = await listJobs();
     const clonePattern = new RegExp(`^${cleanBase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} Clone (\\d+)$`);
     let maxClone = 0;
     for (const j of allJobs as any[]) {

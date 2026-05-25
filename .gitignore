@@ -77,3 +77,13 @@ _tmp_debug_*.ts
 # Python build artifacts (Cloud Run Job source has Python)
 __pycache__/
 *.pyc
+
+# Local A/B test outputs (already excluded from deploy via .gcloudignore)
+test_outputs/
+test_inputs/
+
+# Loose debug/smoke render PNGs left in the repo root from one-off Seedream tests.
+# These aren't source-of-truth — they're throwaway artifacts. Specific PNGs only,
+# so legitimate image files committed elsewhere (e.g. diagram_proposal.png) are
+# unaffected.
+/seedream-bruno-test*.png

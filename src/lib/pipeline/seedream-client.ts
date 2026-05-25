@@ -56,7 +56,17 @@ const RETRY_DELAYS = [15_000, 30_000, 60_000];
 export interface SeedreamReferenceImage {
   /** Public URL reachable by BytePlus servers. */
   url: string;
-  /** Label used only for logging — Seedream ignores it. */
+  /**
+   * Per-ref scoping label. When the caller passes `forceInventory: true` on
+   * `SeedreamGenerateParams`, non-empty labels are prepended to the prompt as
+   * a "REFERENCE IMAGE INVENTORY" block so Seedream's text encoder sees them
+   * (per LEARNING #89 — Seedream's `image` field carries URLs only). Empty
+   * labels indicate "anonymous slot" (e.g. silent anti-twin anchor) and are
+   * intentionally omitted from the inventory listing.
+   *
+   * When `forceInventory` is not set (default — M05/M06 path), labels remain
+   * logging-only as in the 2026-05-18 "lean" change.
+   */
   label: string;
 }
 
@@ -77,6 +87,21 @@ export interface SeedreamGenerateParams {
    * (= 'seedream-5-0-260128') to call Seedream 5.0 Lite.
    */
   model?: string;
+  /**
+   * When true, prepend a "REFERENCE IMAGE INVENTORY" block (built from each
+   * ref's `label` field) to the prompt before sending. This is the Path B
+   * delivery mechanism from LEARNING #89 — necessary because the BytePlus
+   * `image` field is URLs only. Per LEARNING #101, multi-ref M01/M02 with 5+
+   * refs NEED per-ref OUT-scoping to avoid twin/garment-drift renders.
+   *
+   * Default (false) keeps the 2026-05-18 "lean" behaviour for M05/M06 — no
+   * inventory injection, prompt is sent verbatim. Set true on M01/M02 where
+   * the ByteDance v1 audit pattern is required.
+   *
+   * Refs with empty `label` are omitted from the inventory listing
+   * (intentional anonymity for silent anti-twin anchors).
+   */
+  forceInventory?: boolean;
 }
 
 export interface SeedreamGenerateResult {
@@ -113,7 +138,7 @@ function aspectToSize(aspect: '9:16' | '3:4' | '1:1'): string {
 }
 
 export async function generateSeedreamImage(params: SeedreamGenerateParams): Promise<SeedreamGenerateResult> {
-  const { prompt, referenceImages, aspectRatio, size: sizeOverride, apiKey: paramKey, model: modelOverride } = params;
+  const { prompt, referenceImages, aspectRatio, size: sizeOverride, apiKey: paramKey, model: modelOverride, forceInventory } = params;
 
   const apiKey = paramKey || process.env.BYTEPLUS_API_KEY;
   if (!apiKey) {
@@ -130,21 +155,27 @@ export async function generateSeedreamImage(params: SeedreamGenerateParams): Pro
 
   const resolvedModel = resolveSeedreamModel(modelOverride);
 
-  // Path B (2026-05-10 experiment): prepend a "Reference image inventory" block
-  // to the prompt so the per-ref label scoping ACTUALLY reaches Seedream.
-  // Previously labels were logging-only (BytePlus accepts only `image: [urls]`).
-  // Discovery: labels-don't-reach-Seedream was the architecture from day one
-  // (April 22 commit). Phase B / M05 layering / expression / shoe-size scoping
-  // deploys (May 8–10) were no-ops because of this. Testing whether labels
-  // injected into the prompt body restore their intended effect.
-  const inventory = referenceImages
-    .map((r, i) => `Image ${i + 1}: ${r.label}`)
-    .join('\n');
-  const promptWithInventory = `REFERENCE IMAGE INVENTORY (these are the images sent with this request, in slot order — use the descriptions to know what each image is for):\n${inventory}\n\n---\n\n${prompt}`;
+  // Inventory block: opt-in via `forceInventory` (LEARNING #89 Path B
+  // delivery). The 2026-05-18 lean experiment disabled this globally
+  // because Bruno's manual web-UI tests on M05/M06 worked without it.
+  // Twin regressions on multi-ref M01/M02 (LEARNING #101 / BUGS_AND_FIXES
+  // #10) confirmed the inventory IS load-bearing when ref counts grow
+  // past 3-4. Callers that need it set forceInventory: true; M05/M06
+  // continue to operate on the lean prompt as-is.
+  let finalPrompt = prompt;
+  if (forceInventory) {
+    const inventoryLines = referenceImages
+      .map((r, i) => (r.label ? `IMAGE ${i + 1}: ${r.label}` : null))
+      .filter((s): s is string => !!s);
+    if (inventoryLines.length > 0) {
+      finalPrompt = `REFERENCE IMAGE INVENTORY:\n${inventoryLines.join('\n')}\n\n---\n\n${prompt}`;
+      console.log(`[Seedream] forceInventory ON — prepended ${inventoryLines.length} labelled refs to prompt (+${finalPrompt.length - prompt.length} chars)`);
+    }
+  }
 
   const body = {
     model: resolvedModel,
-    prompt: promptWithInventory,
+    prompt: finalPrompt,
     image: referenceImages.map(r => r.url),
     size: sizeOverride || aspectToSize(aspectRatio),
     response_format: 'url' as const,

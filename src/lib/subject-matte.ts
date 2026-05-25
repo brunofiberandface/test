@@ -512,8 +512,21 @@ export async function produceBackdropVariants(
           const matteSized = (rw === matteW && rh === matteH)
             ? matteBufferOpt
             : await sharp(matteBufferOpt).resize(rw, rh).png().toBuffer();
+          // Two-step composite (Bruno 2026-05-17, restored 2026-05-22 — fixes
+          // doubled-model ghosting):
+          //   1) `dest-out` knock-out: erases regen pixels where the rembg
+          //      matte has alpha. This removes Gemini's re-rendered subject
+          //      (which often drifts pose vs the rembg subject), leaving
+          //      only Gemini's backdrop + grounding shadow.
+          //   2) `over`: paints the crisp rembg subject back on top.
+          // Without step 1, Gemini's drifted subject peeked through outside
+          // the rembg silhouette, producing the "two models" artifact in
+          // matte-grey / matte-white stages.
           return sharp(regen)
-            .composite([{ input: matteSized, blend: 'over' }])
+            .composite([
+              { input: matteSized, blend: 'dest-out' },
+              { input: matteSized, blend: 'over' },
+            ])
             .png()
             .toBuffer();
         };

@@ -66,7 +66,16 @@ export interface AIModel {
 
 // ── Jobs (v2: 3 wardrobe items + focus) ──
 
-export type JobStatus = 'pending' | 'generating' | 'review' | 'complete' | 'failed';
+export type JobStatus =
+  | 'pending'
+  | 'generating'
+  | 'review'
+  | 'complete'
+  | 'failed'
+  // Set on job create when at least one (model × shoe) Tier-2 cell is missing.
+  // process-queue checks the pending batch, flips to 'generating' once the
+  // cell lands. Added 2026-05-17 with the matrix-based new-job pipeline.
+  | 'awaiting-matrix';
 
 /** Which image-generation backend to use. Defaults to 'gemini' everywhere absent. */
 export type GenerationProvider = 'gemini' | 'seedream';
@@ -107,14 +116,10 @@ export interface Job {
   wardrobe: JobWardrobe;
   modelId: string;
 
-  // Prompt versions used (for reproducibility)
-  promptRevisions: {
-    M01: number;
-    M02: number;
-    M03: number;
-    M04: number;
-    M05: number;
-  };
+  // Prompt versions used (for reproducibility). Partial because matrix-paint
+  // shots (M01/M02) don't use the vault prompt system, and legacy jobs may
+  // have any subset of M01-M05 depending on when they were created.
+  promptRevisions: Partial<Record<ShotType, number>>;
 
   // Cached silhouette analysis results
   silhouetteAnalysis?: {
@@ -127,13 +132,33 @@ export interface Job {
   // have this field absent → seedreamM06 falls back to M06_DEFAULT_POSE_ID.
   m06PoseId?: string;
 
-  // M03/M04 anchor URLs (for dependency chain)
+  // Set on the job doc when status='awaiting-matrix'. Tracks which Tier-2
+  // (shoe × model) cell the job is parked behind. Worker tick polls this:
+  // when the cell becomes complete, the job flips to 'generating' and is
+  // enqueued for normal processing. Field is cleared on resume. (Stage 4
+  // missing-cell async flow, 2026-05-17.)
+  awaitingCell?: {
+    shoeId: string;
+    modelId: string;
+    /** Gemini batch resource name (e.g. "batches/abc123"), if a batch was
+     *  submitted on behalf of this job. Absent when the job piggybacks on
+     *  an already-in-flight batch submitted for a different job. */
+    batchName?: string;
+    /** When the job was first parked (ms since epoch) — used for stuck-job
+     *  watchdog + UX (show "waiting for matrix render…" with elapsed time). */
+    parkedAt?: number;
+  };
+
+  // M02 anchor URL — primary visual anchor for M05 (back-pocket close-up).
+  // Set by /api/generate after a successful M02 matrix-paint. M05 reads this
+  // off the job doc so seedreamM05 can inject the painted-back view as its
+  // dominant ref. Replaces the M03/M04 anchor pattern (retired 2026-05-17).
+  m02AnchorUrl?: string;
+
+  // Legacy anchor URLs from the M03/M04 era — kept for backward-compat reads
+  // of pre-2026-05-17 job docs. Not written by the current pipeline.
   m03AnchorUrl?: string;
   m04AnchorUrl?: string;
-  // Parallel anchors pointing at the white-bg sibling masters of M03/M04, set
-  // by /api/generate when the matte pipeline runs on the parent. M01/M02 use
-  // these to crop a white-bg variant in lockstep with the grey-bg primary.
-  // Absent on jobs that predate the matte pipeline — caller checks before use.
   m03WhiteAnchorUrl?: string;
   m04WhiteAnchorUrl?: string;
 
@@ -176,6 +201,12 @@ export interface Shot {
   // Per-shot provider override for one-shot reruns (e.g. "Rerun with Seedream").
   // If set, takes precedence over job.provider. Absent = use job.provider (or 'gemini').
   provider?: GenerationProvider;
+  // True iff this shot was previously approved (status='approved') before
+  // being reset for a rerun. UI shows a "Pre-approved — Re-approve" badge so
+  // the reviewer knows the prior version was approved and can quickly re-bless
+  // the new version. Cleared on next approval. (2026-05-17 with the batch-
+  // rerun-last-50 backfill so approval state survives reruns.)
+  wasApproved?: boolean;
   // Backdrop variants (subject-matte pipeline). Set when /api/generate ran the
   // rembg matte + composite step successfully. greyMasterUrl mirrors imageUrl
   // for explicit consumption; whiteMasterUrl is the pure-white-bg deliverable.
@@ -195,7 +226,17 @@ export interface Shot {
    * Absent on shots generated before this shipped.
    */
   pipelineStages?: Partial<Record<
-    'pass1' | 'seedream' | 'teeedit' | 'shoeedit' | 'label' | 'upscaled' | 'matte-grey' | 'matte-white' | 'final',
+    | 'pass1'
+    | 'seedream'
+    | 'teeedit'
+    | 'shoeedit'
+    | 'label'
+    | 'upscaled'
+    | 'matte-raw-grey'
+    | 'matte-raw-white'
+    | 'matte-grey'
+    | 'matte-white'
+    | 'final',
     string
   >>;
 }
