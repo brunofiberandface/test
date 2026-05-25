@@ -244,7 +244,7 @@ export async function generateM06WithGemini(ctx: GeminiM06Context): Promise<Gemi
     refs.push({
       buffer: headCropBuf,
       mimeType: 'image/png',
-      label: `IMAGE 2B — IDENTITY ANCHOR (head + shoulders crop, same person as IMAGE 2). Cropped tight on the face + hair + neckline so the identity and SKIN TONE signal is unambiguous. The rendered model's FACE must match IMAGE 2B: same eye shape, same nose, same lip shape, same jawline. The rendered model's SKIN TONE must match IMAGE 2B exactly: same undertone, same depth, no shift toward editorial warmth, no shift toward paler/darker. The rendered model's HAIR must match IMAGE 2B exactly: same color, same length, same parting, same texture.`,
+      label: `IMAGE 2B — IDENTITY ANCHOR (head + shoulders crop, same person as IMAGE 2). Cropped tight on the face + hair + neckline so the identity and SKIN TONE signal is unambiguous. The rendered model's FACE must match IMAGE 2B pixel-for-pixel at the facial micro-feature level: same eye shape and spacing, same eyelid line, same iris color and brightness, same nose bridge profile and nostril shape, same lip line and lip volume, same philtrum, same jawline angle, same cheekbone structure, same brow density and shape, same skin micro-texture (pores, sub-surface tone). DO NOT soften the face. DO NOT editorialize the features. DO NOT interpolate or smooth eye / nose / mouth structure. DO NOT shift the face toward an idealized or generic editorial look. The face in the output must read as the SAME PHOTOGRAPH of the SAME PERSON as IMAGE 2B, just at a different head angle and lighting. The rendered model's SKIN TONE must match IMAGE 2B exactly: same undertone, same depth, no shift toward editorial warmth, no shift toward paler/darker. The rendered model's HAIR must match IMAGE 2B exactly: same color, same length, same parting, same texture.`,
     });
   } catch (e) {
     console.warn(`[GeminiM06] identity head crop failed (non-blocking):`, (e as Error).message);
@@ -351,8 +351,9 @@ async function generateM06TopFocusWithGemini(ctx: GeminiM06Context): Promise<Gem
   // clothes and model".
   const bottomConfig = ctx.wardrobe['bottom' as keyof JobWardrobe];
   let wardrobeBottomDescription = '';
+  let bottomItem: any = null;
   if (bottomConfig?.itemId) {
-    const bottomItem = await getWardrobeItem(bottomConfig.itemId) as any;
+    bottomItem = await getWardrobeItem(bottomConfig.itemId) as any;
     if (bottomItem) {
       wardrobeBottomDescription = bottomItem.bottomDescription
         || bottomItem.description
@@ -360,6 +361,17 @@ async function generateM06TopFocusWithGemini(ctx: GeminiM06Context): Promise<Gem
         || '';
     }
   }
+  // Normalize bottom for visual ref URLs (flat + fit-model angles).
+  // 2026-05-25 FIX: M06 top-focus was injecting pants as TEXT ONLY — no visual
+  // refs. Gemini rendered generic blue jeans from its prior (LEARNING #88:
+  // visual evidence beats text). Mirroring the M01/M02 top-focus restoration
+  // from rev 00608-89m: add BOTTOM flat-front + fit-model.front + 45° as refs
+  // with OUT-scoping labels so identity / pose / top / footwear don't bleed
+  // from the fit-model images.
+  const bottomNorm = bottomItem ? normalizeWardrobeItem(bottomItem) : null;
+  const bottomFlatFrontUrl: string | undefined = bottomNorm?.flatFrontUrl || bottomItem?.flatFrontUrl;
+  const bottomFmFrontUrl: string | undefined = bottomNorm?.fitModels?.front;
+  const bottomFm45Url: string | undefined = bottomNorm?.fitModels?.front45Right || bottomNorm?.fitModels?.front45Left;
   const shoeConfig = ctx.wardrobe['shoe' as keyof JobWardrobe];
   let wardrobeShoeDescription = '';
   if (shoeConfig?.itemId) {
@@ -415,7 +427,7 @@ async function generateM06TopFocusWithGemini(ctx: GeminiM06Context): Promise<Gem
     refs.push({
       buffer: headCropBuf,
       mimeType: 'image/png',
-      label: `IMAGE 2B — IDENTITY ANCHOR (head + shoulders crop, same person as IMAGE 2). Cropped tight on the face + hair + neckline so the identity signal is unambiguous. The rendered model's FACE must match IMAGE 2B: same eye shape, same nose, same lip shape, same jawline. The rendered model's HAIR must match IMAGE 2B exactly: same color, same length, same parting, same texture.`,
+      label: `IMAGE 2B — IDENTITY ANCHOR (head + shoulders crop, same person as IMAGE 2). Cropped tight on the face + hair + neckline so the identity signal is unambiguous. The rendered model's FACE must match IMAGE 2B pixel-for-pixel at the facial micro-feature level: same eye shape and spacing, same eyelid line, same iris color and brightness, same nose bridge profile and nostril shape, same lip line and lip volume, same philtrum, same jawline angle, same cheekbone structure, same brow density and shape, same skin micro-texture. DO NOT soften the face. DO NOT editorialize the features. DO NOT interpolate or smooth eye / nose / mouth structure. DO NOT shift the face toward an idealized or generic editorial look. The face in the output must read as the SAME PHOTOGRAPH of the SAME PERSON as IMAGE 2B, just at a different head angle and lighting. The rendered model's HAIR must match IMAGE 2B exactly: same color, same length, same parting, same texture.`,
     });
   } catch (e) {
     console.warn(`[GeminiM06:topfocus] identity head crop failed (non-blocking):`, (e as Error).message);
@@ -432,7 +444,8 @@ async function generateM06TopFocusWithGemini(ctx: GeminiM06Context): Promise<Gem
   }
 
   // IMAGE 4+: TOP fit-model angles (drape/fit/shoulder/sleeve reference)
-  for (let i = 0; i < topAngles.length && i < 3; i++) {
+  const topAngleCount = Math.min(topAngles.length, 3);
+  for (let i = 0; i < topAngleCount; i++) {
     const a = await fetchAsBuffer(topAngles[i]);
     refs.push({
       buffer: a.buffer,
@@ -440,6 +453,45 @@ async function generateM06TopFocusWithGemini(ctx: GeminiM06Context): Promise<Gem
       label: `IMAGE ${4 + i} — TOP FIT MODEL ANGLE ${i + 1}. Source for the top garment's fit, drape, shoulder fit, sleeve cap, hem length on body. Pose and identity here are NOT used.`,
     });
   }
+
+  // IMAGE N+: BOTTOM REFS (NEW 2026-05-25 — fixes "wrong pants" by giving
+  // Gemini visual evidence of the chosen pants instead of text-only injection)
+  let nextImageNum = 3 + (topFlat ? 1 : 0) + topAngleCount;
+  const bottomImageNums: number[] = [];
+  if (bottomFlatFrontUrl) {
+    const flatImg = await fetchAsBuffer(bottomFlatFrontUrl);
+    refs.push({
+      buffer: flatImg.buffer,
+      mimeType: flatImg.mimeType,
+      label: `IMAGE ${nextImageNum} — BOTTOM GARMENT FLAT. The EXACT pants the rendered model wears — same color, wash, fabric, fit profile (slim / straight / loose / barrel / flare / wide), leg shape, hem length, front and back pockets, hardware (rivets, buttons, zipper, snaps), any branding. Use ONLY for the pants — NOT for top, identity, pose, footwear, or styling.`,
+    });
+    bottomImageNums.push(nextImageNum);
+    nextImageNum++;
+  }
+  if (bottomFmFrontUrl) {
+    const fmImg = await fetchAsBuffer(bottomFmFrontUrl);
+    refs.push({
+      buffer: fmImg.buffer,
+      mimeType: fmImg.mimeType,
+      label: `IMAGE ${nextImageNum} — BOTTOM FIT MODEL FRONT. The pants on a fit model — source for pants drape, fit on body, hem position relative to footwear, how the fabric falls. Use ONLY for the pants. The IDENTITY of the fit model is NOT the target — identity comes EXCLUSIVELY from IMAGE 2 + IMAGE 2B. The TOP, POSE, BACKDROP, and FOOTWEAR shown in this image are NOT the target.`,
+    });
+    bottomImageNums.push(nextImageNum);
+    nextImageNum++;
+  }
+  if (bottomFm45Url && nextImageNum < 11) {
+    const fmImg = await fetchAsBuffer(bottomFm45Url);
+    refs.push({
+      buffer: fmImg.buffer,
+      mimeType: fmImg.mimeType,
+      label: `IMAGE ${nextImageNum} — BOTTOM FIT MODEL 45°. Additional fit/drape reference for the pants from a 3/4 angle. Use ONLY for the pants. IDENTITY, TOP, POSE, BACKDROP, FOOTWEAR in this image are NOT the target.`,
+    });
+    bottomImageNums.push(nextImageNum);
+    nextImageNum++;
+  }
+  const bottomRefsLabel = bottomImageNums.length > 0
+    ? bottomImageNums.map(n => `IMAGE ${n}`).join(' + ')
+    : '';
+  console.log(`[GeminiM06:topfocus] bottom refs: flat=${!!bottomFlatFrontUrl} fmFront=${!!bottomFmFrontUrl} fm45=${!!bottomFm45Url} → ${bottomImageNums.length} ref(s), labels=${bottomRefsLabel || '(none — text only)'}`);
 
   // Build top-focus prompt
   const finalPrompt = `Photorealistic studio e-commerce photograph, 1:1 square, full body, light grey backdrop (#D9DAD2). Soft diffused studio lighting, white-balanced 5500K. Sharp focus, ultra-high detail.
@@ -466,10 +518,16 @@ Match the top EXACTLY: color, fabric, neckline/collar, sleeves, hem position on 
 
 CRITICAL — the top in IMAGE 1 (POSE REFERENCE) is NOT the target top. IGNORE the top garment shown in IMAGE 1. The rendered model's top is the garment in IMAGE 3 + IMAGE 4+, period.
 
-═══ BOTTOM (from wardrobe — supporting, do not distract from the top) ═══
-${wardrobeBottomDescription
-  ? `The model wears: ${wardrobeBottomDescription}. Match this bottom description faithfully — color, wash, fit, fabric, length. The bottom is supporting context for the top (which is the hero) — render accurately but do not over-emphasize.`
-  : `The model wears plain medium-wash blue denim jeans (straight-leg or relaxed-straight fit), clean and neutral.`
+═══ BOTTOM (from BOTTOM REFS — supporting, do not distract from the top) ═══
+${bottomImageNums.length > 0
+  ? `The model's LOWER BODY wears the pants shown in ${bottomRefsLabel} (BOTTOM REFS). Match the pants EXACTLY: color, wash, fabric, fit profile (slim / straight / loose / barrel / flare / wide), leg shape, hem length, front and back pockets, hardware (rivets, buttons, zipper), any branding visible in the refs.${wardrobeBottomDescription ? ` Text reinforcement: ${wardrobeBottomDescription}.` : ''}
+
+CRITICAL — the pants are the EXACT garment shown in ${bottomRefsLabel}. The pants in IMAGE 1 (POSE REFERENCE) are NOT the target. The fit-model wearing the pants in the BOTTOM REFS is NOT the target identity (identity = IMAGE 2 + IMAGE 2B). Use BOTTOM REFS ONLY for the pants — color, wash, fit, fabric, leg shape, hem, pockets, hardware.
+
+The pants are supporting context for the top (which is the hero) — render accurately but do not over-emphasize.`
+  : (wardrobeBottomDescription
+    ? `The model wears: ${wardrobeBottomDescription}. Match this bottom description faithfully — color, wash, fit, fabric, length. The bottom is supporting context for the top (which is the hero) — render accurately but do not over-emphasize.`
+    : `The model wears plain medium-wash blue denim jeans (straight-leg or relaxed-straight fit), clean and neutral.`)
 }
 
 ═══ FOOTWEAR (from wardrobe) ═══
@@ -488,13 +546,15 @@ Clean light-grey studio sweep (#D9DAD2), no scuffs / texture / marks. Floor: con
 - WRONG: head turned over the shoulder — these poses look STRAIGHT INTO THE CAMERA.
 - WRONG: clenched fists / rigid fingers — fingers are soft.
 - WRONG: distracting bottom (bright wash, rips, embellishments).
+- WRONG: rendering different pants than the BOTTOM REFS — wash, color, fit profile, leg shape, hem, or pocket structure mismatching the BOTTOM REFS. The pants are the EXACT garment in the BOTTOM REFS.
+- WRONG: rendering generic blue jeans (or any default jeans) when BOTTOM REFS are provided.
 - WRONG: any part of the head, hair, scalp, or hairstyle cropped at the top edge.
 - WRONG: heels or feet cut off at the bottom edge.${pose.handcropUrl ? `
 - ABSOLUTELY WRONG for ${pose.id}: any hand inside a front pocket. The front pockets are EMPTY.
 - ABSOLUTELY WRONG for ${pose.id}: any thumb hooked over a pocket edge or wrist tucked behind a pocket opening.
 - REQUIRED for ${pose.id}: BOTH hands clearly VISIBLE, hanging at the SIDES of the body, fingers SHOWING.` : ''}
 
-The pose MUST match IMAGE 1 + text. The identity MUST match IMAGE 2 + IMAGE 2B. The top MUST match IMAGE 3 + IMAGE 4+. These are non-negotiable.`;
+The pose MUST match IMAGE 1 + text. The identity MUST match IMAGE 2 + IMAGE 2B. The top MUST match IMAGE 3 + IMAGE 4+.${bottomImageNums.length > 0 ? ` The pants MUST match ${bottomRefsLabel} (BOTTOM REFS).` : ''} These are non-negotiable.`;
 
   console.log(`[GeminiM06:topfocus] Calling Gemini (${refs.length} refs, pose=${pose.id}, prompt=${finalPrompt.length} chars)...`);
   const t0 = Date.now();
