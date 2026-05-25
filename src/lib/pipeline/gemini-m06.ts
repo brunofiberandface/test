@@ -463,7 +463,7 @@ async function generateM06TopFocusWithGemini(ctx: GeminiM06Context): Promise<Gem
     refs.push({
       buffer: flatImg.buffer,
       mimeType: flatImg.mimeType,
-      label: `IMAGE ${nextImageNum} — BOTTOM GARMENT FLAT. The EXACT pants the rendered model wears — same color, wash, fabric, fit profile (slim / straight / loose / barrel / flare / wide), leg shape, hem length, front and back pockets, hardware (rivets, buttons, zipper, snaps), any branding. Use ONLY for the pants — NOT for top, identity, pose, footwear, or styling.`,
+      label: `IMAGE ${nextImageNum} — BOTTOM GARMENT FLAT. The EXACT pants the rendered model wears — same color, material/fabric, finish, fit and silhouette, leg shape, hem, pockets, closures, hardware visible in the flat, any branding. The fabric/material is whatever is shown in this flat — cotton tailored, wool, linen, denim, satin, twill — match what is visible. Use ONLY for the pants — NOT for top, identity, pose, footwear, or styling.`,
     });
     bottomImageNums.push(nextImageNum);
     nextImageNum++;
@@ -520,9 +520,11 @@ CRITICAL — the top in IMAGE 1 (POSE REFERENCE) is NOT the target top. IGNORE t
 
 ═══ BOTTOM (from BOTTOM REFS — supporting, do not distract from the top) ═══
 ${bottomImageNums.length > 0
-  ? `The model's LOWER BODY wears the pants shown in ${bottomRefsLabel} (BOTTOM REFS). Match the pants EXACTLY: color, wash, fabric, fit profile (slim / straight / loose / barrel / flare / wide), leg shape, hem length, front and back pockets, hardware (rivets, buttons, zipper), any branding visible in the refs.${wardrobeBottomDescription ? ` Text reinforcement: ${wardrobeBottomDescription}.` : ''}
+  ? `The model's LOWER BODY wears the pants shown in ${bottomRefsLabel} (BOTTOM REFS). Match the pants EXACTLY: color, material/fabric, finish, fit and silhouette, leg shape, hem, pockets, closures, hardware visible in the refs, any branding.${wardrobeBottomDescription ? ` Text reinforcement: ${wardrobeBottomDescription}.` : ''}
 
-CRITICAL — the pants are the EXACT garment shown in ${bottomRefsLabel}. The pants in IMAGE 1 (POSE REFERENCE) are NOT the target. The fit-model wearing the pants in the BOTTOM REFS is NOT the target identity (identity = IMAGE 2 + IMAGE 2B). Use BOTTOM REFS ONLY for the pants — color, wash, fit, fabric, leg shape, hem, pockets, hardware.
+The FABRIC and MATERIAL of the pants comes EXCLUSIVELY from the BOTTOM REFS — match the weave, finish, and color shown in those refs. The pants are NOT denim/jeans unless the BOTTOM REFS show denim/jeans. If the BOTTOM REFS show a smooth tailored cotton or wool trouser, the rendered pants are smooth tailored cotton or wool. If the BOTTOM REFS show faded indigo denim with twill weave, the rendered pants are faded indigo denim with twill weave.
+
+CRITICAL — the pants are the EXACT garment shown in ${bottomRefsLabel}. The pants in IMAGE 1 (POSE REFERENCE) are NOT the target. The fit-model wearing the pants in the BOTTOM REFS is NOT the target identity (identity = IMAGE 2 + IMAGE 2B). Use BOTTOM REFS ONLY for the pants — color, material, fit, leg shape, hem, pockets, hardware.
 
 The pants are supporting context for the top (which is the hero) — render accurately but do not over-emphasize.`
   : (wardrobeBottomDescription
@@ -546,7 +548,8 @@ Clean light-grey studio sweep (#D9DAD2), no scuffs / texture / marks. Floor: con
 - WRONG: head turned over the shoulder — these poses look STRAIGHT INTO THE CAMERA.
 - WRONG: clenched fists / rigid fingers — fingers are soft.
 - WRONG: distracting bottom (bright wash, rips, embellishments).
-- WRONG: rendering different pants than the BOTTOM REFS — wash, color, fit profile, leg shape, hem, or pocket structure mismatching the BOTTOM REFS. The pants are the EXACT garment in the BOTTOM REFS.
+- WRONG: rendering different pants than the BOTTOM REFS — color, fit, leg shape, hem, fabric, or pocket structure mismatching the BOTTOM REFS. The pants are the EXACT garment in the BOTTOM REFS.
+- WRONG: rendering jeans / denim fabric when the BOTTOM REFS show a non-denim fabric (cotton tailored trouser, wool slacks, linen pants, etc.). The pants' fabric is whatever is in the BOTTOM REFS — NOT a default jeans fabric.
 - WRONG: rendering generic blue jeans (or any default jeans) when BOTTOM REFS are provided.
 - WRONG: any part of the head, hair, scalp, or hairstyle cropped at the top edge.
 - WRONG: heels or feet cut off at the bottom edge.${pose.handcropUrl ? `
