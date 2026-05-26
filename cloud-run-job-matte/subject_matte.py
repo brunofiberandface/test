@@ -229,25 +229,29 @@ def build_heel_contact(
     return layer.filter(ImageFilter.GaussianBlur(radius=blur))
 
 
-# Defaults — G12_bumped (2026-05-06).
-# Compromise between G_compress12 (flat floor, picked 2026-05-05) and POC FINAL_*.png
-# visibility: keep compress=0.12 for flat ground (no "uphill" look), bump opacity to
-# match the POC shadow strength on pure-white backdrop.
-#   cast:  shear=-0.30, compress=0.12 (flat floor), opacity=0.40 (was 0.20 SOFT_C → 2x)
-#   heel:  same width/height/blur/offset, opacity=180 (was 110 → ~1.6x)
+# Defaults — softened (2026-05-26).
+# Bruno feedback after the M06→M03 shadow restoration: prior values had a
+# 5-6× blur ratio between contact and cast (heel blur 22 vs cast blur 130) —
+# they read as two disjoint shadows (hard contact pad + far-too-soft
+# directional wash). Goal: one consistent soft-studio-light reading.
+#   cast: blur 130→95,  opacity 0.40→0.32  (tighter, slightly less prominent)
+#   heel: blur 22→45,   opacity 180→140    (softer edge, lighter)
+#   shear / compress / dimensions / tint unchanged.
+# Pre-ship validated via local rembg+composite simulation on 3 jobs
+# (M61G/wTqV/5gmK) — see gstar/Shadow_Backdrop_Test_v2.pptx.
 DEFAULT_SHADOW = {
     "cast": {
         "shear": -0.30,
         "compress": 0.12,
-        "opacity": 0.40,
-        "blur": 130,
+        "opacity": 0.32,
+        "blur": 95,
         "tint": [20, 20, 25],
     },
     "heel_contact": {
         "width": 130,
         "height": 20,
-        "opacity": 180,
-        "blur": 22,
+        "opacity": 140,
+        "blur": 45,
         "y_offset": -5,
         "tint": [20, 20, 25],
     },
