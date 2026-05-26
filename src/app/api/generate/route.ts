@@ -4,10 +4,10 @@
  * Per-shot routing:
  *   M01 / M02 — matrix-paint (Tier-2 cell base + Seedream jeans paint)
  *   M05       — Seedream single-pass (pocket-detail back close-up)
- *   M06       — Seedream → Gemini tee-edit (free-pose full body)
+ *   M03       — Seedream → Gemini (full body / functionality; formerly M06)
  *
  * Post-generation: leather label composite (M02 only) → matte + backdrop
- * variants (M01/M02/M06) → deliverable formatting (PDP + PLP for all 4).
+ * variants (M01/M02/M03) → deliverable formatting (PDP + PLP for all 4).
  *
  * M03 / M04 retired 2026-05-17 — replaced by the Tier-2 matrix.
  */
@@ -161,9 +161,9 @@ export async function POST(req: NextRequest) {
       }
 
     } else {
-      // ── Seedream path — single-pass for M05/M06, no dressed base ──
+      // ── Seedream path — single-pass for M03/M05, no dressed base ──
       // The legacy provider='gemini' path was retired with M03/M04 — it was
-      // structurally tied to those shots and had no working M05/M06 path of
+      // structurally tied to those shots and had no working M03/M05 path of
       // its own. All non-matrix shots now go through Seedream regardless of
       // job.provider; the `provider` field is kept on the doc for audit only.
       // Model selected by SEEDREAM_MODEL env var (4.5 default; flip to 5.0 in
@@ -188,9 +188,15 @@ export async function POST(req: NextRequest) {
         m02AnchorUrl: job.m02AnchorUrl,  // M05 dominant anchor — set by route after M02 lands
         apiKey: seedreamApiKey || process.env.BYTEPLUS_API_KEY,
         model: seedreamModelOverride,  // undefined → uses SEEDREAM_MODEL env var default
-        m06PoseId: (job as { m06PoseId?: string }).m06PoseId,  // M06-only — undefined falls back to default
+        // M03 (Full Body / Functionality, formerly M06) — read new field first,
+        // fall back to legacy m06PoseId / m06TopPoseId on pre-rename job/shot
+        // docs so historical content keeps rendering until the migration script
+        // physically renames the fields.
+        m03PoseId: (job as { m03PoseId?: string; m06PoseId?: string }).m03PoseId
+          ?? (job as { m06PoseId?: string }).m06PoseId,  // undefined falls back to default pose
         m05TopVariantId: (shotData as { m05TopVariantId?: 'A' | 'B' | 'C' })?.m05TopVariantId,  // M05 top-focus only — undefined = random pick
-        m06TopPoseId: (shotData as { m06TopPoseId?: string })?.m06TopPoseId,  // M06 top-focus only — undefined = random pick (t01-t05)
+        m03TopPoseId: (shotData as { m03TopPoseId?: string; m06TopPoseId?: string })?.m03TopPoseId
+          ?? (shotData as { m06TopPoseId?: string })?.m06TopPoseId,  // M03 top-focus only — undefined = random pick (t01-t05)
         focusSlot,  // 'top' | 'bottom' | 'shoe' | undefined
       };
       // prompt is non-null here — only M01/M02 (matrix shots) skip the loader,
@@ -201,7 +207,7 @@ export async function POST(req: NextRequest) {
       console.log(`[Generate] ${shotType} Seedream generated (${result.imageData.length} bytes, model=${usedModel})`);
       finalImageData = result.imageData;
 
-      // ── Gemini tee-edit: replace sports bra with real top (M06 only) ──
+      // ── Gemini tee-edit: replace sports bra with real top (M03 only — formerly M06) ──
       // Seedream 4.5 renders with a sports bra to avoid body seam artifacts.
       // Gemini then paints the real top using the flat image + Opus description.
       // Seedream 5.0+ handles tucked-in tops natively, so tee-edit is skipped.
@@ -276,7 +282,7 @@ export async function POST(req: NextRequest) {
 
     // ── Subject matte + backdrop variants ──────────────────────────────────
     // Shot type policy:
-    //   M01/M02/M06 — matte + cast shadow + heel contact + composite onto white & grey
+    //   M01/M02/M03 — matte + cast shadow + heel contact + composite onto white & grey
     //   M05         — SKIP (2026-05-11, Bruno-approved). Track A (cropped refs)
     //                 + rev 32 prompt produces a clean grey-backdrop M05 from
     //                 Seedream alone. Matte step was adding cutout artifacts
@@ -298,15 +304,26 @@ export async function POST(req: NextRequest) {
     console.log(`[Generate] ${shotType} entering matte block (finalImageData=${finalImageData.length} bytes)`);
     let whiteMasterUrl: string | undefined;
     {
-      const SHADOW_SHOTS = new Set(['M01', 'M02', 'M06']);
+      // 2026-05-26: 'M06' added as a legacy alias of 'M03'. The platform-wide
+      // M06→M03 rename (see src/types/index.ts) hasn't fully propagated to all
+      // existing shot docs — some still carry shotType='M06' in Firestore.
+      // Listing both ensures the matte + procedural-shadow + recomposite
+      // pipeline runs for the free-pose / full-body shot regardless of which
+      // string is on the doc. Without this, M06 shipped raw from Gemini-3-pro
+      // (no rembg backdrop normalization → backdrop grey drifted vs M01/M02;
+      // no procedural shadow → only whatever Gemini painted natively).
+      const SHADOW_SHOTS = new Set(['M01', 'M02', 'M03', 'M06']);
       const NO_SHADOW_SHOTS = new Set<string>();  // M05 removed 2026-05-11 — see comment block above
-      // 2026-05-22: M06 needs the rembg + composite + procedural-shadow output,
-      // but NOT the Gemini grounding-shadow regen step. Gemini's regen drifts
-      // the subject framing (head cropped at top of frame, feet shifted) even
-      // with the knockout fix applied. Procedural shadow from the Python matte
-      // job is sufficient. Add M06 to SKIP_GEMINI_SHADOW so it still matte's +
-      // produces backdrop variants but Gemini doesn't touch the output.
-      const SKIP_GEMINI_SHADOW = new Set(['M06']);
+      // 2026-05-22: M03 (Full Body / Functionality, formerly M06) needs the
+      // rembg + composite + procedural-shadow output, but NOT the Gemini
+      // grounding-shadow regen step. Gemini's regen drifts the subject framing
+      // (head cropped at top of frame, feet shifted) even with the knockout
+      // fix applied. Procedural shadow from the Python matte job is sufficient.
+      // Add M03 (and its legacy alias M06) to SKIP_GEMINI_SHADOW so it still
+      // matte's + produces backdrop variants but Gemini doesn't touch the
+      // output. The recomposite step (subject-matte.ts:484+) preserves crisp
+      // garment pixels regardless.
+      const SKIP_GEMINI_SHADOW = new Set(['M03', 'M06']);
       const shouldMatte = SHADOW_SHOTS.has(shotType as string) || NO_SHADOW_SHOTS.has(shotType as string);
       // Top-focus matrix-paint M01/M02 outputs an upper-body crop (head →
       // mid-femur). No feet means the procedural foot-cast-shadow would render
@@ -403,23 +420,76 @@ export async function POST(req: NextRequest) {
     }
 
     // ── Deliverable formatting ─────────────────────────────────────────────
-    // For deliverable shot types (M01, M02, M05, M06) produce the brand-spec
-    // PDP (4000×4000) and PLP (1500×2025) variants and upload them as siblings.
+    // For deliverable shot types (M01, M02, M03, M05) produce the brand-spec
+    // PDP (4000×4000), PLP (1500×2025), and Wholesale (3200×4000 white-bg)
+    // variants and upload them as siblings.
+    //
+    // Filename pattern (2026-05-26 — replaces the old `${modelId}_${shotType}_v${version}_pdp.jpg`):
+    //   PDP        — {focusDesignNumber}-M0{n}.jpg     e.g.  D24461-D559-A587-M01.jpg
+    //   PLP        — {focusDesignNumber}-E0{n}.jpg     e.g.  D24461-D559-A587-E01.jpg
+    //   Wholesale  — {focusDesignNumber}-W0{n}.jpg     e.g.  D24461-D559-A587-W01.jpg
+    // Where {n} is the two-digit suffix from shotFilenameSuffix() — '01' for M01,
+    // '02' for M02, '03' for M03, '05' for M05. Falls back to the legacy
+    // `{modelId}_{shotType}_v{version}_<format>.jpg` pattern when focusDesignNumber
+    // is missing (e.g. legacy jobs without the field, or wardrobe items whose
+    // name didn't parse as D{NNNNN}-...).
+    //
+    // Wholesale source: prefers whiteMasterUrl content (the pure-white matte
+    // output). If matting didn't run (older shots, M05 which skips matte),
+    // wholesale falls back to greyMaster — visible halo, acceptable for legacy.
+    //
     // Non-blocking: a formatter failure must not fail the shot.
     let pdpUrl: string | undefined;
     let plpUrl: string | undefined;
+    let wholesaleUrl: string | undefined;
     try {
-      const { isDeliverableShot, formatBoth } = await import('@/lib/pipeline/deliverable-format');
+      const { isDeliverableShot, formatAll } = await import('@/lib/pipeline/deliverable-format');
+      const { shotFilenameSuffix } = await import('@/lib/shot-labels');
       if (isDeliverableShot(shotType as ShotType)) {
         await reportProgress('Formatting deliverables', 92);
-        const { pdp, plp } = await formatBoth(finalImageData);
-        const pdpName = `${job.modelId}_${shotType}_v${version}_pdp.jpg`;
-        const plpName = `${job.modelId}_${shotType}_v${version}_plp.jpg`;
-        [pdpUrl, plpUrl] = await Promise.all([
+
+        // Wholesale uses the white master if available — fetch it back from
+        // GCS. produceBackdropVariants() returned the whiteBuffer above and we
+        // uploaded it; pulling the buffer back is cheaper than re-rendering.
+        // If whiteMasterUrl is undefined (M05 / shots that skipped matte),
+        // pass undefined → formatAll falls back to greySource on white canvas.
+        let whiteBuffer: Buffer | undefined;
+        if (whiteMasterUrl) {
+          try {
+            const wRes = await fetch(whiteMasterUrl, { signal: AbortSignal.timeout(20_000) });
+            if (wRes.ok) whiteBuffer = Buffer.from(await wRes.arrayBuffer());
+          } catch (wErr) {
+            console.warn(`[Generate] ${shotType} could not fetch whiteMasterUrl for wholesale (non-blocking):`, wErr);
+          }
+        }
+
+        const { pdp, plp, wholesale } = await formatAll(finalImageData, whiteBuffer);
+
+        // Filename builder. Branches on focusDesignNumber availability so old
+        // jobs (no design number persisted) still get deliverables under the
+        // legacy filename pattern. New jobs get the brand-spec D-...-{format}.
+        const designNumber = (job.focusDesignNumber as string | undefined) || '';
+        const suffix = shotFilenameSuffix(shotType as string);
+        const pdpName = designNumber
+          ? `${designNumber}-M${suffix}.jpg`
+          : `${job.modelId}_${shotType}_v${version}_pdp.jpg`;
+        const plpName = designNumber
+          ? `${designNumber}-E${suffix}.jpg`
+          : `${job.modelId}_${shotType}_v${version}_plp.jpg`;
+        const wholesaleName = designNumber
+          ? `${designNumber}-W${suffix}.jpg`
+          : `${job.modelId}_${shotType}_v${version}_wholesale.jpg`;
+
+        [pdpUrl, plpUrl, wholesaleUrl] = await Promise.all([
           uploadGeneratedImage(jobName, pdpName, pdp),
           uploadGeneratedImage(jobName, plpName, plp),
+          uploadGeneratedImage(jobName, wholesaleName, wholesale),
         ]);
-        console.log(`[Generate] ${shotType} deliverables: PDP ${(pdp.length / 1024).toFixed(0)}KB + PLP ${(plp.length / 1024).toFixed(0)}KB`);
+        console.log(
+          `[Generate] ${shotType} deliverables: PDP ${(pdp.length / 1024).toFixed(0)}KB + ` +
+          `PLP ${(plp.length / 1024).toFixed(0)}KB + Wholesale ${(wholesale.length / 1024).toFixed(0)}KB ` +
+          `(designNumber=${designNumber || 'legacy-fallback'})`
+        );
       }
     } catch (delivErr) {
       console.error(`[Generate] ${shotType} deliverable formatting failed (non-blocking):`, delivErr);
@@ -438,6 +508,7 @@ export async function POST(req: NextRequest) {
       ...(useDressedBase ? { usedDressedBase: true } : {}),
       ...(pdpUrl ? { pdpUrl } : {}),
       ...(plpUrl ? { plpUrl } : {}),
+      ...(wholesaleUrl ? { wholesaleUrl } : {}),
       // Backdrop variants — present only when subject-matte ran successfully.
       // greyMasterUrl mirrors imageUrl (same file) for explicit consumption.
       // whiteMasterUrl is the pure-white-background sibling.
