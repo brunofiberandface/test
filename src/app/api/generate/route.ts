@@ -195,8 +195,15 @@ export async function POST(req: NextRequest) {
         m03PoseId: (job as { m03PoseId?: string; m06PoseId?: string }).m03PoseId
           ?? (job as { m06PoseId?: string }).m06PoseId,  // undefined falls back to default pose
         m05TopVariantId: (shotData as { m05TopVariantId?: 'A' | 'B' | 'C' })?.m05TopVariantId,  // M05 top-focus only — undefined = random pick
-        m03TopPoseId: (shotData as { m03TopPoseId?: string; m06TopPoseId?: string })?.m03TopPoseId
-          ?? (shotData as { m06TopPoseId?: string })?.m06TopPoseId,  // M03 top-focus only — undefined = random pick (t01-t05)
+        // M01/M02 top-focus pose precedence (2026-05-26):
+        //   shot-level override (per-shot rerun-with-pose) >
+        //     job-level pick (new-job step 4) >
+        //       legacy shot field (m06TopPoseId from pre-rename docs) >
+        //         random per gender at generation time.
+        m03TopPoseId:
+          (shotData as { m03TopPoseId?: string; m06TopPoseId?: string })?.m03TopPoseId
+          ?? (job as { m03TopPoseId?: string })?.m03TopPoseId
+          ?? (shotData as { m06TopPoseId?: string })?.m06TopPoseId,
         focusSlot,  // 'top' | 'bottom' | 'shoe' | undefined
       };
       // prompt is non-null here — only M01/M02 (matrix shots) skip the loader,
@@ -313,7 +320,17 @@ export async function POST(req: NextRequest) {
       // (no rembg backdrop normalization → backdrop grey drifted vs M01/M02;
       // no procedural shadow → only whatever Gemini painted natively).
       const SHADOW_SHOTS = new Set(['M01', 'M02', 'M03', 'M06']);
-      const NO_SHADOW_SHOTS = new Set<string>();  // M05 removed 2026-05-11 — see comment block above
+      // 2026-05-26: M05 added back. Originally excluded 2026-05-11 because the
+      // matte step produced rembg artifacts on M05's close-up framing (xray
+      // softness without alpha_matting, jagged edges with). Since then the
+      // pipeline has alpha_matting=True + LEARNING #102 recomposite + the
+      // DISABLE_SHADOW=1 propagation for no-feet shots. Local rembg+composite
+      // simulation on 3 jobs (M61G/wTqV/5gmK) — see gstar/M05_Matte_Test.pptx —
+      // confirmed clean silhouettes with no artifacts on close-up framings.
+      // M05 stays in NO_SHADOW_SHOTS (not SHADOW_SHOTS) because it shares the
+      // no-feet property with upper-body M01/M02 crops — disable_shadow=true
+      // must be passed to python to skip heel detection.
+      const NO_SHADOW_SHOTS = new Set(['M05']);
       // 2026-05-22: M03 (Full Body / Functionality, formerly M06) needs the
       // rembg + composite + procedural-shadow output, but NOT the Gemini
       // grounding-shadow regen step. Gemini's regen drifts the subject framing
@@ -325,15 +342,26 @@ export async function POST(req: NextRequest) {
       // garment pixels regardless.
       const SKIP_GEMINI_SHADOW = new Set(['M03', 'M06']);
       const shouldMatte = SHADOW_SHOTS.has(shotType as string) || NO_SHADOW_SHOTS.has(shotType as string);
-      // Top-focus matrix-paint M01/M02 outputs an upper-body crop (head →
-      // mid-femur). No feet means the procedural foot-cast-shadow would render
-      // floating mid-thigh — disable shadow but still produce white/grey
-      // variants from rembg matte.
-      const disableShadow =
+      // 2026-05-26 (later): split the single disableShadow boolean into TWO
+      // distinct concepts that were being conflated and broke M03's cast
+      // shadow:
+      //   noFeetVisible — true when there are NO feet in the frame
+      //     (M05 close-up, M01/M02 upper-body). Python should skip the
+      //     procedural shadow build (no heels to anchor it to). Maps to
+      //     options.disableShadow → DISABLE_SHADOW=1 env var.
+      //   skipGroundingOnly — true when there ARE feet but Gemini's
+      //     grounding-shadow regen drifts the subject framing (M03/M06).
+      //     Python should KEEP the procedural shadow on (cast + heel),
+      //     just skip the Gemini grounding pass + recomposite. Maps to
+      //     options.skipGroundingOnly.
+      //   The two are mutually exclusive: a shot is either no-feet (use
+      //   disableShadow) or has-feet-but-skip-gemini (use skipGroundingOnly).
+      const noFeetVisible =
         NO_SHADOW_SHOTS.has(shotType as string) ||
-        SKIP_GEMINI_SHADOW.has(shotType as string) ||
         matrixUpperBodyCrop;
-      console.log(`[Generate] ${shotType} shouldMatte=${shouldMatte} disableShadow=${disableShadow}`);
+      const skipGroundingOnly =
+        SKIP_GEMINI_SHADOW.has(shotType as string) && !noFeetVisible;
+      console.log(`[Generate] ${shotType} shouldMatte=${shouldMatte} noFeetVisible=${noFeetVisible} skipGroundingOnly=${skipGroundingOnly}`);
       if (shouldMatte) {
         const version_for_white = body.version || 1;
         const jobName_for_white = job.jobName || job.jobId;
@@ -341,12 +369,18 @@ export async function POST(req: NextRequest) {
           await reportProgress('Matting + backdrop variants', 87);
           console.log(`[Generate] ${shotType} calling produceBackdropVariants…`);
           const variants = await produceBackdropVariants(finalImageData, {
-            disableShadow,
+            disableShadow: noFeetVisible,
+            skipGroundingOnly,
           });
           console.log(`[Generate] ${shotType} produceBackdropVariants returned ${variants ? 'success' : 'null'}`);
           if (variants) {
             const whiteName = `${job.modelId}_${shotType}_v${version_for_white}_white.png`;
-            whiteMasterUrl = await uploadGeneratedImage(jobName_for_white, whiteName, variants.whiteBuffer);
+            // 2026-05-26 BUG FIX: folder uses jobId to avoid cross-job filename
+            // collisions when two jobs share the same auto-generated jobName.
+            // The whiteName filename pattern is {modelId}_{shotType}_v{version}_white.png
+            // so different-model jobs wouldn't collide, but same-model same-design
+            // reruns/clones could. jobId folder closes that gap.
+            whiteMasterUrl = await uploadGeneratedImage(jobId, whiteName, variants.whiteBuffer);
             // Grey becomes the new primary master — replace finalImageData so all
             // downstream paths (master upload, deliverable formatter, anchor URLs,
             // version history) work off the cleaned/composited version.
@@ -379,7 +413,10 @@ export async function POST(req: NextRequest) {
     const version = body.version || 1;
     const filename = `${job.modelId}_${shotType}_v${version}.png`;
     const jobName = job.jobName || job.jobId;
-    const imageUrl = await uploadGeneratedImage(jobName, filename, finalImageData);
+    // 2026-05-26 BUG FIX: folder uses jobId — see comment in deliverable
+    // upload block below for the collision rationale. Same fix applied here
+    // for the primary master upload.
+    const imageUrl = await uploadGeneratedImage(jobId, filename, finalImageData);
     // Dropped the 'final' stage pointer (2026-05-18 cleanup): it was set to
     // imageUrl, producing a duplicate "8. Final" tile in the debug viewer.
     // The viewer already renders imageUrl as the primary image; the pointer
@@ -480,10 +517,19 @@ export async function POST(req: NextRequest) {
           ? `${designNumber}-W${suffix}.jpg`
           : `${job.modelId}_${shotType}_v${version}_wholesale.jpg`;
 
+        // 2026-05-26 BUG FIX: upload folder is now jobId, not jobName.
+        // Multiple jobs with the same focus garment auto-generate the same
+        // jobName ("D24461-D559-A587 KATE BOYFRIEND WMN"), so jobName-based
+        // folders collided on the brand-spec filenames (D24461-W01.jpg etc.).
+        // Symptom: Wholesale download showed a different model's image
+        // because Job B's backfill overwrote Job A's file. Per-jobId folders
+        // make collision impossible. Pre-existing files in jobName folders
+        // are orphaned; backfill-deliverables.ts re-uploads under jobId.
+        const uploadFolder = jobId;
         [pdpUrl, plpUrl, wholesaleUrl] = await Promise.all([
-          uploadGeneratedImage(jobName, pdpName, pdp),
-          uploadGeneratedImage(jobName, plpName, plp),
-          uploadGeneratedImage(jobName, wholesaleName, wholesale),
+          uploadGeneratedImage(uploadFolder, pdpName, pdp),
+          uploadGeneratedImage(uploadFolder, plpName, plp),
+          uploadGeneratedImage(uploadFolder, wholesaleName, wholesale),
         ]);
         console.log(
           `[Generate] ${shotType} deliverables: PDP ${(pdp.length / 1024).toFixed(0)}KB + ` +

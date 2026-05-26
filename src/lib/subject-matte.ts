@@ -79,9 +79,20 @@ export interface BackdropVariantsResult {
 }
 
 export interface ProduceOptions {
-  /** True for shots with no feet visible (M05). Skips procedural shadow in
-   *  the Cloud Run Job AND the Gemini grounding pass. */
+  /** True for shots with NO feet visible (M05 close-up, M01/M02 upper-body
+   *  crops). Skips procedural shadow in the Cloud Run Job (via DISABLE_SHADOW=1)
+   *  AND skips the Gemini grounding pass. Returns python's raw output (matte
+   *  composited onto solid grey/white, no shadow). */
   disableShadow?: boolean;
+  /** True for shots WITH feet visible where Gemini's grounding-shadow regen
+   *  drifts the subject framing (M03/M06 free-pose full-body). Keeps the
+   *  python procedural shadow ON (cast + heel contact), but skips the Gemini
+   *  grounding pass + recomposite. Returns python's raw output (matte +
+   *  procedural shadow composited onto solid grey/white).
+   *
+   *  Distinct from disableShadow: disableShadow disables everything,
+   *  skipGroundingOnly preserves the procedural shadow under feet. */
+  skipGroundingOnly?: boolean;
 }
 
 // ── Grounding-shadow prompts ────────────────────────────────────────────────
@@ -400,14 +411,16 @@ export async function produceBackdropVariants(
               // shadow under the feet; the Gemini grounding pass still runs on
               // top to refine quality when available.
               //
-              // 2026-05-26: DISABLE_SHADOW=1 now also flows for upper-body
-              // crops (M01/M02 top-focus). Those shots end at mid-femur — no
-              // feet visible — so the python heel-detection fails and the
-              // entire matte step errors out, dropping back to the raw
-              // Gemini-toppaint output (which has the non-uniform native
-              // backdrop). Setting DISABLE_SHADOW=1 lets python complete the
-              // rembg+composite step onto clean #D9DAD2 without attempting
-              // shadow detection on the absent feet.
+              // 2026-05-26: DISABLE_SHADOW=1 flows ONLY for no-feet shots
+              // (options.disableShadow). For SKIP_GEMINI_SHADOW shots (M03/M06
+              // with feet) the procedural shadow MUST stay on — those shots
+              // use options.skipGroundingOnly instead, which keeps python's
+              // shadow build active and only skips the downstream Gemini
+              // grounding pass.
+              //
+              // Earlier today I conflated the two cases under disableShadow;
+              // M03 lost its cast shadow as a result. Splitting the two
+              // concepts via two distinct ProduceOptions fields fixes it.
               ...(options.disableShadow ? [{ name: 'DISABLE_SHADOW', value: '1' }] : []),
             ],
           }],
@@ -465,9 +478,18 @@ export async function produceBackdropVariants(
     console.log(`[SubjectMatte] downloaded outputs in ${downloadMs}ms (white=${whiteBufferRaw.length}B grey=${greyBufferRaw.length}B matte=${matteBufferOpt ? matteBufferOpt.length + 'B' : 'missing'})`);
 
     // 5. Gemini grounding shadow — parallel pass on each backdrop variant.
-    // Skipped for shots without feet visible (M05) — those stay no-shadow.
-    if (options.disableShadow) {
-      console.log(`[SubjectMatte] disableShadow=true → skipping Gemini grounding pass`);
+    // Skipped in two distinct cases:
+    //   (a) disableShadow=true — no feet visible (M05, M01/M02 upper-body).
+    //       Python skipped procedural shadow via DISABLE_SHADOW=1; the raw
+    //       output is matte composited onto solid grey/white, no shadow.
+    //   (b) skipGroundingOnly=true — M03/M06 free-pose. Python ran procedural
+    //       shadow normally (cast + heel contact); we just skip the Gemini
+    //       grounding regen pass + recomposite because Gemini drifts framing.
+    // Both branches return python's raw output as the final result. They
+    // differ only in what python did upstream (shadow vs no-shadow).
+    if (options.disableShadow || options.skipGroundingOnly) {
+      const reason = options.disableShadow ? 'disableShadow=true' : 'skipGroundingOnly=true';
+      console.log(`[SubjectMatte] ${reason} → skipping Gemini grounding pass + recomposite`);
       return {
         whiteBuffer: whiteBufferRaw,
         greyBuffer: greyBufferRaw,
