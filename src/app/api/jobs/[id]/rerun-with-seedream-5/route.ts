@@ -20,6 +20,7 @@ import { NextRequest } from 'next/server';
 import { getJob, listShots, shotsCol, enqueueJob, updateJobStatus } from '@/lib/firestore';
 import { SEEDREAM_MODEL_5_0 } from '@/lib/pipeline/seedream-client';
 import { triggerWorker } from '@/lib/worker/trigger';
+import { gateJobOnMatrixCell } from '@/lib/job-dispatch';
 
 export async function POST(
   _req: NextRequest,
@@ -64,6 +65,28 @@ export async function POST(
   // and M01/M02/M05 pick up the new Seedream anchors in the dependency chain.
   const { updateJob } = await import('@/lib/firestore');
   await updateJob(jobId, { m03AnchorUrl: null, m04AnchorUrl: null });
+
+  // ── Matrix-cell readiness gate (parity with CREATE) ──
+  // 2026-05-26: rerun endpoints previously skipped this check, causing the
+  // M61G infinite-retry loop on missing cells. Now matches CREATE behavior.
+  const wardrobe = job.wardrobe as { shoe?: { itemId?: string } } | undefined;
+  const shoeId = wardrobe?.shoe?.itemId;
+  const modelId = job.modelId as string | undefined;
+  if (shoeId && modelId) {
+    const gate = await gateJobOnMatrixCell(jobId, shoeId, modelId);
+    if (gate.parked) {
+      triggerWorker('rerun-seedream-5-awaiting-matrix').catch(() => { /* logged in helper */ });
+      return new Response(JSON.stringify({
+        ok: true,
+        jobId,
+        provider: 'seedream',
+        seedreamModel: SEEDREAM_MODEL_5_0,
+        shotsRequeued: shots.length,
+        status: 'awaiting-matrix',
+        awaitingCell: { shoeId, modelId, batchName: gate.awaitingCellBatchName },
+      }), { headers: { 'Content-Type': 'application/json' } });
+    }
+  }
 
   await updateJobStatus(jobId, 'generating');
 

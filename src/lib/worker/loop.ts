@@ -283,7 +283,7 @@ async function processShot(shot: EligibleShot, geminiKey: string, bytePlusKey: s
         // retry loop (status reset to 'pending' → re-pickup → same fail).
         //
         // Trigger case: job B7MCDg2G + model F8 (F8 had no referenceImageUrl).
-        // M03/M04/M06 spun 3+ retries per second for ~30+ min, burning Cloud
+        // The full-body shots (legacy M03/M04 + current M03 / formerly M06) spun 3+ retries per second for ~30+ min, burning Cloud
         // Run CPU + key checkouts. See BUGS_AND_FIXES "May 12, 2026 — F8
         // infinite retry loop" + LEARNING note.
         //
@@ -291,7 +291,13 @@ async function processShot(shot: EligibleShot, geminiKey: string, bytePlusKey: s
         // On match, mark 'failed' (terminal, won't be re-picked). On no
         // match, fall through to 'pending' (transient — Seedream rate limit,
         // network, etc.).
-        const PERMANENT_ERROR_PATTERNS = /reference image not found|no model card for|model front ref missing|model card missing|model card not found|fitModels\.(front|back) missing|fitModels missing|no bottom \(pants\)|no top item|no shoe in wardrobe|wardrobe item not found|bottom garment not found|top garment not found|no back reference/i;
+        //
+        // 2026-05-26: added matrixPaint missing-view pattern. The upstream
+        // dispatcher gate now parks jobs in 'awaiting-matrix' for missing
+        // cells (job-dispatch.ts), so this regex is a defense-in-depth
+        // fallback. If a job somehow slips the gate, this prevents the
+        // infinite-retry loop that consumed quota on job M61G.
+        const PERMANENT_ERROR_PATTERNS = /reference image not found|no model card for|model front ref missing|model card missing|model card not found|fitModels\.(front|back) missing|fitModels missing|no bottom \(pants\)|no top item|no shoe in wardrobe|wardrobe item not found|bottom garment not found|top garment not found|no back reference|matrixPaint\([^)]+\): no \w+ for cell/i;
         if (PERMANENT_ERROR_PATTERNS.test(errorText)) {
           console.error(`[Worker] ${shot.shotType} (${shot.jobId.substring(0,8)}) — PERMANENT error detected, marking 'failed' (no retry).`);
           await shotsCol.doc(shot.shotId).update({

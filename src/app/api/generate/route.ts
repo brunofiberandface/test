@@ -500,7 +500,7 @@ export async function POST(req: NextRequest) {
           }
         }
 
-        const { pdp, plp, wholesale } = await formatAll(finalImageData, whiteBuffer);
+        const { pdp, plp, wholesale } = await formatAll(finalImageData, whiteBuffer, shotType as ShotType);
 
         // Filename builder. Branches on focusDesignNumber availability so old
         // jobs (no design number persisted) still get deliverables under the
