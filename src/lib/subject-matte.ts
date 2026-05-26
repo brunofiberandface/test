@@ -12,9 +12,9 @@
  *   - V4 (this file): rembg in Cloud Run Job for the matte ONLY (always
  *     `disable_shadow=true`), then the main service runs a Gemini-3-pro-image-
  *     preview "grounding shadow" pass on each backdrop variant in parallel.
- *     Validated on M06 male sneakers + Slide1 female stiletto heels — matte
+ *     Validated on M03 (Full Body / Functionality, formerly M06) male sneakers + Slide1 female stiletto heels — matte
  *     preserves footwear, Gemini adds subtle contact + faint cast without
- *     altering the subject. ~$0.48/shot extra (~$1.44/job for M03+M04+M06).
+ *     altering the subject. ~$0.48/shot extra (historically ~$1.44/job for the legacy M03+M04+M06 set; current active set is M01+M02+M03 active, formerly M06).
  *
  * Cloud Run Job: `subject-matte-job` in europe-west1.
  * Source: cloud-run-job-matte/ (Dockerfile + job_main.py + subject_matte.py).
@@ -85,7 +85,7 @@ export interface ProduceOptions {
 }
 
 // ── Grounding-shadow prompts ────────────────────────────────────────────────
-// Locked by Bruno on 2026-05-06 after testing M06 male sneakers + Slide1
+// Locked by Bruno on 2026-05-06 after testing M03 (Full Body / Functionality, formerly M06) male sneakers + Slide1
 // female stiletto heels. See LEARNINGS #81 for context.
 
 const GROUNDING_PROMPT_GREY = `Edit this e-commerce studio photo to ground the model on the floor. The model is currently floating because there is no shadow.
@@ -275,7 +275,7 @@ async function snapNearWhiteToPure(buffer: Buffer): Promise<Buffer> {
   const { data, info } = await image.ensureAlpha().raw().toBuffer({ resolveWithObject: true });
   const channels = info.channels;
 
-  // Detect backdrop color from a 100×100 top-left sample. M03/M04/M06 are
+  // Detect backdrop color from a 100×100 top-left sample. The full-body shots (legacy M03/M04 + current M03 / formerly M06) are
   // 3:4 portrait full-body with the subject vertically centered — the top
   // corners are reliably backdrop.
   const sampleSize = 100;
@@ -391,16 +391,24 @@ export async function produceBackdropVariants(
               { name: 'DST_WHITE_GCS_URL', value: `gs://${BUCKET}/${whiteKey}` },
               { name: 'DST_GREY_GCS_URL',  value: `gs://${BUCKET}/${greyKey}` },
               { name: 'DST_MATTE_GCS_URL', value: `gs://${BUCKET}/${matteKey}` },
-              // 2026-05-13: procedural shadow RE-ENABLED as the floor. V4 had
-              // disabled it because the Gemini grounding-shadow pass produced
-              // higher-quality shadows. But when Gemini 503s (Kate Boyfriend
-              // Jeans 62 incident — 5 of 7 grounding calls failed), the shot
-              // shipped shadow-less. Procedural baseline guarantees every shot
-              // has at least a soft contact + heel shadow under the feet; the
-              // Gemini grounding pass still runs on top to refine quality
-              // when it's available.
-              // (Set DISABLE_SHADOW=1 only for identity reference image
-              // mattes — see model-whitebg.ts.)
+              // 2026-05-13: procedural shadow RE-ENABLED as the floor for shots
+              // WITH feet visible. V4 had disabled it because the Gemini
+              // grounding-shadow pass produced higher-quality shadows. But when
+              // Gemini 503s (Kate Boyfriend Jeans 62 — 5 of 7 grounding calls
+              // failed), the shot shipped shadow-less. Procedural baseline
+              // guarantees every shot has at least a soft contact + heel
+              // shadow under the feet; the Gemini grounding pass still runs on
+              // top to refine quality when available.
+              //
+              // 2026-05-26: DISABLE_SHADOW=1 now also flows for upper-body
+              // crops (M01/M02 top-focus). Those shots end at mid-femur — no
+              // feet visible — so the python heel-detection fails and the
+              // entire matte step errors out, dropping back to the raw
+              // Gemini-toppaint output (which has the non-uniform native
+              // backdrop). Setting DISABLE_SHADOW=1 lets python complete the
+              // rembg+composite step onto clean #D9DAD2 without attempting
+              // shadow detection on the absent feet.
+              ...(options.disableShadow ? [{ name: 'DISABLE_SHADOW', value: '1' }] : []),
             ],
           }],
         },
