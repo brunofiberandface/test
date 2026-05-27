@@ -10,6 +10,16 @@ interface ShellProps {
   user?: { email: string; name: string; role: 'admin' | 'creator' };
 }
 
+// Map of Classic href → v2 href. When the user is currently on a /v2/*
+// route, nav items in this map navigate to the v2 equivalent so the user
+// stays in v2 instead of bouncing between Classic and New.
+//
+// Phase 2 Slice 2B: only Wardrobe has a v2 destination. Add more entries
+// as later slices ship (e.g. /jobs/new → /v2/jobs/new in Slice 2D).
+const V2_NAV_MAP: Record<string, string> = {
+  '/wardrobe': '/v2/wardrobe',
+};
+
 const NAV_ITEMS = [
   { href: '/dashboard', label: 'Dashboard', roles: ['admin', 'creator'] },
   { href: '/jobs/new', label: 'New Job', roles: ['admin', 'creator'], exact: true },
@@ -39,11 +49,15 @@ export default function Shell({ children, user }: ShellProps) {
             {NAV_ITEMS
               .filter(item => !user || item.roles.includes(user.role))
               .map(item => {
-                const active = item.exact ? pathname === item.href : pathname?.startsWith(item.href);
+                const onV2 = pathname?.startsWith('/v2');
+                const href = onV2 && V2_NAV_MAP[item.href] ? V2_NAV_MAP[item.href] : item.href;
+                const active = item.exact
+                  ? pathname === href || pathname === item.href
+                  : pathname?.startsWith(href) || pathname?.startsWith(item.href);
                 return (
                   <Link
                     key={item.href}
-                    href={item.href}
+                    href={href}
                     className={`px-3 py-1.5 text-sm transition-colors ${
                       active
                         ? 'text-neutral-900 font-medium'
