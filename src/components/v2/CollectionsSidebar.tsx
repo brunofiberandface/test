@@ -3,38 +3,37 @@
 /**
  * <CollectionsSidebar/> — Year → Quarter → Drop tree + NOOS sub-buckets.
  *
- * Reusable. Used in /v2/wardrobe (this slice) and will be used in
+ * NOOS sub-buckets are now derived from the actual `category` values
+ * present in the data (Bottoms / Tops / Shoes / …) rather than a fixed
+ * enum. The parent passes them in via `noosCategoryBuckets`.
+ *
+ * Reusable. Used in /v2/wardrobe (this slice) and will be reused in
  * /v2/jobs/new step 1 (Slice 2D) for the focus-collection picker.
  *
- * The parent owns the selection state and the data (drop counts + NOOS
- * bucket counts). The sidebar is otherwise self-contained.
- *
- * 2026-05-27 (Phase 2 Slice 2B of dashboard redesign).
+ * 2026-05-27 (Phase 2 Slice 2B + hotfix of dashboard redesign).
  */
 import { useMemo, useState } from 'react';
-import {
-  NOOS_BUCKET_LABELS,
-  QUARTER_LABELS,
-  type V2NoosBucket,
-} from '@/lib/v2/wardrobe-classification';
+import { QUARTER_LABELS } from '@/lib/v2/wardrobe-classification';
 
 export type SidebarSelection =
   | { kind: 'all' }
   | { kind: 'drop'; year: number; quarter: number; dropNumber: number }
-  | { kind: 'noos'; bucket: V2NoosBucket }
-  | { kind: 'noosAll' };
+  | { kind: 'noos' }                                     // All NOOS
+  | { kind: 'noosCategory'; category: string };          // NOOS · {category}
+
+export interface CategoryBucket {
+  key: string;
+  label: string;
+  count: number;
+}
 
 export interface CollectionsSidebarProps {
   selection: SidebarSelection;
   onSelect: (s: SidebarSelection) => void;
   drops: Array<{ year: number; quarter: number; dropNumber: number; count: number }>;
-  noosByBucket: Record<V2NoosBucket, number>;
+  noosCategoryBuckets: CategoryBucket[];
   noosTotal: number;
-  /**
-   * If true, render years even when no drops exist for them. Wardrobe
-   * page uses this so the tree shows "2026 → Q1, Q2, Q3, Q4 (empty)"
-   * to teach Bruno the shape during the bootstrap period.
-   */
+  total: number;
   showEmptyCurrentYear?: boolean;
 }
 
@@ -42,13 +41,15 @@ function isSelectedDrop(
   sel: SidebarSelection,
   d: { year: number; quarter: number; dropNumber: number },
 ): boolean {
-  return sel.kind === 'drop' && sel.year === d.year && sel.quarter === d.quarter && sel.dropNumber === d.dropNumber;
+  return sel.kind === 'drop'
+    && sel.year === d.year
+    && sel.quarter === d.quarter
+    && sel.dropNumber === d.dropNumber;
 }
 
 export default function CollectionsSidebar({
-  selection, onSelect, drops, noosByBucket, noosTotal, showEmptyCurrentYear,
+  selection, onSelect, drops, noosCategoryBuckets, noosTotal, total, showEmptyCurrentYear,
 }: CollectionsSidebarProps) {
-  // Group drops by year for the tree.
   const yearsMap = useMemo(() => {
     const m = new Map<number, typeof drops>();
     for (const d of drops) {
@@ -66,13 +67,9 @@ export default function CollectionsSidebar({
     return Array.from(set).sort((a, b) => b - a);
   }, [yearsMap, showEmptyCurrentYear, currentYear]);
 
-  // Expanded state per year. Default: current year expanded, others collapsed.
   const [expanded, setExpanded] = useState<Record<number, boolean>>(() => ({
     [currentYear]: true,
   }));
-
-  const dropTotalAcrossYears = drops.reduce((a, b) => a + b.count, 0);
-  const grandTotal = dropTotalAcrossYears + noosTotal;
 
   const toggleYear = (year: number) =>
     setExpanded(e => ({ ...e, [year]: !e[year] }));
@@ -89,7 +86,7 @@ export default function CollectionsSidebar({
         }`}
       >
         <span>All items</span>
-        <span className="text-[11px] text-neutral-400">{grandTotal}</span>
+        <span className="text-[11px] text-neutral-400">{total}</span>
       </button>
 
       <div className="text-[10px] uppercase tracking-wider text-neutral-400 mb-1.5">Collections</div>
@@ -173,9 +170,9 @@ export default function CollectionsSidebar({
       <div className="flex flex-col gap-px">
         <button
           type="button"
-          onClick={() => onSelect({ kind: 'noosAll' })}
+          onClick={() => onSelect({ kind: 'noos' })}
           className={`w-full flex items-center justify-between px-1.5 py-1 rounded ${
-            selection.kind === 'noosAll'
+            selection.kind === 'noos'
               ? 'bg-neutral-100 text-neutral-900 font-medium'
               : 'text-neutral-700 hover:text-neutral-900'
           }`}
@@ -183,25 +180,21 @@ export default function CollectionsSidebar({
           <span>All NOOS</span>
           <span className="text-[11px] text-neutral-400">{noosTotal}</span>
         </button>
-        {(Object.keys(NOOS_BUCKET_LABELS) as V2NoosBucket[]).map(b => {
-          const active = selection.kind === 'noos' && selection.bucket === b;
-          const count = noosByBucket[b] || 0;
-          const isLegacy = b === 'legacy';
+        {noosCategoryBuckets.map(b => {
+          const active = selection.kind === 'noosCategory' && selection.category === b.key;
           return (
             <button
-              key={b}
+              key={b.key}
               type="button"
-              onClick={() => onSelect({ kind: 'noos', bucket: b })}
+              onClick={() => onSelect({ kind: 'noosCategory', category: b.key })}
               className={`w-full flex items-center justify-between pl-5 pr-1.5 py-0.5 rounded text-[11px] ${
                 active
                   ? 'bg-neutral-100 text-neutral-900 font-medium'
-                  : isLegacy
-                    ? 'text-neutral-500 hover:text-neutral-900'
-                    : 'text-neutral-600 hover:text-neutral-900'
+                  : 'text-neutral-600 hover:text-neutral-900'
               }`}
             >
-              <span className={isLegacy ? 'italic' : ''}>{NOOS_BUCKET_LABELS[b]}</span>
-              <span className="text-neutral-400">{count}</span>
+              <span>{b.label}</span>
+              <span className="text-neutral-400">{b.count}</span>
             </button>
           );
         })}

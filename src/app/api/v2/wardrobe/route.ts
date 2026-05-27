@@ -1,41 +1,54 @@
 /**
  * GET /api/v2/wardrobe
  *
- * Returns wardrobe items with their classification coerced (unclassified
- * items default to NOOS · Legacy) + sidebar counts (per drop + per NOOS
- * sub-bucket) so the v2 wardrobe page can render the tree and the grid
- * from a single round-trip.
+ * Returns wardrobe items + sidebar counts.
+ *
+ * Sidebar structure:
+ *   - drops    : Year → Quarter → Drop tree (derived from item.drop)
+ *   - noos     : NOOS sub-buckets derived from item.category (Bottoms /
+ *                Tops / Shoes / … — populated from the actual category
+ *                values present in NOOS items, not from a fixed enum)
+ *   - genders  : { male, female, … } counts so the page can render filter
+ *                chips with live counts
+ *
+ * Each item carries four named thumbnail URLs in a fixed order so the
+ * UI doesn't have to do its own picking:
+ *   flatFrontUrl    : product flat-front image
+ *   fitFrontUrl     : model fit, straight front
+ *   fitBackUrl      : model fit, straight back
+ *   fitBack45RightUrl : model fit, 45° rotated right from back
  *
  * Query params:
- *   classification = 'drop' | 'noos'   — filter by top-level
- *   dropKey        = '2026-Q3-4'       — filter to one drop (year-Qq-N)
- *   noosBucket     = 'denim' | 'tops' | 'outerwear' | 'legacy'
- *   category       = 'top' | 'bottom' | 'shoe' | ...
+ *   classification=drop|noos
+ *   dropKey=2026-Q3-4
+ *   category=top|bottom|shoes|…
+ *   gender=male|female
  *
- * The full counts (across the whole wardrobe) are ALWAYS returned so the
- * sidebar can show totals regardless of the active filter.
+ * Counts are computed off the full wardrobe (NOT filtered) so the
+ * sidebar numbers stay stable as the user filters the grid.
  *
- * 2026-05-27 (Phase 2 Slice 2B of dashboard redesign).
+ * 2026-05-27 (Phase 2 Slice 2B hotfix of dashboard redesign).
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { wardrobeCol } from '@/lib/firestore';
 import {
   coerceClassification,
   dropKey as fmtDropKey,
-  type V2NoosBucket,
 } from '@/lib/v2/wardrobe-classification';
 
-interface WardrobeListItem {
+export interface WardrobeListItem {
   wardrobeId: string;
   name: string;
   designNumber?: string;
   category?: string;
   gender?: string;
-  thumbnailUrl?: string;
-  fitModelThumbs: string[]; // up to 4 short urls for the 2x2 grid
+  flatFrontUrl?: string;
+  fitFrontUrl?: string;
+  fitBackUrl?: string;
+  fitBack45RightUrl?: string;
   classification: 'drop' | 'noos';
   drop?: { year: number; quarter: number; dropNumber: number };
-  noosBucket?: V2NoosBucket;
+  noosBucket?: string;
 }
 
 interface DropCount {
@@ -45,27 +58,51 @@ interface DropCount {
   count: number;
 }
 
+interface CategoryBucket {
+  key: string;    // canonical category id from item.category, lowercased
+  label: string;  // user-facing
+  count: number;
+}
+
 interface SidebarCounts {
   drops: DropCount[];
-  noosByBucket: Record<V2NoosBucket, number>;
+  noosCategoryBuckets: CategoryBucket[];
   noosTotal: number;
   dropTotal: number;
   total: number;
+  genderCounts: Record<string, number>;
 }
 
-function pickFitThumbs(item: any): string[] {
-  // Fit-model angle thumbnails for the 2x2 mosaic. Falls back to flats
-  // when fit angles are missing so legacy items still show something.
+const CATEGORY_LABELS: Record<string, string> = {
+  top:     'Tops',
+  bottom:  'Bottoms',
+  shoes:   'Shoes',
+  shoe:    'Shoes',     // tolerate either singular / plural in data
+  shirt:   'Shirts',
+  jacket:  'Jackets',
+  pants:   'Pants',
+};
+
+function labelForCategory(cat: string): string {
+  return CATEGORY_LABELS[cat.toLowerCase()] || (cat.charAt(0).toUpperCase() + cat.slice(1));
+}
+
+function pickThumbUrls(item: any): {
+  flatFrontUrl?: string;
+  fitFrontUrl?: string;
+  fitBackUrl?: string;
+  fitBack45RightUrl?: string;
+} {
   const fm = item.fitModels || {};
-  const ordered = [
-    fm.front, fm.back, fm.leftSide || fm.left, fm.rightSide || fm.right,
-    fm.frontDetail, fm.backDetail,
-  ].filter((u): u is string => typeof u === 'string' && u.length > 0);
-  if (ordered.length >= 4) return ordered.slice(0, 4);
-  const flats = [item.flatFrontUrl, item.flatBackUrl, item.thumbnailUrl].filter(
-    (u): u is string => typeof u === 'string' && u.length > 0,
-  );
-  return [...ordered, ...flats].slice(0, 4);
+  return {
+    // Flat front from product photos; fall back to thumbnailUrl.
+    flatFrontUrl: item.flatFrontUrl || item.thumbnailUrl,
+    fitFrontUrl: fm.front,
+    fitBackUrl: fm.back,
+    // Bruno explicitly asked for the 45° right back angle; fall back to
+    // the 45° right front if back-right isn't shot.
+    fitBack45RightUrl: fm.back45Right || fm.front45Right,
+  };
 }
 
 export async function GET(req: NextRequest) {
@@ -73,65 +110,81 @@ export async function GET(req: NextRequest) {
     const { searchParams } = new URL(req.url);
     const fClassification = searchParams.get('classification') as 'drop' | 'noos' | null;
     const fDropKey = searchParams.get('dropKey');
-    const fNoos = searchParams.get('noosBucket') as V2NoosBucket | null;
     const fCategory = searchParams.get('category');
+    const fGender = searchParams.get('gender');
 
     const snap = await wardrobeCol.get();
     const allItems = snap.docs.map(d => ({ id: d.id, ...(d.data() as any) }));
 
-    // Build sidebar counts off the FULL set first (filter-independent).
-    const counts: SidebarCounts = {
-      drops: [],
-      noosByBucket: { denim: 0, tops: 0, outerwear: 0, legacy: 0 },
-      noosTotal: 0,
-      dropTotal: 0,
-      total: allItems.length,
-    };
+    // Sidebar counts off the FULL set.
     const dropMap = new Map<string, DropCount>();
+    const noosCategoryMap = new Map<string, number>();
+    const genderCounts: Record<string, number> = {};
+    let noosTotal = 0;
+    let dropTotal = 0;
+
     for (const it of allItems) {
       const c = coerceClassification(it);
       if (c.classification === 'drop' && c.drop) {
-        counts.dropTotal++;
+        dropTotal++;
         const k = fmtDropKey(c.drop);
         const existing = dropMap.get(k);
         if (existing) existing.count++;
         else dropMap.set(k, { ...c.drop, count: 1 });
-      } else if (c.classification === 'noos' && c.noosBucket) {
-        counts.noosTotal++;
-        counts.noosByBucket[c.noosBucket]++;
+      } else if (c.classification === 'noos') {
+        noosTotal++;
+        const cat = (it.category || 'uncategorized').toLowerCase();
+        noosCategoryMap.set(cat, (noosCategoryMap.get(cat) || 0) + 1);
       }
+      const g = (it.gender || 'unspecified').toLowerCase();
+      genderCounts[g] = (genderCounts[g] || 0) + 1;
     }
-    counts.drops = Array.from(dropMap.values()).sort(
-      (a, b) =>
-        b.year - a.year ||                       // newest year first
-        b.quarter - a.quarter ||                 // newest quarter first
-        b.dropNumber - a.dropNumber,             // newest drop first
-    );
 
-    // Now filter the items themselves per the query.
+    const counts: SidebarCounts = {
+      drops: Array.from(dropMap.values()).sort(
+        (a, b) => b.year - a.year || b.quarter - a.quarter || b.dropNumber - a.dropNumber,
+      ),
+      noosCategoryBuckets: Array.from(noosCategoryMap.entries())
+        .map(([key, count]): CategoryBucket => ({ key, label: labelForCategory(key), count }))
+        // Most-populated first; tie-break alphabetical.
+        .sort((a, b) => b.count - a.count || a.label.localeCompare(b.label)),
+      noosTotal,
+      dropTotal,
+      total: allItems.length,
+      genderCounts,
+    };
+
+    // Filter the items per the query.
     const filtered: WardrobeListItem[] = [];
     for (const it of allItems) {
       const c = coerceClassification(it);
       if (fClassification && c.classification !== fClassification) continue;
-      if (fNoos && (c.classification !== 'noos' || c.noosBucket !== fNoos)) continue;
       if (fDropKey && (c.classification !== 'drop' || !c.drop || fmtDropKey(c.drop) !== fDropKey)) continue;
-      if (fCategory && (it.category || '').toLowerCase() !== fCategory.toLowerCase()) continue;
+      if (fCategory) {
+        const a = (it.category || '').toLowerCase();
+        const b = fCategory.toLowerCase();
+        if (a !== b) continue;
+      }
+      if (fGender) {
+        const a = (it.gender || '').toLowerCase();
+        const b = fGender.toLowerCase();
+        if (a !== b) continue;
+      }
 
+      const thumbs = pickThumbUrls(it);
       filtered.push({
         wardrobeId: it.id,
         name: it.name || '—',
         designNumber: it.designNumber,
         category: it.category,
         gender: it.gender,
-        thumbnailUrl: it.thumbnailUrl || it.flatFrontUrl,
-        fitModelThumbs: pickFitThumbs(it),
+        ...thumbs,
         classification: c.classification,
         drop: c.drop,
         noosBucket: c.noosBucket,
       });
     }
 
-    // Stable order: by createdAt asc when present, else by id.
     filtered.sort((a, b) => (a.name > b.name ? 1 : a.name < b.name ? -1 : 0));
 
     return NextResponse.json({ counts, items: filtered });

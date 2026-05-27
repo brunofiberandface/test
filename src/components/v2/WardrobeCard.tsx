@@ -3,13 +3,15 @@
 /**
  * <WardrobeCard/> — single garment card in the v2 wardrobe grid.
  *
- * Layout: hero photo (60×80) on the left + 2×2 mosaic of fit-angle
- * thumbs on the right. Name + SKU + category/gender chip below.
+ * Four horizontal thumbs (flat front · fit front · fit back · 45° back-
+ * right), name + SKU + category/gender chips below. Thumbs render at
+ * ~80px wide on screen and use a `sizes="160px"` hint so the Next.js
+ * image optimizer serves a 2x-density variant (~160px wide) instead of
+ * the previous tiny 40px JPEG that looked pixelated.
  *
- * 2026-05-27 (Phase 2 Slice 2B of dashboard redesign).
+ * 2026-05-27 (Phase 2 Slice 2B + hotfix of dashboard redesign).
  */
 import Image from 'next/image';
-import type { V2NoosBucket } from '@/lib/v2/wardrobe-classification';
 
 export interface WardrobeCardData {
   wardrobeId: string;
@@ -17,37 +19,49 @@ export interface WardrobeCardData {
   designNumber?: string;
   category?: string;
   gender?: string;
-  thumbnailUrl?: string;
-  fitModelThumbs: string[];
+  flatFrontUrl?: string;
+  fitFrontUrl?: string;
+  fitBackUrl?: string;
+  fitBack45RightUrl?: string;
   classification: 'drop' | 'noos';
   drop?: { year: number; quarter: number; dropNumber: number };
-  noosBucket?: V2NoosBucket;
+  noosBucket?: string;
 }
 
-function MaybeImage({ src, alt, className, sizes }: { src?: string; alt: string; className?: string; sizes?: string }) {
-  if (!src) return <div className={`${className} bg-neutral-200`} />;
+function Thumb({ src, alt, label }: { src?: string; alt: string; label: string }) {
   return (
-    <div className={`${className} relative bg-neutral-100 overflow-hidden`}>
-      <Image src={src} alt={alt} fill sizes={sizes || '60px'} className="object-cover" loading="lazy" />
+    <div className="flex flex-col gap-1 flex-1 min-w-0">
+      <div className="relative aspect-[3/4] rounded-sm overflow-hidden bg-neutral-100">
+        {src ? (
+          <Image
+            src={src}
+            alt={alt}
+            fill
+            sizes="(max-width: 768px) 25vw, 160px"
+            className="object-cover"
+            loading="lazy"
+          />
+        ) : (
+          <div className="absolute inset-0 flex items-center justify-center text-[9px] text-neutral-400">
+            —
+          </div>
+        )}
+      </div>
+      <div className="text-[9px] uppercase tracking-wider text-neutral-400 text-center">
+        {label}
+      </div>
     </div>
   );
 }
 
 export default function WardrobeCard({ item }: { item: WardrobeCardData }) {
-  const thumbs = item.fitModelThumbs.slice(0, 4);
-  // Pad to exactly 4 entries (with undefineds) so the 2x2 grid always renders.
-  while (thumbs.length < 4) thumbs.push('' as unknown as string);
-  const isLegacy = item.classification === 'noos' && item.noosBucket === 'legacy';
-
   return (
     <div className="bg-white border border-neutral-200 rounded-md p-2.5 flex flex-col">
-      <div className="flex gap-1.5 mb-2">
-        <MaybeImage src={item.thumbnailUrl} alt={item.name} className="w-[60px] h-20 rounded-sm" sizes="60px" />
-        <div className="grid grid-cols-2 gap-0.5 flex-1">
-          {thumbs.map((src, i) => (
-            <MaybeImage key={i} src={src || undefined} alt={`fit ${i + 1}`} className="aspect-square rounded-sm" sizes="40px" />
-          ))}
-        </div>
+      <div className="flex gap-1.5 mb-2.5">
+        <Thumb src={item.flatFrontUrl} alt={`${item.name} flat front`} label="Flat" />
+        <Thumb src={item.fitFrontUrl} alt={`${item.name} fit front`} label="Front" />
+        <Thumb src={item.fitBackUrl} alt={`${item.name} fit back`} label="Back" />
+        <Thumb src={item.fitBack45RightUrl} alt={`${item.name} 45 back right`} label="45° R" />
       </div>
       <div className="text-[12px] font-medium text-neutral-900 truncate" title={item.name}>{item.name}</div>
       <div className="text-[10px] text-neutral-400 truncate" title={item.designNumber}>{item.designNumber || '—'}</div>
@@ -58,11 +72,11 @@ export default function WardrobeCard({ item }: { item: WardrobeCardData }) {
           </span>
         )}
         {item.gender && (
-          <span className="text-[9px] text-neutral-400 capitalize">{item.gender}</span>
+          <span className="text-[9px] text-neutral-500 capitalize">{item.gender}</span>
         )}
-        {isLegacy && (
-          <span className="ml-auto text-[9px] text-[#854F0B] bg-[#FAEEDA] px-1.5 py-px rounded-sm italic">
-            legacy
+        {item.classification === 'drop' && item.drop && (
+          <span className="ml-auto text-[9px] text-[#26215C] bg-[#EEEDFE] px-1.5 py-px rounded-sm">
+            {item.drop.year} · Q{item.drop.quarter} · D{item.drop.dropNumber}
           </span>
         )}
       </div>
