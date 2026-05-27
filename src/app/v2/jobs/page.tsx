@@ -1,22 +1,21 @@
 'use client';
 
 /**
- * /v2/jobs — placeholder for the chronological feed (Slice 1B).
+ * /v2/jobs — chronological feed (Slice 1B).
  *
- * Slice 1A ships this stub so the dual-view plumbing (nav toggle + route
- * tree) can be validated in production before the real feed lands.
- * Bruno hits Classic ↔ New in the nav, lands here, sees the stub, switches
- * back. If that round-trip works without breaking Classic, Slice 1A is done.
+ * Shell + filters strip (placeholder for now) + <ChronologicalFeed/>.
+ * Slice 1C adds the tile-click modal so individual shot tiles open in
+ * place instead of forcing a navigation to the job detail page.
  *
- * 2026-05-27 (Phase 1 Slice 1A of dashboard redesign).
+ * 2026-05-27 (Phase 1 Slice 1B of dashboard redesign).
  */
 import { useSession } from 'next-auth/react';
 import { useRouter } from 'next/navigation';
 import { useEffect } from 'react';
-import Link from 'next/link';
 import Shell from '@/components/Shell';
+import ChronologicalFeed from '@/components/v2/ChronologicalFeed';
 
-export default function V2JobsStub() {
+export default function V2JobsPage() {
   const { data: session, status } = useSession();
   const router = useRouter();
 
@@ -40,24 +39,19 @@ export default function V2JobsStub() {
 
   return (
     <Shell user={user}>
-      <div className="max-w-2xl mx-auto py-24 text-center">
-        <div className="text-xs uppercase tracking-widest text-neutral-400 mb-3">
-          /v2 · preview
+      <div className="max-w-5xl mx-auto">
+        <div className="flex items-baseline justify-between mb-4">
+          <div>
+            <h1 className="text-xl font-semibold text-neutral-900">Jobs</h1>
+            <p className="text-[12px] text-neutral-500 mt-0.5">
+              Latest first. Click any row to open the job.
+            </p>
+          </div>
+          <div className="text-[11px] uppercase tracking-wider text-neutral-400">
+            /v2 · Slice 1B
+          </div>
         </div>
-        <h1 className="text-3xl font-semibold text-neutral-900 mb-3">
-          New view is coming.
-        </h1>
-        <p className="text-neutral-500 mb-8 leading-relaxed">
-          The chronological jobs feed lands in Slice 1B.
-          <br />
-          This stub proves the dual-view plumbing works end-to-end.
-        </p>
-        <Link
-          href="/dashboard"
-          className="inline-flex items-center gap-2 px-4 py-2 text-sm border border-neutral-300 rounded-md text-neutral-700 hover:bg-neutral-50 transition-colors"
-        >
-          ← Back to Classic
-        </Link>
+        <ChronologicalFeed />
       </div>
     </Shell>
   );
