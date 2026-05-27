@@ -9,9 +9,14 @@
  * image optimizer serves a 2x-density variant (~160px wide) instead of
  * the previous tiny 40px JPEG that looked pixelated.
  *
- * 2026-05-27 (Phase 2 Slice 2B + hotfix of dashboard redesign).
+ * Slice 2C: the whole card is a link to /v2/wardrobe/[id] — the full
+ * assessment page with all 6 fit angles, flats, metadata, and the
+ * classify form.
+ *
+ * 2026-05-27 (Phase 2 Slice 2B + hotfix + Slice 2C of dashboard redesign).
  */
 import Image from 'next/image';
+import Link from 'next/link';
 
 export interface WardrobeCardData {
   wardrobeId: string;
@@ -56,7 +61,10 @@ function Thumb({ src, alt, label }: { src?: string; alt: string; label: string }
 
 export default function WardrobeCard({ item }: { item: WardrobeCardData }) {
   return (
-    <div className="bg-white border border-neutral-200 rounded-md p-2.5 flex flex-col">
+    <Link
+      href={`/v2/wardrobe/${item.wardrobeId}`}
+      className="bg-white border border-neutral-200 rounded-md p-2.5 flex flex-col hover:border-neutral-300 transition-colors"
+    >
       <div className="flex gap-1.5 mb-2.5">
         <Thumb src={item.flatFrontUrl} alt={`${item.name} flat front`} label="Flat" />
         <Thumb src={item.fitFrontUrl} alt={`${item.name} fit front`} label="Front" />
@@ -80,6 +88,6 @@ export default function WardrobeCard({ item }: { item: WardrobeCardData }) {
           </span>
         )}
       </div>
-    </div>
+    </Link>
   );
 }
