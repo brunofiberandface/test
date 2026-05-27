@@ -360,6 +360,20 @@ export interface WardrobeItem {
 
   createdAt: Date;
   updatedAt: Date;
+
+  // 2026-05-27 (Phase 2 Slice 2A of dashboard redesign): collection
+  // classification. Items are tagged as either a Drop (time-bound merch,
+  // sells out, focus-only) or NOOS (always-on, focus or styling). All
+  // three fields are OPTIONAL because the Phase 2 Slice 2A migration
+  // script defaults pre-classification items to NOOS / Legacy; future
+  // Classic-path uploads (deliberately not modified — see CLAUDE.md
+  // dashboard redesign spec) may also create unclassified items.
+  // /v2 read paths apply `coerceClassification()` defaults at read time.
+  classification?: 'drop' | 'noos';
+  drop?: { year: number; quarter: 1 | 2 | 3 | 4; dropNumber: number };
+  noosBucket?: 'denim' | 'tops' | 'outerwear' | 'legacy';
+  classifiedAt?: string;
+  classifiedBy?: string;
 }
 
 // ── Prompt Vault ──
