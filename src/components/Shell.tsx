@@ -3,6 +3,7 @@
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 import { signOut } from 'next-auth/react';
+import ViewToggle from '@/components/v2/ViewToggle';
 
 interface ShellProps {
   children: React.ReactNode;
@@ -58,6 +59,7 @@ export default function Shell({ children, user }: ShellProps) {
 
         {user && (
           <div className="flex items-center gap-4">
+            <ViewToggle />
             <span className="text-xs text-neutral-500">{user.email}</span>
             <span className="text-xs px-2 py-0.5 bg-neutral-100 text-neutral-600 uppercase tracking-wider">
               {user.role}
