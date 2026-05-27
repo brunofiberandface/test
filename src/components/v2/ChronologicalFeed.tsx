@@ -23,13 +23,17 @@ export interface FeedHandle {
   refetch: () => Promise<void>;
 }
 
+export type FeedDateRange = 'all' | '7d' | '30d' | '90d';
+
 export default function ChronologicalFeed({
   tab,
+  dateRange = '30d',
   onShotTileClick,
   onCountsChange,
   refreshKey = 0,
 }: {
   tab: V2Tab;
+  dateRange?: FeedDateRange;
   onShotTileClick?: (info: ShotTileClickInfo) => void;
   onCountsChange?: (counts: { active: number; completed: number; live: number; archived: number; total: number }) => void;
   refreshKey?: number;
@@ -42,9 +46,13 @@ export default function ChronologicalFeed({
     (async () => {
       try {
         setError(null);
-        // Default 30 for fast first paint. Bumping later via a "Load more"
-        // button is a Phase 2 ergonomics win.
-        const r = await fetch(`/api/v2/feed?limit=30&_=${refreshKey}`);
+        // Default 30 for fast first paint. Date range maps to a limit:
+        // shorter windows mean a smaller scan is fine; 'all time' lifts
+        // the cap so older work is reachable.
+        const limit = dateRange === 'all' ? 200 : dateRange === '90d' ? 100 : 30;
+        const params = new URLSearchParams({ limit: String(limit), _: String(refreshKey) });
+        if (dateRange !== 'all') params.set('dateRange', dateRange);
+        const r = await fetch(`/api/v2/feed?${params}`);
         if (!r.ok) throw new Error(`feed responded ${r.status}`);
         const j = await r.json();
         if (!cancelled) setJobs(j.jobs || []);
@@ -53,7 +61,7 @@ export default function ChronologicalFeed({
       }
     })();
     return () => { cancelled = true; };
-  }, [refreshKey]);
+  }, [refreshKey, dateRange]);
 
   const jobTabs = useMemo(() => {
     if (!jobs) return null;

@@ -140,7 +140,7 @@ export default function V2WardrobePage() {
 
   return (
     <Shell user={user}>
-      <div className="bg-white border border-neutral-200 rounded-lg overflow-hidden flex min-h-[640px]">
+      <div className="bg-white border border-neutral-200 rounded-lg flex min-h-[640px]">
         <CollectionsSidebar
           selection={selection}
           onSelect={setSelection}
@@ -151,36 +151,41 @@ export default function V2WardrobePage() {
           showEmptyCurrentYear
         />
 
-        <div className="flex-1 min-w-0 p-4">
-          <div className="flex items-baseline justify-between mb-3">
-            <div>
-              <div className="text-[14px] font-medium text-neutral-900">{label.title}</div>
-              <div className="text-[11px] text-neutral-500 mt-0.5">{label.sub || ''}</div>
-            </div>
-            <div className="flex items-center gap-1">
-              {GENDER_CHIPS.map(g => {
-                const active = gender === g.key;
-                const n = g.key === 'all'
-                  ? (resp?.counts?.total ?? 0)
-                  : (genderTotal[g.key] || 0);
-                return (
-                  <button
-                    key={g.key}
-                    type="button"
-                    onClick={() => setGender(g.key)}
-                    className={`text-[11px] rounded-full px-2.5 py-1 transition-colors ${
-                      active
-                        ? 'bg-neutral-900 text-white'
-                        : 'bg-neutral-100 text-neutral-600 hover:bg-neutral-200'
-                    }`}
-                  >
-                    {g.label} <span className={active ? 'text-neutral-300' : 'text-neutral-400'}>{n}</span>
-                  </button>
-                );
-              })}
+        <div className="flex-1 min-w-0">
+          {/* Sticky header inside the right pane: title + gender chips
+              stay pinned while the items grid scrolls. */}
+          <div className="sticky top-0 z-10 bg-white p-4 border-b border-neutral-200">
+            <div className="flex items-baseline justify-between">
+              <div>
+                <div className="text-[14px] font-medium text-neutral-900">{label.title}</div>
+                <div className="text-[11px] text-neutral-500 mt-0.5">{label.sub || ''}</div>
+              </div>
+              <div className="flex items-center gap-1">
+                {GENDER_CHIPS.map(g => {
+                  const active = gender === g.key;
+                  const n = g.key === 'all'
+                    ? (resp?.counts?.total ?? 0)
+                    : (genderTotal[g.key] || 0);
+                  return (
+                    <button
+                      key={g.key}
+                      type="button"
+                      onClick={() => setGender(g.key)}
+                      className={`text-[11px] rounded-full px-2.5 py-1 transition-colors ${
+                        active
+                          ? 'bg-neutral-900 text-white'
+                          : 'bg-neutral-100 text-neutral-600 hover:bg-neutral-200'
+                      }`}
+                    >
+                      {g.label} <span className={active ? 'text-neutral-300' : 'text-neutral-400'}>{n}</span>
+                    </button>
+                  );
+                })}
+              </div>
             </div>
           </div>
 
+          <div className="p-4">
           {error && (
             <div className="text-sm text-red-600 border border-red-200 bg-red-50 rounded-md p-3">
               Failed to load wardrobe: {error}
@@ -204,6 +209,7 @@ export default function V2WardrobePage() {
               ))}
             </div>
           )}
+          </div>
         </div>
       </div>
     </Shell>

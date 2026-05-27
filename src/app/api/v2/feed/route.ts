@@ -62,8 +62,22 @@ export async function GET(req: NextRequest) {
     // Default 30 (fast first paint). Cap at 500 if the caller explicitly asks.
     const limit = Math.max(1, Math.min(500, limitParam ? Number(limitParam) : 30));
 
+    // Date range filter — 7d / 30d / 90d / absent (no filter). Applied
+    // on updatedAt with fallback to createdAt so in-progress jobs
+    // surface in recent windows even if they were created earlier.
+    const dateRange = searchParams.get('dateRange');
+    const daysCutoff = dateRange === '7d' ? 7 : dateRange === '30d' ? 30 : dateRange === '90d' ? 90 : 0;
+    const cutoffMs = daysCutoff > 0 ? Date.now() - daysCutoff * 24 * 60 * 60 * 1000 : 0;
+
     const { jobs: rawJobs } = await listJobs(undefined, { limit });
-    const visible = includeArchived ? rawJobs : rawJobs.filter((j: any) => !j.archived);
+    let visible = includeArchived ? rawJobs : rawJobs.filter((j: any) => !j.archived);
+    if (cutoffMs > 0) {
+      visible = visible.filter((j: any) => {
+        const ts = j.updatedAt || j.createdAt;
+        if (!ts) return true;
+        return new Date(ts).getTime() >= cutoffMs;
+      });
+    }
 
     const activeShotTypes = APP_CONFIG.shotTypes as readonly string[];
 
