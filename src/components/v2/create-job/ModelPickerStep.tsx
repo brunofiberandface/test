@@ -13,7 +13,10 @@ import { useEffect, useMemo, useState } from 'react';
 import Image from 'next/image';
 import { formatDrop } from '@/lib/v2/wardrobe-classification';
 import type { CollectionPick, ModelRef, SlotKey, WardrobeItemRef } from './wizard-types';
-import { slotLabel } from './wizard-types';
+import { slotLabel, categoryToSlot } from './wizard-types';
+import { M03TopPosePicker, M03PosePicker } from './PosePickers';
+import { getM03TopPose } from '@/lib/m03-top-poses';
+import { getM03Pose } from '@/lib/m03-poses';
 
 export interface ModelPickerStepProps {
   collection: CollectionPick;
@@ -21,6 +24,10 @@ export interface ModelPickerStepProps {
   styling: Partial<Record<SlotKey, WardrobeItemRef>>;
   value: ModelRef | null;
   onChange: (model: ModelRef) => void;
+  m03TopPoseId: string | null;
+  onM03TopPoseChange: (id: string | null) => void;
+  m03PoseId: string | null;
+  onM03PoseChange: (id: string | null) => void;
 }
 
 interface ModelsResponse {
@@ -28,7 +35,11 @@ interface ModelsResponse {
   items?: any[];
 }
 
-export default function ModelPickerStep({ collection, focus, styling, value, onChange }: ModelPickerStepProps) {
+export default function ModelPickerStep({
+  collection, focus, styling, value, onChange,
+  m03TopPoseId, onM03TopPoseChange,
+  m03PoseId, onM03PoseChange,
+}: ModelPickerStepProps) {
   const focusGender = (focus.gender || '').toLowerCase();
   const [genderFilter, setGenderFilter] = useState<'all' | string>(focusGender || 'all');
   const [models, setModels] = useState<ModelRef[] | null>(null);
@@ -129,13 +140,28 @@ export default function ModelPickerStep({ collection, focus, styling, value, onC
         )}
       </div>
 
+      <M03TopPosePicker
+        modelGender={(value?.gender as 'female' | 'male' | undefined) ?? (focus.gender as 'female' | 'male' | undefined)}
+        value={m03TopPoseId}
+        onChange={onM03TopPoseChange}
+      />
+
+      <M03PosePicker
+        value={m03PoseId}
+        onChange={onM03PoseChange}
+      />
+
       <div className="bg-neutral-50 border border-neutral-200 rounded-lg p-4">
         <div className="text-[11px] uppercase tracking-wider text-neutral-400 mb-2">Job summary</div>
         <dl className="text-[12px] grid grid-cols-[120px_1fr] gap-y-1 gap-x-4">
           <dt className="text-neutral-400">Collection</dt>
           <dd className="text-neutral-900">{collectionLabel}</dd>
           <dt className="text-neutral-400">Focus</dt>
-          <dd className="text-neutral-900">{focus.name} <span className="text-neutral-400">· {focus.designNumber || ''}</span></dd>
+          <dd className="text-neutral-900">
+            {focus.name}
+            <span className="text-neutral-400"> · {focus.designNumber || ''}</span>
+            <span className="text-neutral-400 capitalize"> · {categoryToSlot(focus.category) || focus.category}</span>
+          </dd>
           {(['top', 'bottom', 'shoe'] as SlotKey[]).map(slot => {
             const s = styling[slot];
             if (!s || s.wardrobeId === focus.wardrobeId) return null;
@@ -148,6 +174,18 @@ export default function ModelPickerStep({ collection, focus, styling, value, onC
           })}
           <dt className="text-neutral-400">Model</dt>
           <dd className="text-neutral-900">{value ? `${value.modelId} · ${value.name}` : <span className="text-neutral-400 italic">not picked</span>}</dd>
+          <dt className="text-neutral-400">Top-focus pose</dt>
+          <dd className="text-neutral-900">
+            {m03TopPoseId
+              ? `${m03TopPoseId} · ${getM03TopPose(m03TopPoseId, (value?.gender as 'female'|'male'|undefined) ?? (focus.gender as 'female'|'male'|undefined)).label}`
+              : <span className="text-neutral-400 italic">auto (backend default)</span>}
+          </dd>
+          <dt className="text-neutral-400">M03 free pose</dt>
+          <dd className="text-neutral-900">
+            {m03PoseId
+              ? `${m03PoseId} · ${getM03Pose(m03PoseId).label}`
+              : <span className="text-neutral-400 italic">auto (backend default)</span>}
+          </dd>
         </dl>
       </div>
     </div>

@@ -100,6 +100,8 @@ export default function V2CreateJobPage() {
           creatorEmail: user.email,
           modelId: state.model.modelId,
           wardrobe,
+          ...(state.m03PoseId ? { m03PoseId: state.m03PoseId } : {}),
+          ...(state.m03TopPoseId ? { m03TopPoseId: state.m03TopPoseId } : {}),
         }),
       });
       if (!r.ok) {
@@ -158,61 +160,77 @@ export default function V2CreateJobPage() {
           styling={state.styling}
           value={state.model}
           onChange={model => setState(s => ({ ...s, model }))}
+          m03TopPoseId={state.m03TopPoseId}
+          onM03TopPoseChange={id => setState(s => ({ ...s, m03TopPoseId: id }))}
+          m03PoseId={state.m03PoseId}
+          onM03PoseChange={id => setState(s => ({ ...s, m03PoseId: id }))}
         />
       );
     }
     return null;
   })();
 
+  const nav = (
+    <div className="flex items-center justify-between">
+      <button
+        type="button"
+        onClick={() => setStep(s => Math.max(1, s - 1))}
+        disabled={step === 1 || submitting}
+        className="text-[12px] text-neutral-500 hover:text-neutral-900 disabled:opacity-40 disabled:cursor-not-allowed"
+      >
+        ← Back
+      </button>
+
+      {step < 4 ? (
+        <button
+          type="button"
+          onClick={() => setStep(s => Math.min(4, s + 1))}
+          disabled={!canAdvance}
+          className="bg-neutral-900 text-white rounded-md px-4 py-2 text-[12px] font-medium hover:bg-neutral-800 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          Continue →
+        </button>
+      ) : (
+        <button
+          type="button"
+          onClick={onSubmit}
+          disabled={!canAdvance || submitting}
+          className="bg-neutral-900 text-white rounded-md px-4 py-2 text-[12px] font-medium hover:bg-neutral-800 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          {submitting ? 'Creating job…' : 'Run job'}
+        </button>
+      )}
+    </div>
+  );
+
   return (
     <Shell user={user}>
       <div className="max-w-5xl mx-auto">
-        <div className="flex items-baseline justify-between mb-3">
-          <div className="flex items-center gap-3">
-            <Link href="/v2/jobs" className="text-[12px] text-neutral-500 hover:text-neutral-900">← Jobs</Link>
-            <h1 className="text-xl font-semibold text-neutral-900">New job</h1>
+        {/* Sticky header: title bar + stepper + nav buttons. Stays pinned
+            so the user can always Continue without scrolling back up the
+            long item grids. The negative-mx + matching bg lets the sticky
+            row span the page-padding edges of the Shell main area. */}
+        <div className="sticky top-0 z-20 bg-neutral-50 -mx-6 px-6 pt-2 pb-3 border-b border-neutral-200">
+          <div className="flex items-baseline justify-between mb-3">
+            <div className="flex items-center gap-3">
+              <Link href="/v2/jobs" className="text-[12px] text-neutral-500 hover:text-neutral-900">← Jobs</Link>
+              <h1 className="text-xl font-semibold text-neutral-900">New job</h1>
+            </div>
+            <div className="text-[11px] uppercase tracking-wider text-neutral-400">/v2 · Slice 2D</div>
           </div>
-          <div className="text-[11px] uppercase tracking-wider text-neutral-400">/v2 · Slice 2D</div>
+
+          <Stepper current={step} completed={completed} onJump={setStep} />
+
+          {nav}
         </div>
 
-        <Stepper current={step} completed={completed} onJump={setStep} />
+        <div className="pt-4">
+          {stepView}
 
-        {stepView}
-
-        {submitError && (
-          <div className="mt-4 text-[12px] text-red-700 bg-red-50 border border-red-200 rounded-md px-3 py-2">
-            Failed to create job: {submitError}
-          </div>
-        )}
-
-        <div className="flex items-center justify-between mt-5">
-          <button
-            type="button"
-            onClick={() => setStep(s => Math.max(1, s - 1))}
-            disabled={step === 1 || submitting}
-            className="text-[12px] text-neutral-500 hover:text-neutral-900 disabled:opacity-40 disabled:cursor-not-allowed"
-          >
-            ← Back
-          </button>
-
-          {step < 4 ? (
-            <button
-              type="button"
-              onClick={() => setStep(s => Math.min(4, s + 1))}
-              disabled={!canAdvance}
-              className="bg-neutral-900 text-white rounded-md px-4 py-2 text-[12px] font-medium hover:bg-neutral-800 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              Continue →
-            </button>
-          ) : (
-            <button
-              type="button"
-              onClick={onSubmit}
-              disabled={!canAdvance || submitting}
-              className="bg-neutral-900 text-white rounded-md px-4 py-2 text-[12px] font-medium hover:bg-neutral-800 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              {submitting ? 'Creating job…' : 'Run job'}
-            </button>
+          {submitError && (
+            <div className="mt-4 text-[12px] text-red-700 bg-red-50 border border-red-200 rounded-md px-3 py-2">
+              Failed to create job: {submitError}
+            </div>
           )}
         </div>
       </div>

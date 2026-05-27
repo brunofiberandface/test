@@ -71,6 +71,11 @@ export interface WizardState {
   focus: WardrobeItemRef | null;
   styling: Partial<Record<SlotKey, WardrobeItemRef>>;
   model: ModelRef | null;
+  /** M01/M02 top-focus pose id (e.g. f03, m07). Gender-specific. Optional —
+   *  absent = backend picks a default per gender at generation time. */
+  m03TopPoseId: string | null;
+  /** M03 free pose id (e.g. p02). Optional — absent = backend default pose. */
+  m03PoseId: string | null;
 }
 
 export const INITIAL_WIZARD_STATE: WizardState = {
@@ -78,6 +83,8 @@ export const INITIAL_WIZARD_STATE: WizardState = {
   focus: null,
   styling: {},
   model: null,
+  m03TopPoseId: null,
+  m03PoseId: null,
 };
 
 export const TOTAL_STEPS = 4;
