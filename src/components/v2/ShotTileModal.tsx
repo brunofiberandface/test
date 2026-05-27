@@ -155,11 +155,11 @@ export default function ShotTileModal({
             Open job
           </Link>
           <Link
-            href={`/jobs/${context.jobId}/results`}
+            href={`/v2/jobs/${context.jobId}/shots/${context.shotType}`}
             className="bg-white border border-neutral-300 text-neutral-900 text-center text-[12px] rounded-md py-2 hover:bg-neutral-50 transition-colors"
             onClick={onClose}
           >
-            Classic results
+            Contact sheet
           </Link>
         </div>
         <div className="grid grid-cols-2 gap-1.5 px-4 pb-4">

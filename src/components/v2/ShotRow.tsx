@@ -7,8 +7,12 @@
  * [actions]. Click the big thumbnail OR any version pill → opens the modal
  * via the onOpenModal handler the parent passes in.
  *
- * 2026-05-27 (Phase 1 Slice 1C of dashboard redesign).
+ * Slice 3A: the "Sheet" action is now a Link to the contact sheet page
+ * /v2/jobs/[id]/shots/[shotType] (was a no-op button before).
+ *
+ * 2026-05-27 (Phase 1 Slice 1C + Phase 3 Slice 3A of dashboard redesign).
  */
+import Link from 'next/link';
 import Image from 'next/image';
 import VersionStrip, { type VersionTile } from './VersionStrip';
 import WinnerBadge from './WinnerBadge';
@@ -33,9 +37,11 @@ export interface ShotRowData {
 
 export default function ShotRow({
   shot,
+  jobId,
   onOpenModal,
 }: {
   shot: ShotRowData;
+  jobId: string;
   onOpenModal?: (versionImageUrl: string | undefined, versionNumber: number | undefined) => void;
 }) {
   const isRunning = shot.status === 'generating';
@@ -93,6 +99,15 @@ export default function ShotRow({
           versions={versionTiles}
           onTileClick={(v) => onOpenModal?.(v.imageUrl, v.version)}
         />
+      </div>
+
+      <div className="shrink-0">
+        <Link
+          href={`/v2/jobs/${jobId}/shots/${shot.shotType}`}
+          className="text-[11px] text-neutral-600 hover:text-neutral-900 border border-neutral-200 rounded-md px-2.5 py-1.5 hover:border-neutral-300 transition-colors whitespace-nowrap"
+        >
+          Sheet →
+        </Link>
       </div>
     </div>
   );
