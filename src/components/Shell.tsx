@@ -18,6 +18,7 @@ interface ShellProps {
 // as later slices ship (e.g. /jobs/new → /v2/jobs/new in Slice 2D).
 const V2_NAV_MAP: Record<string, string> = {
   '/wardrobe': '/v2/wardrobe',
+  '/jobs/new': '/v2/jobs/new',
 };
 
 const NAV_ITEMS = [
