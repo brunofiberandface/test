@@ -142,8 +142,8 @@ export default function V2WardrobeDetailPage() {
         body: JSON.stringify(value),
       });
       if (!r.ok) {
-        const text = await r.text().catch(() => '');
-        throw new Error(text || `responded ${r.status}`);
+        const j = await r.json().catch(() => null);
+        throw new Error(j?.error || `responded ${r.status}`);
       }
       setSavedFlash(true);
       setTimeout(() => setSavedFlash(false), 1800);
@@ -152,6 +152,57 @@ export default function V2WardrobeDetailPage() {
       setSaveError(e instanceof Error ? e.message : String(e));
     } finally {
       setSaving(false);
+    }
+  };
+
+  // ── Details edit mode ───────────────────────────────────────────────
+  const [editingDetails, setEditingDetails] = useState(false);
+  const [details, setDetails] = useState<{
+    name: string; designNumber: string; category: string; gender: string; description: string;
+  } | null>(null);
+  const [detailsSaving, setDetailsSaving] = useState(false);
+  const [detailsError, setDetailsError] = useState<string | null>(null);
+  const [detailsSavedFlash, setDetailsSavedFlash] = useState(false);
+
+  const startEditing = () => {
+    if (!item) return;
+    setDetails({
+      name: item.name || '',
+      designNumber: item.designNumber || '',
+      category: item.category || '',
+      gender: item.gender || '',
+      description: item.description || '',
+    });
+    setDetailsError(null);
+    setEditingDetails(true);
+  };
+  const cancelEditing = () => {
+    setEditingDetails(false);
+    setDetails(null);
+    setDetailsError(null);
+  };
+  const saveDetails = async () => {
+    if (!details) return;
+    setDetailsSaving(true);
+    setDetailsError(null);
+    try {
+      const r = await fetch(`/api/v2/wardrobe/${wardrobeId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(details),
+      });
+      if (!r.ok) {
+        const j = await r.json().catch(() => null);
+        throw new Error(j?.error || `responded ${r.status}`);
+      }
+      setDetailsSavedFlash(true);
+      setTimeout(() => setDetailsSavedFlash(false), 1800);
+      setEditingDetails(false);
+      await loadItem();
+    } catch (e) {
+      setDetailsError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setDetailsSaving(false);
     }
   };
 
@@ -253,19 +304,120 @@ export default function V2WardrobeDetailPage() {
           {/* METADATA + CLASSIFY (right) */}
           <div className="flex flex-col gap-4">
             <div className="bg-white border border-neutral-200 rounded-lg p-4">
-              <div className="text-[11px] uppercase tracking-wider text-neutral-400 mb-2">Details</div>
-              <dl className="text-[12px] flex flex-col gap-1.5">
-                <Row label="Name" value={item.name} />
-                <Row label="Design #" value={item.designNumber || '—'} />
-                <Row label="Category" value={item.category || '—'} capitalize />
-                <Row label="Gender" value={item.gender || '—'} capitalize />
-                {item.description && (
+              <div className="flex items-baseline justify-between mb-2">
+                <div className="text-[11px] uppercase tracking-wider text-neutral-400">Details</div>
+                <div className="flex items-center gap-2">
+                  {detailsSavedFlash && (
+                    <span className="text-[10px] text-[#173404] bg-[#EAF3DE] px-1.5 py-px rounded-sm">saved</span>
+                  )}
+                  {editingDetails ? (
+                    <>
+                      <button
+                        type="button"
+                        onClick={cancelEditing}
+                        disabled={detailsSaving}
+                        className="text-[11px] text-neutral-500 hover:text-neutral-900 disabled:opacity-50"
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        type="button"
+                        onClick={saveDetails}
+                        disabled={detailsSaving}
+                        className="text-[11px] bg-neutral-900 text-white rounded-md px-2 py-1 hover:bg-neutral-800 disabled:opacity-50"
+                      >
+                        {detailsSaving ? 'Saving…' : 'Save'}
+                      </button>
+                    </>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={startEditing}
+                      className="text-[11px] text-neutral-500 hover:text-neutral-900 underline"
+                    >
+                      Edit
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {editingDetails && details ? (
+                <div className="flex flex-col gap-2 text-[12px]">
+                  <EditRow label="Name">
+                    <input
+                      value={details.name}
+                      onChange={e => setDetails(d => d ? { ...d, name: e.target.value } : d)}
+                      className="w-full border border-neutral-300 rounded-md px-2 py-1 text-[12px]"
+                    />
+                  </EditRow>
+                  <EditRow label="Design #">
+                    <input
+                      value={details.designNumber}
+                      onChange={e => setDetails(d => d ? { ...d, designNumber: e.target.value } : d)}
+                      className="w-full border border-neutral-300 rounded-md px-2 py-1 text-[12px]"
+                    />
+                  </EditRow>
+                  <EditRow label="Category">
+                    <select
+                      value={details.category}
+                      onChange={e => setDetails(d => d ? { ...d, category: e.target.value } : d)}
+                      className="w-full border border-neutral-300 rounded-md px-2 py-1 text-[12px] bg-white capitalize"
+                    >
+                      <option value="">—</option>
+                      <option value="top">Top</option>
+                      <option value="bottom">Bottom</option>
+                      <option value="shoes">Shoes</option>
+                      <option value="shirt">Shirt</option>
+                      <option value="jacket">Jacket</option>
+                      <option value="pants">Pants</option>
+                    </select>
+                  </EditRow>
+                  <EditRow label="Gender">
+                    <select
+                      value={details.gender}
+                      onChange={e => setDetails(d => d ? { ...d, gender: e.target.value } : d)}
+                      className="w-full border border-neutral-300 rounded-md px-2 py-1 text-[12px] bg-white capitalize"
+                    >
+                      <option value="">—</option>
+                      <option value="male">Male</option>
+                      <option value="female">Female</option>
+                      <option value="unisex">Unisex</option>
+                    </select>
+                  </EditRow>
                   <div className="pt-1">
                     <div className="text-[10px] uppercase tracking-wider text-neutral-400 mb-0.5">Description</div>
-                    <div className="text-[12px] text-neutral-700 whitespace-pre-wrap">{item.description}</div>
+                    <textarea
+                      value={details.description}
+                      onChange={e => setDetails(d => d ? { ...d, description: e.target.value } : d)}
+                      rows={6}
+                      className="w-full border border-neutral-300 rounded-md px-2 py-1.5 text-[12px] leading-snug"
+                    />
                   </div>
-                )}
-              </dl>
+                  {details.category !== (item.category || '') && (
+                    <div className="text-[11px] text-[#854F0B] bg-[#FAEEDA] border border-[#F0C36C] rounded-md px-2 py-1.5">
+                      Changing category moves the item between sidebar buckets and may affect downstream pipelines (top-description, label setup). Confirm before saving.
+                    </div>
+                  )}
+                  {detailsError && (
+                    <div className="text-[11px] text-red-700 bg-red-50 border border-red-200 rounded-md px-2 py-1.5">
+                      {detailsError}
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <dl className="text-[12px] flex flex-col gap-1.5">
+                  <Row label="Name" value={item.name} />
+                  <Row label="Design #" value={item.designNumber || '—'} />
+                  <Row label="Category" value={item.category || '—'} capitalize />
+                  <Row label="Gender" value={item.gender || '—'} capitalize />
+                  {item.description && (
+                    <div className="pt-1">
+                      <div className="text-[10px] uppercase tracking-wider text-neutral-400 mb-0.5">Description</div>
+                      <div className="text-[12px] text-neutral-700 whitespace-pre-wrap">{item.description}</div>
+                    </div>
+                  )}
+                </dl>
+              )}
             </div>
 
             <div className="bg-white border border-neutral-200 rounded-lg p-4">
@@ -325,5 +477,14 @@ function Row({ label, value, capitalize }: { label: string; value: string; capit
       <dt className="text-neutral-400">{label}</dt>
       <dd className={`text-neutral-900 text-right ${capitalize ? 'capitalize' : ''}`}>{value}</dd>
     </div>
+  );
+}
+
+function EditRow({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <label className="flex items-center gap-3">
+      <span className="text-[11px] uppercase tracking-wider text-neutral-400 w-[68px] shrink-0">{label}</span>
+      <span className="flex-1 min-w-0">{children}</span>
+    </label>
   );
 }

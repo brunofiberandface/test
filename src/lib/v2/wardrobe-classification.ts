@@ -113,8 +113,11 @@ export function validateClassification(input: V2WardrobeClassificationFields): v
       throw new Error('noosBucket cannot be set when classification=drop');
     }
   } else if (input.classification === 'noos') {
-    if (!input.noosBucket) throw new Error('noosBucket required for classification=noos');
-    if (!NOOS_BUCKETS.includes(input.noosBucket)) {
+    // 2026-05-27 — noosBucket is no longer required at validation time.
+    // The /v2 sidebar derives NOOS sub-buckets from item.category (the
+    // 2B-hotfix change), so the bucket field is vestigial. If present
+    // it still has to be one of the known values; absent is fine.
+    if (input.noosBucket !== undefined && !NOOS_BUCKETS.includes(input.noosBucket)) {
       throw new Error(`noosBucket must be one of ${NOOS_BUCKETS.join(', ')}, got ${input.noosBucket}`);
     }
     if (input.drop) {
