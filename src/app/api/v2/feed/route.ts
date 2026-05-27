@@ -59,7 +59,8 @@ export async function GET(req: NextRequest) {
     const { searchParams } = new URL(req.url);
     const includeArchived = searchParams.get('includeArchived') === 'true';
     const limitParam = searchParams.get('limit');
-    const limit = Math.max(1, Math.min(500, limitParam ? Number(limitParam) : 100));
+    // Default 30 (fast first paint). Cap at 500 if the caller explicitly asks.
+    const limit = Math.max(1, Math.min(500, limitParam ? Number(limitParam) : 30));
 
     const { jobs: rawJobs } = await listJobs(undefined, { limit });
     const visible = includeArchived ? rawJobs : rawJobs.filter((j: any) => !j.archived);

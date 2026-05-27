@@ -3,44 +3,62 @@
 /**
  * <JobRow/> — one row in the chronological feed.
  *
- * Layout matches the mockup: left = focus garment hero, middle = 4 generated
- * shot thumbnails (M01 / M02 / M03 / M05), right-of-middle = model
- * thumbnail, far right = compact metadata (time, design code, ★ count).
+ * Layout matches the mockup: focus garment hero on the left, 4 generated
+ * shot tiles in the middle, model thumbnail, then a small metadata column.
  *
- * Clicking the row navigates to /v2/jobs/[id]. Slice 1C will wire tile
- * clicks to open the modal instead of navigating.
+ * Click anywhere EXCEPT a shot tile → navigates to /v2/jobs/[id]. Click a
+ * shot tile → calls onShotTileClick with the shot context so the parent
+ * can open the ShotTileModal in place. Slice 1C wiring.
  *
- * 2026-05-27 (Phase 1 Slice 1B of dashboard redesign).
+ * 2026-05-27 (Phase 1 Slice 1C of dashboard redesign).
  */
-import Link from 'next/link';
 import Image from 'next/image';
+import { useRouter } from 'next/navigation';
 import { APP_CONFIG } from '@/lib/config';
 import { formatRowTime, type FeedJob, type ShotSummary } from './feed-types';
+import { deriveV2Status } from '@/lib/v2/job-status';
+import StatusPill from './StatusPill';
+
+export interface ShotTileClickInfo {
+  job: FeedJob;
+  shot: ShotSummary;
+}
 
 interface JobRowProps {
   job: FeedJob;
+  onShotTileClick?: (info: ShotTileClickInfo) => void;
 }
 
 function placeholderBg(seed: string): string {
-  // Stable greyscale gradient per shotType so empty tiles aren't pure white.
   let hash = 0;
   for (const c of seed) hash = ((hash << 5) - hash) + c.charCodeAt(0);
-  const v = Math.abs(hash) % 60 + 180; // 180-240 grey band
+  const v = Math.abs(hash) % 60 + 180;
   return `linear-gradient(160deg, rgb(${v},${v},${v}), rgb(${v - 20},${v - 20},${v - 20}))`;
 }
 
-function ShotTile({ shot, jobId }: { shot: ShotSummary; jobId: string }) {
+function ShotTile({
+  shot, jobId, onClick,
+}: {
+  shot: ShotSummary;
+  jobId: string;
+  onClick?: () => void;
+}) {
   const hasImage = !!shot.imageUrl;
   return (
-    <div className="relative flex-1 aspect-[3/4] rounded-sm overflow-hidden bg-neutral-100">
+    <button
+      type="button"
+      onClick={(e) => { e.stopPropagation(); onClick?.(); }}
+      className="relative flex-1 aspect-[3/4] rounded-sm overflow-hidden bg-neutral-100 hover:opacity-90 transition-opacity"
+      aria-label={`Open ${shot.shotType} v${shot.version || 1}`}
+    >
       {hasImage ? (
         <Image
           src={shot.imageUrl as string}
           alt={`${shot.shotType} v${shot.version || 1}`}
           fill
-          sizes="80px"
+          sizes="(max-width: 768px) 80px, 100px"
           className="object-cover"
-          unoptimized
+          loading="lazy"
         />
       ) : (
         <div
@@ -63,7 +81,7 @@ function ShotTile({ shot, jobId }: { shot: ShotSummary; jobId: string }) {
       {shot.status === 'generating' && (
         <span className="absolute top-1 left-1 bg-[#534AB7] text-white text-[8px] px-1 rounded-sm">●</span>
       )}
-    </div>
+    </button>
   );
 }
 
@@ -73,7 +91,7 @@ function ReferenceBlock({ job }: { job: FeedJob }) {
     <div className="flex flex-col gap-1 shrink-0">
       <div className="w-[60px] h-20 bg-neutral-100 rounded-sm overflow-hidden relative">
         {heroUrl ? (
-          <Image src={heroUrl} alt={job.focusName || ''} fill sizes="60px" className="object-cover" unoptimized />
+          <Image src={heroUrl} alt={job.focusName || ''} fill sizes="60px" className="object-cover" loading="lazy" />
         ) : (
           <div className="absolute inset-0 bg-neutral-200" />
         )}
@@ -88,7 +106,7 @@ function ModelBlock({ job }: { job: FeedJob }) {
     <div className="flex flex-col items-center gap-1 shrink-0 w-14">
       <div className="w-11 h-14 bg-neutral-100 rounded-sm overflow-hidden relative">
         {url ? (
-          <Image src={url} alt={job.modelName || ''} fill sizes="44px" className="object-cover" unoptimized />
+          <Image src={url} alt={job.modelName || ''} fill sizes="44px" className="object-cover" loading="lazy" />
         ) : (
           <div className="absolute inset-0 bg-neutral-200" />
         )}
@@ -100,58 +118,58 @@ function ModelBlock({ job }: { job: FeedJob }) {
   );
 }
 
-function StatusPill({ job }: { job: FeedJob }) {
-  if (job.winnerCount >= job.totalShotTypes && job.totalShotTypes > 0) {
-    return (
-      <span className="bg-[#EAF3DE] text-[#173404] text-[10px] font-medium px-1.5 py-px rounded-sm">
-        complete
-      </span>
-    );
-  }
-  if (job.winnerCount > 0) {
-    return (
-      <span className="bg-[#EAF3DE] text-[#173404] text-[10px] font-medium px-1.5 py-px rounded-sm">
-        ★ {job.winnerCount}
-      </span>
-    );
-  }
-  if (job.status === 'failed') {
-    return <span className="bg-[#FCEBEB] text-[#791F1F] text-[10px] px-1.5 py-px rounded-sm">failed</span>;
-  }
-  if (job.status === 'generating' || job.status === 'queued' || job.status === 'uploading') {
-    return <span className="bg-[#EEEDFE] text-[#26215C] text-[10px] px-1.5 py-px rounded-sm">running</span>;
-  }
-  return <span className="bg-neutral-100 text-neutral-500 text-[10px] px-1.5 py-px rounded-sm">exploring</span>;
-}
-
-export default function JobRow({ job }: JobRowProps) {
+export default function JobRow({ job, onShotTileClick }: JobRowProps) {
+  const router = useRouter();
   const shotTypes = APP_CONFIG.shotTypes as readonly string[];
+  const v2Status = deriveV2Status({
+    rawStatus: job.status,
+    archived: job.archived,
+    winnerCount: job.winnerCount,
+    totalShotTypes: job.totalShotTypes,
+  });
+
+  const goToDetail = () => router.push(`/v2/jobs/${job.jobId}`);
+
   return (
-    <Link
-      href={`/v2/jobs/${job.jobId}`}
-      className="block bg-white border border-neutral-200 rounded-lg p-3 hover:border-neutral-300 transition-colors"
+    <div
+      role="button"
+      tabIndex={0}
+      onClick={goToDetail}
+      onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); goToDetail(); } }}
+      className="block bg-white border border-neutral-200 rounded-lg p-3 hover:border-neutral-300 transition-colors cursor-pointer"
     >
       <div className="flex items-stretch gap-3">
         <ReferenceBlock job={job} />
         <div className="flex-1 min-w-0 flex gap-1.5 items-center">
-          {shotTypes.map(st => (
-            <ShotTile key={st} shot={job.shots[st] || { shotType: st }} jobId={job.jobId} />
-          ))}
+          {shotTypes.map(st => {
+            const shot = job.shots[st] || { shotType: st };
+            return (
+              <ShotTile
+                key={st}
+                shot={shot}
+                jobId={job.jobId}
+                onClick={() => onShotTileClick?.({ job, shot })}
+              />
+            );
+          })}
         </div>
         <ModelBlock job={job} />
-        <div className="flex flex-col justify-between items-end text-right shrink-0 w-[100px]">
-          <div>
+        <div className="flex flex-col justify-between items-end text-right shrink-0 w-[160px] gap-2">
+          <div className="w-full">
             <div className="text-[11px] text-neutral-400">{formatRowTime(job.updatedAt || job.createdAt)}</div>
-            <div className="text-[12px] font-medium text-neutral-900 mt-0.5 truncate">
+            <div className="text-[12px] font-medium text-neutral-900 mt-0.5 leading-tight break-words">
               {job.focusDesignNumber || job.jobName || job.jobId}
             </div>
-            <div className="text-[11px] text-neutral-500 truncate">
+            <div
+              className="text-[11px] text-neutral-500 leading-snug mt-0.5 break-words"
+              style={{ display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical', overflow: 'hidden' }}
+            >
               {job.focusDesignName || job.focusName || ''}
             </div>
           </div>
-          <StatusPill job={job} />
+          <StatusPill status={v2Status} winnerCount={job.winnerCount} totalShotTypes={job.totalShotTypes} />
         </div>
       </div>
-    </Link>
+    </div>
   );
 }
